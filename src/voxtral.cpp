@@ -1349,7 +1349,7 @@ static bool alloc_decoder_memory(voxtral_context * ctx, int32_t dec_seq) {
     };
     ctx->ctx_dec_mem = ggml_init(p);
     ctx->decoder_memory = ggml_new_tensor_2d(ctx->ctx_dec_mem, GGML_TYPE_F32,
-        VOXTRAL_DEC_DIM, dec_seq);
+        ctx->model->hp.dec_dim, dec_seq);
     ggml_set_name(ctx->decoder_memory, "decoder_memory");
     ctx->buf_dec_mem = ggml_backend_alloc_ctx_tensors(ctx->ctx_dec_mem, ctx->backend);
     if (!ctx->buf_dec_mem) return false;
@@ -1677,7 +1677,7 @@ static ggml_cgraph * build_adapter_graph(
 
     // Copy to persistent decoder_memory
     ggml_tensor * dec_mem_view = ggml_view_2d(gctx, ctx->decoder_memory,
-        VOXTRAL_DEC_DIM, dec_seq,
+        ctx->model->hp.dec_dim, dec_seq,
         ctx->decoder_memory->nb[1], 0); // [dec_dim, dec_seq]
     ggml_tensor * cpy = ggml_cpy(gctx, x, dec_mem_view);
     ggml_build_forward_expand(gf, cpy);
