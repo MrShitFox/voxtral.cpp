@@ -14,9 +14,6 @@ option(VOXTRAL_AUTO_DETECT_BLAS "Auto-enable ggml BLAS if found" ON)
 option(VOXTRAL_AUTO_DETECT_CUDA "Auto-enable ggml CUDA if found" ON)
 option(VOXTRAL_AUTO_DETECT_VULKAN "Auto-enable ggml Vulkan if found" ON)
 option(VOXTRAL_AUTO_DETECT_METAL "Auto-enable ggml Metal on Apple" ON)
-# Homebrew-core requires linking the system ggml formula instead of bundling it.
-# The engine selects backends at runtime via the ggml registry, so no backend
-# compile-defines are needed in either mode.
 option(VOXTRAL_USE_SYSTEM_GGML "Link a system-installed ggml instead of the bundled submodule" OFF)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
