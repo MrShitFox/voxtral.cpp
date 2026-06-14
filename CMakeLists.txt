@@ -14,6 +14,10 @@ option(VOXTRAL_AUTO_DETECT_BLAS "Auto-enable ggml BLAS if found" ON)
 option(VOXTRAL_AUTO_DETECT_CUDA "Auto-enable ggml CUDA if found" ON)
 option(VOXTRAL_AUTO_DETECT_VULKAN "Auto-enable ggml Vulkan if found" ON)
 option(VOXTRAL_AUTO_DETECT_METAL "Auto-enable ggml Metal on Apple" ON)
+# Homebrew-core requires linking the system ggml formula instead of bundling it.
+# The engine selects backends at runtime via the ggml registry, so no backend
+# compile-defines are needed in either mode.
+option(VOXTRAL_USE_SYSTEM_GGML "Link a system-installed ggml instead of the bundled submodule" OFF)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -106,7 +110,17 @@ if(VOXTRAL_AUTO_DETECT_METAL AND APPLE)
     set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "ggml: embed Metal library" FORCE)
 endif()
 
-add_subdirectory(ggml)
+if(VOXTRAL_USE_SYSTEM_GGML)
+    find_package(ggml CONFIG REQUIRED)
+    set(VOXTRAL_GGML_TARGETS ggml::ggml ggml::ggml-base)
+    # The ggml::ggml/ggml-base imported targets don't carry the include dir when the
+    # backends are dynamically loaded; the package exports GGML_INCLUDE_DIR for it.
+    set(VOXTRAL_GGML_INCLUDES ${GGML_INCLUDE_DIR})
+else()
+    add_subdirectory(ggml)
+    set(VOXTRAL_GGML_TARGETS ggml)
+    set(VOXTRAL_GGML_INCLUDES "")
+endif()
 
 add_library(voxtral_lib
     src/voxtral.cpp)
@@ -119,11 +133,12 @@ endif()
 
 target_include_directories(voxtral_lib
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${VOXTRAL_GGML_INCLUDES})
 
 target_link_libraries(voxtral_lib
     PUBLIC
-        ggml
+        ${VOXTRAL_GGML_TARGETS}
         Threads::Threads)
 
 if(NOT WIN32)
@@ -154,7 +169,8 @@ add_executable(voxtral src/main.cpp)
 target_link_libraries(voxtral PRIVATE voxtral_lib)
 
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
-target_link_libraries(voxtral-quantize PRIVATE ggml Threads::Threads)
+target_link_libraries(voxtral-quantize PRIVATE ${VOXTRAL_GGML_TARGETS} Threads::Threads)
+target_include_directories(voxtral-quantize PRIVATE ${VOXTRAL_GGML_INCLUDES})
 
 if(NOT WIN32)
     target_link_libraries(voxtral-quantize PRIVATE m)

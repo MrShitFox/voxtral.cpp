@@ -1,19 +1,5 @@
 #include "voxtral.h"
 #include "gguf.h"
-#include "ggml-cpu.h"
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-#ifdef GGML_USE_VULKAN
-#include "ggml-vulkan.h"
-#endif
-#ifdef GGML_USE_BLAS
-#include "ggml-blas.h"
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -664,6 +650,91 @@ static ggml_tensor * get_tensor_opt(ggml_context * ctx, const char * name) {
     return ggml_get_tensor(ctx, name);
 }
 
+// ============================================================================
+// Backend selection via the ggml backend registry
+// ============================================================================
+
+// Case-insensitive substring test (registry names vary by ggml version/build,
+// e.g. the Metal backend is "MTL" in the bundled build but "Metal" elsewhere).
+static bool name_has(const char * hay, const char * needle_lc) {
+    if (!hay) return false;
+    std::string h(hay);
+    for (char & c : h) if (c >= 'A' && c <= 'Z') c += 32;
+    return h.find(needle_lc) != std::string::npos;
+}
+
+// Does a registry name belong to the requested GPU family? (auto matches any GPU.)
+static bool gpu_reg_matches(const char * rn, voxtral_gpu_backend req) {
+    switch (req) {
+        case voxtral_gpu_backend::metal:  return name_has(rn, "metal") || name_has(rn, "mtl");
+        case voxtral_gpu_backend::cuda:   return name_has(rn, "cuda");
+        case voxtral_gpu_backend::vulkan: return name_has(rn, "vulkan") || name_has(rn, "vk");
+        default:                          return true; // auto_detect
+    }
+}
+
+// Map a registry name back to our backend enum.
+static voxtral_gpu_backend gpu_from_reg(const char * rn) {
+    if (name_has(rn, "cuda")) return voxtral_gpu_backend::cuda;
+    if (name_has(rn, "vulkan") || name_has(rn, "vk")) return voxtral_gpu_backend::vulkan;
+    return voxtral_gpu_backend::metal; // metal/mtl, or a generic GPU
+}
+
+// First GPU/IGPU device matching the requested family (any GPU for auto_detect).
+static ggml_backend_dev_t find_gpu_device(voxtral_gpu_backend req) {
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (gpu_reg_matches(reg ? ggml_backend_reg_name(reg) : "", req)) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+// Find an accelerator device (e.g. BLAS/Accelerate) used alongside the CPU.
+static ggml_backend_dev_t find_accel_device() {
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+// Set the thread count on a backend via the registry proc-address (no-op if the
+// backend does not support it, e.g. GPU backends).
+static void backend_set_threads(ggml_backend_t backend, int n_threads) {
+    if (!backend) return;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) return;
+    auto set_threads = (ggml_backend_set_n_threads_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_threads) set_threads(backend, n_threads);
+}
+
+// Initialize the CPU backend via the registry.
+static ggml_backend_t init_cpu_backend() {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    return dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+}
+
+// Load all dynamically-linked ggml backend modules into the registry, exactly
+// once. Required when linking a system ggml (its backends are separate modules);
+// a no-op for the bundled static build whose backends self-register.
+static void ensure_backends_loaded() {
+    static const bool loaded = [] { ggml_backend_load_all(); return true; }();
+    (void) loaded;
+}
+
 // ==========================================================================
 // Model loading
 // ============================================================================
@@ -673,6 +744,7 @@ voxtral_model * voxtral_model_load_from_file(
     voxtral_log_callback   logger,
     voxtral_gpu_backend    gpu)
 {
+    ensure_backends_loaded();
     auto log_info = [&](const std::string & msg) {
         if (logger) logger(voxtral_log_level::info, msg);
     };
@@ -751,65 +823,26 @@ voxtral_model * voxtral_model_load_from_file(
         gi32("voxtral.token.begin_audio",    hp.tok_begin_audio);
     }
 
-    // Allocate a backend buffer for all the weights
+    // Allocate a backend buffer for all the weights. The GPU backend (if any) is
+    // selected from the ggml backend registry; weights are allocated on it.
     ggml_backend_t weights_backend = nullptr;
     voxtral_gpu_backend resolved_gpu = voxtral_gpu_backend::none;
 
-    auto try_cuda = [&]() -> bool {
-#ifdef GGML_USE_CUDA
-        weights_backend = ggml_backend_cuda_init(0);
-        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::cuda; return true; }
-        log_info("CUDA backend init failed");
-#endif
-        return false;
-    };
-
-    auto try_metal = [&]() -> bool {
-#ifdef GGML_USE_METAL
-        weights_backend = ggml_backend_metal_init();
-        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::metal; return true; }
-        log_info("Metal backend init failed");
-#endif
-        return false;
-    };
-
-    auto try_vulkan = [&]() -> bool {
-#ifdef GGML_USE_VULKAN
-        weights_backend = ggml_backend_vk_init(0);
-        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::vulkan; return true; }
-        log_info("Vulkan backend init failed");
-#endif
-        return false;
-    };
-
-    switch (gpu) {
-        case voxtral_gpu_backend::cuda:
-            if (!try_cuda()) {
-                log_info("CUDA not available in this build, falling back to CPU");
-            }
-            break;
-        case voxtral_gpu_backend::metal:
-            if (!try_metal()) {
-                log_info("Metal not available in this build, falling back to CPU");
-            }
-            break;
-        case voxtral_gpu_backend::vulkan:
-            if (!try_vulkan()) {
-                log_info("Vulkan not available in this build, falling back to CPU");
-            }
-            break;
-        case voxtral_gpu_backend::auto_detect:
-            if (!try_cuda() && !try_metal() && !try_vulkan()) {
-                log_info("no GPU backend available, using CPU");
-            }
-            break;
-        case voxtral_gpu_backend::none:
-        default:
-            break;
+    if (gpu != voxtral_gpu_backend::none) {
+        ggml_backend_dev_t gdev = find_gpu_device(gpu);
+        if (gdev) {
+            weights_backend = ggml_backend_dev_init(gdev, nullptr);
+        }
+        if (weights_backend) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(gdev);
+            resolved_gpu = gpu_from_reg(reg ? ggml_backend_reg_name(reg) : "");
+        } else {
+            log_info("no GPU backend available, using CPU");
+        }
     }
 
     if (!weights_backend) {
-        weights_backend = ggml_backend_cpu_init();
+        weights_backend = init_cpu_backend();
     }
 
     model->backend_weights = weights_backend;
@@ -1023,54 +1056,31 @@ voxtral_context * voxtral_init_from_model(
     }
     ctx->gpu_type = voxtral_gpu_backend::none;
 
-    auto try_cuda_ctx = [&]() -> bool {
-#ifdef GGML_USE_CUDA
-        ctx->backend = ggml_backend_cuda_init(0);
-        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::cuda; return true; }
-        LOG_WARN(ctx, "CUDA backend init failed");
-#endif
-        return false;
-    };
-    auto try_metal_ctx = [&]() -> bool {
-#ifdef GGML_USE_METAL
-        ctx->backend = ggml_backend_metal_init();
-        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::metal; return true; }
-        LOG_WARN(ctx, "Metal backend init failed");
-#endif
-        return false;
-    };
-    auto try_vulkan_ctx = [&]() -> bool {
-#ifdef GGML_USE_VULKAN
-        ctx->backend = ggml_backend_vk_init(0);
-        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::vulkan; return true; }
-        LOG_WARN(ctx, "Vulkan backend init failed");
-#endif
-        return false;
-    };
-
-    switch (gpu) {
-        case voxtral_gpu_backend::cuda:    try_cuda_ctx();   break;
-        case voxtral_gpu_backend::metal:   try_metal_ctx();  break;
-        case voxtral_gpu_backend::vulkan:  try_vulkan_ctx(); break;
-        case voxtral_gpu_backend::auto_detect:
-            if (!try_cuda_ctx() && !try_metal_ctx() && !try_vulkan_ctx()) {
-                LOG_INFO(ctx, "no GPU backend available, using CPU");
-            }
-            break;
-        case voxtral_gpu_backend::none:
-        default:
-            break;
+    // GPU compute backend (registry): match the requested backend, or any GPU.
+    if (gpu != voxtral_gpu_backend::none) {
+        ggml_backend_dev_t gdev = find_gpu_device(gpu);
+        if (gdev) {
+            ctx->backend = ggml_backend_dev_init(gdev, nullptr);
+        }
+        if (ctx->backend) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(gdev);
+            ctx->gpu_type = gpu_from_reg(reg ? ggml_backend_reg_name(reg) : "");
+        } else {
+            LOG_INFO(ctx, "no GPU backend available, using CPU");
+        }
     }
 
     bool has_gpu = (ctx->gpu_type != voxtral_gpu_backend::none);
 
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        // CPU-only: the CPU backend is the compute backend.
+        ctx->backend = init_cpu_backend();
+        backend_set_threads(ctx->backend, ctx->n_threads);
         LOG_INFO(ctx, "backend: CPU with %d threads", ctx->n_threads);
     } else {
-        ctx->backend_cpu = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        // GPU compute + a CPU backend for fallback ops.
+        ctx->backend_cpu = init_cpu_backend();
+        backend_set_threads(ctx->backend_cpu, ctx->n_threads);
         const char * gpu_name = "GPU";
         if (ctx->gpu_type == voxtral_gpu_backend::cuda)   gpu_name = "CUDA";
         if (ctx->gpu_type == voxtral_gpu_backend::metal)  gpu_name = "METAL";
@@ -1078,14 +1088,15 @@ voxtral_context * voxtral_init_from_model(
         LOG_INFO(ctx, "backend: %s (CPU fallback %d threads)", gpu_name, ctx->n_threads);
     }
 
-    // Try to init BLAS backend for accelerated CPU matmuls
-#ifdef GGML_USE_BLAS
-    ctx->blas_backend = ggml_backend_blas_init();
-    if (ctx->blas_backend) {
-        ggml_backend_blas_set_n_threads(ctx->blas_backend, ctx->n_threads);
-        LOG_INFO(ctx, "BLAS backend enabled with %d threads", ctx->n_threads);
+    // Accelerator (BLAS/Accelerate) device for faster CPU matmuls, added to the
+    // scheduler below — preserves CPU-path performance.
+    if (ggml_backend_dev_t adev = find_accel_device()) {
+        ctx->blas_backend = ggml_backend_dev_init(adev, nullptr);
+        if (ctx->blas_backend) {
+            backend_set_threads(ctx->blas_backend, ctx->n_threads);
+            LOG_INFO(ctx, "BLAS backend enabled with %d threads", ctx->n_threads);
+        }
     }
-#endif
 
     // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
