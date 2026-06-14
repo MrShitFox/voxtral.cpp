@@ -6,9 +6,9 @@ A ggml-based C++ implementation of Voxtral.
 
 Two model families are supported:
 
-- [**Voxtral-Mini-4B-Realtime**](https://huggingface.co/andrijdavid/Voxtral-Mini-4B-Realtime-2602-GGUF) (`general.architecture = voxtral_realtime`) — streaming
+- [**Voxtral-Mini-4B-Realtime**](https://huggingface.co/andrijdavid/Voxtral-Mini-4B-Realtime-2602-GGUF) (`general.architecture = voxtral_realtime`) - streaming
   model that emits one token per 80 ms audio frame. Built for low-latency/longform.
-- [**Voxtral-Mini-3B-2507**](https://huggingface.co/andrijdavid/Voxtral-Mini-3B-2507-GGUF) (`general.architecture = voxtral`) — offline audio-LLM that
+- [**Voxtral-Mini-3B-2507**](https://huggingface.co/andrijdavid/Voxtral-Mini-3B-2507-GGUF) (`general.architecture = voxtral`) - offline audio-LLM that
   generates only the text tokens (Whisper-style), much faster for batch transcription of
   short clips. Convert from the official `mistralai/Voxtral-Mini-3B-2507` checkpoint:
 
