@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Voxtral-Mini-4B-Realtime safetensors to GGUF.
-
-Features:
-- deterministic tensor naming
-- strict shape/count validation
-- metadata export (architecture/hparams/tokenizer/checksums)
-- --verify mode with safetensors + optional GGUF shape checks
-
-This implementation intentionally avoids PyTorch and the `gguf` python package.
-"""
+"""Convert Voxtral models safetensors to GGUF."""
 
 from __future__ import annotations
 
@@ -254,7 +245,32 @@ def _flatten_dict(prefix: str, obj: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def expected_tensor_specs(params: Dict[str, Any]) -> Dict[str, TensorSpec]:
+# Embedding-module prefix differs between the two model families:
+#   realtime (Voxtral-Mini-4B-Realtime): mm_streams_embeddings.embedding_module.
+#   offline  (Voxtral-Mini-3B-2507):     mm_whisper_embeddings.
+REALTIME_EMB_PREFIX = "mm_streams_embeddings.embedding_module."
+OFFLINE_EMB_PREFIX = "mm_whisper_embeddings."
+
+
+def detect_offline(source_names: Iterable[str]) -> bool:
+    return any(n.startswith(OFFLINE_EMB_PREFIX) for n in source_names)
+
+
+def arch_prefixes(offline: bool) -> Tuple[str, str]:
+    """(embedding-module prefix, conv-layer name infix) for the model family.
+
+    Offline (Whisper) conv tensors are conv_layers.N.weight; realtime are
+    conv_layers.N.conv.weight.
+    """
+    return (
+        OFFLINE_EMB_PREFIX if offline else REALTIME_EMB_PREFIX,
+        "" if offline else ".conv",
+    )
+
+
+def expected_tensor_specs(params: Dict[str, Any], offline: bool = False) -> Dict[str, TensorSpec]:
+    emb, conv_infix = arch_prefixes(offline)
+    has_ada = not offline
     enc = params["multimodal"]["whisper_model_args"]["encoder_args"]
 
     enc_dim = int(enc["dim"])
@@ -262,7 +278,7 @@ def expected_tensor_specs(params: Dict[str, Any]) -> Dict[str, TensorSpec]:
     enc_heads = int(enc["n_heads"])
     enc_head_dim = int(enc["head_dim"])
     enc_hidden = int(enc["hidden_dim"])
-    enc_kv_heads = int(enc["n_kv_heads"])
+    enc_kv_heads = int(enc.get("n_kv_heads", enc["n_heads"]))
 
     dec_dim = int(params["dim"])
     dec_layers = int(params["n_layers"])
@@ -282,25 +298,23 @@ def expected_tensor_specs(params: Dict[str, Any]) -> Dict[str, TensorSpec]:
     def add(name: str, shape: Sequence[int]) -> None:
         s[name] = TensorSpec(name=name, shape=tuple(int(x) for x in shape))
 
+    # Offline (true Whisper) encoder: conv tensors are conv_layers.N.weight (no
+    # ".conv." infix), norms are LayerNorm (weight+bias), FFN is a plain GELU MLP
+    # (w1/w2, no w3). Realtime encoder: conv_layers.N.conv.weight, RMSNorm (weight
+    # only), SwiGLU FFN (w1/w2/w3).
     add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.weight",
+        f"{emb}whisper_encoder.conv_layers.0{conv_infix}.weight",
         (enc_dim, int(enc["audio_encoding_args"]["num_mel_bins"]), 3),
     )
+    add(f"{emb}whisper_encoder.conv_layers.0{conv_infix}.bias", (enc_dim,))
     add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.bias",
-        (enc_dim,),
-    )
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.1.conv.weight",
+        f"{emb}whisper_encoder.conv_layers.1{conv_infix}.weight",
         (enc_dim, enc_dim, 3),
     )
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.1.conv.bias",
-        (enc_dim,),
-    )
+    add(f"{emb}whisper_encoder.conv_layers.1{conv_infix}.bias", (enc_dim,))
 
     for i in range(enc_layers):
-        p = f"mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}"
+        p = f"{emb}whisper_encoder.transformer.layers.{i}"
         add(f"{p}.attention_norm.weight", (enc_dim,))
         add(f"{p}.attention.wq.weight", (enc_heads * enc_head_dim, enc_dim))
         add(f"{p}.attention.wq.bias", (enc_heads * enc_head_dim,))
@@ -313,24 +327,32 @@ def expected_tensor_specs(params: Dict[str, Any]) -> Dict[str, TensorSpec]:
         add(f"{p}.feed_forward.w1.weight", (enc_hidden, enc_dim))
         add(f"{p}.feed_forward.w2.weight", (enc_dim, enc_hidden))
         add(f"{p}.feed_forward.w2.bias", (enc_dim,))
-        add(f"{p}.feed_forward.w3.weight", (enc_hidden, enc_dim))
+        if offline:
+            # LayerNorm biases + MLP w1 bias (no SwiGLU gate)
+            add(f"{p}.attention_norm.bias", (enc_dim,))
+            add(f"{p}.ffn_norm.bias", (enc_dim,))
+            add(f"{p}.feed_forward.w1.bias", (enc_hidden,))
+        else:
+            add(f"{p}.feed_forward.w3.weight", (enc_hidden, enc_dim))
+
+    add(f"{emb}whisper_encoder.transformer.norm.weight", (enc_dim,))
+    if offline:
+        add(f"{emb}whisper_encoder.transformer.norm.bias", (enc_dim,))
 
     add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight",
-        (enc_dim,),
-    )
-
-    add(
-        "mm_streams_embeddings.embedding_module.audio_language_projection.0.weight",
+        f"{emb}audio_language_projection.0.weight",
         (dec_dim, enc_dim * downsample_factor),
     )
     add(
-        "mm_streams_embeddings.embedding_module.audio_language_projection.2.weight",
+        f"{emb}audio_language_projection.2.weight",
         (dec_dim, dec_dim),
     )
 
-    add("mm_streams_embeddings.embedding_module.tok_embeddings.weight", (dec_vocab, dec_dim))
+    add(f"{emb}tok_embeddings.weight", (dec_vocab, dec_dim))
     add("norm.weight", (dec_dim,))
+    # Note: the offline untied output projection `output.weight` is handled via the
+    # optional-tensor list in convert()/verify() (it also exists for realtime), so it
+    # is intentionally NOT added here to avoid a duplicate tensor entry.
 
     for i in range(dec_layers):
         p = f"layers.{i}"
@@ -343,8 +365,9 @@ def expected_tensor_specs(params: Dict[str, Any]) -> Dict[str, TensorSpec]:
         add(f"{p}.feed_forward.w1.weight", (dec_hidden, dec_dim))
         add(f"{p}.feed_forward.w2.weight", (dec_dim, dec_hidden))
         add(f"{p}.feed_forward.w3.weight", (dec_hidden, dec_dim))
-        add(f"{p}.ada_rms_norm_t_cond.0.weight", (ada_dim, dec_dim))
-        add(f"{p}.ada_rms_norm_t_cond.2.weight", (dec_dim, ada_dim))
+        if has_ada:
+            add(f"{p}.ada_rms_norm_t_cond.0.weight", (ada_dim, dec_dim))
+            add(f"{p}.ada_rms_norm_t_cond.2.weight", (dec_dim, ada_dim))
 
     return s
 
@@ -416,12 +439,41 @@ def make_mel_filter_plan(params: Dict[str, Any]) -> Tuple[TensorPlan, str]:
     return plan, sha
 
 
+def make_enc_pos_embedding_plan(params: Dict[str, Any]) -> TensorPlan:
+    """Whisper sinusoidal positional embeddings for the offline encoder.
+
+    The Mistral consolidated.safetensors omits these (they are a fixed buffer); the
+    HF checkpoint stores them as audio_tower.embed_positions.weight, which matches the
+    standard Whisper sinusoids exactly. We generate them so no extra download is needed.
+    Stored as [length, channels] row-major -> ggml ne=[channels, length].
+    """
+    enc = params["multimodal"]["whisper_model_args"]["encoder_args"]
+    channels = int(enc["dim"])                       # 1280
+    length = int(enc["max_source_positions"])        # 1500
+    log_inc = np.log(10000.0) / (channels // 2 - 1)
+    inv = np.exp(-log_inc * np.arange(channels // 2))
+    scaled = np.arange(length)[:, None] * inv[None, :]
+    pos = np.concatenate([np.sin(scaled), np.cos(scaled)], axis=1).astype(np.float32)  # [length, channels]
+    raw = pos.tobytes(order="C")
+    return TensorPlan(
+        name="enc.pos_embedding",
+        src=None,
+        ggml_type=GGMLType.F32,
+        dims=gguf_dims_from_shape((length, channels)),
+        out_nbytes=len(raw),
+        inline_data=raw,
+    )
+
+
 def build_compact_name_map(
     params: Dict[str, Any],
     source_names: Iterable[str],
 ) -> Dict[str, str]:
     src_set = set(source_names)
     out: Dict[str, str] = {}
+
+    offline = detect_offline(src_set)
+    emb, conv_infix = arch_prefixes(offline)
 
     def add(src: str, dst: str) -> None:
         if src in src_set:
@@ -432,44 +484,26 @@ def build_compact_name_map(
     enc_layers = int(params["multimodal"]["whisper_model_args"]["encoder_args"]["n_layers"])
     dec_layers = int(params["n_layers"])
 
-    add("mm_streams_embeddings.embedding_module.tok_embeddings.weight", "tok_embeddings.weight")
+    add(f"{emb}tok_embeddings.weight", "tok_embeddings.weight")
     add("norm.weight", "norm.weight")
 
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.weight",
-        "enc.conv0.weight",
-    )
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.bias",
-        "enc.conv0.bias",
-    )
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.1.conv.weight",
-        "enc.conv1.weight",
-    )
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.1.conv.bias",
-        "enc.conv1.bias",
-    )
-    add(
-        "mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight",
-        "enc.norm.weight",
-    )
+    add(f"{emb}whisper_encoder.conv_layers.0{conv_infix}.weight", "enc.conv0.weight")
+    add(f"{emb}whisper_encoder.conv_layers.0{conv_infix}.bias", "enc.conv0.bias")
+    add(f"{emb}whisper_encoder.conv_layers.1{conv_infix}.weight", "enc.conv1.weight")
+    add(f"{emb}whisper_encoder.conv_layers.1{conv_infix}.bias", "enc.conv1.bias")
+    add(f"{emb}whisper_encoder.transformer.norm.weight", "enc.norm.weight")
+    add(f"{emb}whisper_encoder.transformer.norm.bias", "enc.norm.bias")
 
-    add(
-        "mm_streams_embeddings.embedding_module.audio_language_projection.0.weight",
-        "adapter.0.weight",
-    )
-    add(
-        "mm_streams_embeddings.embedding_module.audio_language_projection.2.weight",
-        "adapter.2.weight",
-    )
+    add(f"{emb}audio_language_projection.0.weight", "adapter.0.weight")
+    add(f"{emb}audio_language_projection.2.weight", "adapter.2.weight")
 
     for i in range(enc_layers):
-        src = f"mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}"
+        src = f"{emb}whisper_encoder.transformer.layers.{i}"
         dst = f"enc.blk.{i}"
         add(f"{src}.attention_norm.weight", f"{dst}.attn_norm.weight")
+        add(f"{src}.attention_norm.bias", f"{dst}.attn_norm.bias")
         add(f"{src}.ffn_norm.weight", f"{dst}.ffn_norm.weight")
+        add(f"{src}.ffn_norm.bias", f"{dst}.ffn_norm.bias")
         add(f"{src}.attention.wq.weight", f"{dst}.attn_q.weight")
         add(f"{src}.attention.wq.bias", f"{dst}.attn_q.bias")
         add(f"{src}.attention.wk.weight", f"{dst}.attn_k.weight")
@@ -478,6 +512,7 @@ def build_compact_name_map(
         add(f"{src}.attention.wo.weight", f"{dst}.attn_o.weight")
         add(f"{src}.attention.wo.bias", f"{dst}.attn_o.bias")
         add(f"{src}.feed_forward.w1.weight", f"{dst}.ffn_w1.weight")
+        add(f"{src}.feed_forward.w1.bias", f"{dst}.ffn_w1.bias")
         add(f"{src}.feed_forward.w2.weight", f"{dst}.ffn_w2.weight")
         add(f"{src}.feed_forward.w2.bias", f"{dst}.ffn_w2.bias")
         add(f"{src}.feed_forward.w3.weight", f"{dst}.ffn_w3.weight")
@@ -494,12 +529,13 @@ def build_compact_name_map(
         add(f"{src}.feed_forward.w1.weight", f"{dst}.ffn_w1.weight")
         add(f"{src}.feed_forward.w2.weight", f"{dst}.ffn_w2.weight")
         add(f"{src}.feed_forward.w3.weight", f"{dst}.ffn_w3.weight")
-        add(f"{src}.ada_rms_norm_t_cond.0.weight", f"{dst}.ada0.weight")
-        add(f"{src}.ada_rms_norm_t_cond.2.weight", f"{dst}.ada2.weight")
+        if not offline:
+            add(f"{src}.ada_rms_norm_t_cond.0.weight", f"{dst}.ada0.weight")
+            add(f"{src}.ada_rms_norm_t_cond.2.weight", f"{dst}.ada2.weight")
 
     add("output.weight", "output.weight")
     add("output.bias", "output.bias")
-    add("mm_streams_embeddings.embedding_module.output.weight", "output_mm.weight")
+    add(f"{emb}output.weight", "output_mm.weight")
 
     missing_map = sorted(src_set - set(out.keys()))
     if missing_map:
@@ -528,7 +564,9 @@ def validate_safetensors(
     *,
     verbose: bool = True,
 ) -> Tuple[List[str], Dict[str, str], Dict[str, TensorSpec]]:
-    expected = expected_tensor_specs(params)
+    offline = detect_offline(reader.keys())
+    emb, conv_infix = arch_prefixes(offline)
+    expected = expected_tensor_specs(params, offline=offline)
 
     names = sorted(reader.keys())
     actual = set(names)
@@ -537,7 +575,7 @@ def validate_safetensors(
     optional = {
         "output.weight",
         "output.bias",
-        "mm_streams_embeddings.embedding_module.output.weight",
+        f"{emb}output.weight",
     }
 
     missing = sorted(mandatory - actual)
@@ -562,11 +600,11 @@ def validate_safetensors(
 
     checksums: Dict[str, str] = {}
     checksum_names = [
-        "mm_streams_embeddings.embedding_module.tok_embeddings.weight",
+        f"{emb}tok_embeddings.weight",
         "layers.0.attention.wq.weight",
         f"layers.{params['n_layers'] - 1}.feed_forward.w2.weight",
-        "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.weight",
-        "mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight",
+        f"{emb}whisper_encoder.conv_layers.0{conv_infix}.weight",
+        f"{emb}whisper_encoder.transformer.norm.weight",
     ]
 
     for name in checksum_names:
@@ -657,6 +695,7 @@ def metadata_from_model_info(
     out_type: str,
     name_map: Dict[str, str],
     mel_filters_sha256: str,
+    offline: bool = False,
 ) -> List[Tuple[str, int, Any]]:
     params = model_info["params"]
     tekken = model_info["tekken"]
@@ -679,8 +718,8 @@ def metadata_from_model_info(
     vocab_limit = max(0, min(vocab_limit, len(vocab)))
     vocab_b64 = [str(vocab[i]["token_bytes"]) for i in range(vocab_limit)]
 
-    sample_rate = int(audio_cfg.get("sampling_rate", aud["sampling_rate"]))
-    frame_rate = float(audio_cfg.get("frame_rate", aud["frame_rate"]))
+    sample_rate = int(audio_cfg.get("sampling_rate", aud.get("sampling_rate", 16000)))
+    frame_rate = float(audio_cfg.get("frame_rate", aud.get("frame_rate", 12.5)))
     hop_length = int(aud["hop_length"])
     raw_audio_per_tok = int(sample_rate // frame_rate)
     audio_len_per_tok = raw_audio_per_tok // hop_length
@@ -696,11 +735,26 @@ def metadata_from_model_info(
 
     special_lookup = {str(st.get("token_str", "")): int(st.get("rank", -1)) for st in special_tokens}
 
+    # Encoder defaults differ between families: the realtime params.json sets these
+    # explicitly (causal, sliding_window, rope_theta, norm_eps); the offline one omits
+    # them → standard Whisper-style encoder (non-causal, full attention, RoPE theta 1e6).
+    enc_causal = bool(enc.get("causal", not offline))
+    enc_sliding_window = int(enc.get("sliding_window", 0))
+    enc_norm_eps = float(enc.get("norm_eps", 1e-5))
+    enc_rope_theta = float(enc.get("rope_theta", 1e6))
+    dec_sliding_window = int(params.get("sliding_window", 0) or 0)
+    global_log_mel_max = float(aud.get("global_log_mel_max", 1.5))
+    ada_enabled = bool(params.get("ada_rms_norm_t_cond", not offline))
+
+    arch_str = "voxtral" if offline else "voxtral_realtime"
+    name_str = "Voxtral-Mini-3B-2507" if offline else "Voxtral-Mini-4B-Realtime-2602"
+
     kv: List[Tuple[str, int, Any]] = [
-        ("general.architecture", GGUFType.STRING, "voxtral_realtime"),
-        ("general.name", GGUFType.STRING, "Voxtral-Mini-4B-Realtime-2602"),
+        ("general.architecture", GGUFType.STRING, arch_str),
+        ("general.name", GGUFType.STRING, name_str),
         ("general.file_type", GGUFType.UINT32, 0 if out_type == "f32" else 1),
         ("voxtral.format_version", GGUFType.INT32, 1),
+        ("voxtral.decode.offline", GGUFType.BOOL, offline),
         ("voxtral.decoder.dim", GGUFType.INT32, int(params["dim"])),
         ("voxtral.decoder.n_layers", GGUFType.INT32, int(params["n_layers"])),
         ("voxtral.decoder.n_heads", GGUFType.INT32, int(params["n_heads"])),
@@ -709,17 +763,21 @@ def metadata_from_model_info(
         ("voxtral.decoder.n_kv_heads", GGUFType.INT32, int(params["n_kv_heads"])),
         ("voxtral.decoder.norm_eps", GGUFType.FLOAT32, float(params["norm_eps"])),
         ("voxtral.decoder.rope_theta", GGUFType.FLOAT32, float(params["rope_theta"])),
-        ("voxtral.decoder.sliding_window", GGUFType.INT32, int(params["sliding_window"])),
+        ("voxtral.decoder.sliding_window", GGUFType.INT32, dec_sliding_window),
         ("voxtral.encoder.dim", GGUFType.INT32, int(enc["dim"])),
         ("voxtral.encoder.n_layers", GGUFType.INT32, int(enc["n_layers"])),
         ("voxtral.encoder.n_heads", GGUFType.INT32, int(enc["n_heads"])),
         ("voxtral.encoder.head_dim", GGUFType.INT32, int(enc["head_dim"])),
         ("voxtral.encoder.hidden_dim", GGUFType.INT32, int(enc["hidden_dim"])),
-        ("voxtral.encoder.n_kv_heads", GGUFType.INT32, int(enc["n_kv_heads"])),
-        ("voxtral.encoder.norm_eps", GGUFType.FLOAT32, float(enc["norm_eps"])),
-        ("voxtral.encoder.rope_theta", GGUFType.FLOAT32, float(enc["rope_theta"])),
-        ("voxtral.encoder.sliding_window", GGUFType.INT32, int(enc["sliding_window"])),
-        ("voxtral.ada_rms_norm_t_cond", GGUFType.BOOL, bool(params.get("ada_rms_norm_t_cond", True))),
+        ("voxtral.encoder.n_kv_heads", GGUFType.INT32, int(enc.get("n_kv_heads", enc["n_heads"]))),
+        ("voxtral.encoder.norm_eps", GGUFType.FLOAT32, enc_norm_eps),
+        ("voxtral.encoder.rope_theta", GGUFType.FLOAT32, enc_rope_theta),
+        ("voxtral.encoder.sliding_window", GGUFType.INT32, enc_sliding_window),
+        ("voxtral.encoder.causal", GGUFType.BOOL, enc_causal),
+        # Offline = true Whisper block (LayerNorm + GELU MLP); realtime = RMSNorm + SwiGLU
+        ("voxtral.encoder.norm_type", GGUFType.STRING, "layernorm" if offline else "rmsnorm"),
+        ("voxtral.encoder.ffn_type", GGUFType.STRING, "mlp_gelu" if offline else "swiglu"),
+        ("voxtral.ada_rms_norm_t_cond", GGUFType.BOOL, ada_enabled),
         ("voxtral.ada_rms_norm_t_cond_dim", GGUFType.INT32, int(params.get("ada_rms_norm_t_cond_dim", 32))),
         ("voxtral.vocab_size", GGUFType.INT32, int(params["vocab_size"])),
         ("voxtral.audio.sample_rate", GGUFType.INT32, sample_rate),
@@ -727,7 +785,7 @@ def metadata_from_model_info(
         ("voxtral.audio.num_mel_bins", GGUFType.INT32, int(aud["num_mel_bins"])),
         ("voxtral.audio.hop_length", GGUFType.INT32, int(aud["hop_length"])),
         ("voxtral.audio.window_size", GGUFType.INT32, int(aud["window_size"])),
-        ("voxtral.audio.global_log_mel_max", GGUFType.FLOAT32, float(aud["global_log_mel_max"])),
+        ("voxtral.audio.global_log_mel_max", GGUFType.FLOAT32, global_log_mel_max),
         ("voxtral.audio.mel_filters_tensor", GGUFType.STRING, "audio.mel_filters"),
         ("voxtral.audio.mel_filters_sha256", GGUFType.STRING, mel_filters_sha256),
         ("voxtral.audio.downsample_factor", GGUFType.INT32, downsample_factor),
@@ -1063,6 +1121,9 @@ def convert(args: argparse.Namespace) -> None:
         write_out_path = temp_fp_path
 
     with SafeTensorReader(st_path) as reader:
+        offline = detect_offline(reader.keys())
+        emb, _ = arch_prefixes(offline)
+        print(f"[convert] detected architecture: {'voxtral (offline)' if offline else 'voxtral_realtime'}")
         names, checksums, expected = validate_safetensors(reader, model_info["params"], verbose=True)
 
         mandatory = sorted(expected.keys())
@@ -1071,7 +1132,7 @@ def convert(args: argparse.Namespace) -> None:
             for n in [
                 "output.weight",
                 "output.bias",
-                "mm_streams_embeddings.embedding_module.output.weight",
+                f"{emb}output.weight",
             ]
             if n in names
         ]
@@ -1081,12 +1142,17 @@ def convert(args: argparse.Namespace) -> None:
         plans = make_plans(reader, tensor_names, base_out_type, name_map)
         mel_plan, mel_sha = make_mel_filter_plan(model_info["params"])
         plans.append(mel_plan)
+        if offline:
+            # Offline Whisper encoder needs sinusoidal positional embeddings (the
+            # consolidated checkpoint omits them); generate and embed them.
+            plans.append(make_enc_pos_embedding_plan(model_info["params"]))
         kv = metadata_from_model_info(
             model_info,
             checksums,
             base_out_type,
             name_map,
             mel_sha,
+            offline=offline,
         )
 
         print(f"[convert] writing {len(plans)} tensors to {write_out_path}")

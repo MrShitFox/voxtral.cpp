@@ -1,6 +1,23 @@
 # Voxtral.cpp
 
-A ggml-based C++ implementation of Voxtral Realtime 4B.
+A ggml-based C++ implementation of Voxtral.
+
+## Models
+
+Two model families are supported:
+
+- [**Voxtral-Mini-4B-Realtime**](https://huggingface.co/andrijdavid/Voxtral-Mini-4B-Realtime-2602-GGUF) (`general.architecture = voxtral_realtime`) — streaming
+  model that emits one token per 80 ms audio frame. Built for low-latency/longform.
+- [**Voxtral-Mini-3B-2507**](https://huggingface.co/andrijdavid/Voxtral-Mini-3B-2507-GGUF) (`general.architecture = voxtral`) — offline audio-LLM that
+  generates only the text tokens (Whisper-style), much faster for batch transcription of
+  short clips. Convert from the official `mistralai/Voxtral-Mini-3B-2507` checkpoint:
+
+  ```bash
+  # needs consolidated.safetensors + params.json + tekken.json in the model dir
+  python tools/convert_voxtral_to_gguf.py --model-dir models/voxtral-3b \
+    --output models/voxtral-3b/voxtral-3b.gguf --out-type q4_k_m
+  ./build/voxtral --model models/voxtral-3b/voxtral-3b.gguf --audio clip.wav
+  ```
 
 ## Voxtral References
 
@@ -13,6 +30,7 @@ A ggml-based C++ implementation of Voxtral Realtime 4B.
 Quantized GGUF weights used by this project are hosted on Hugging Face:
 
 - https://huggingface.co/andrijdavid/Voxtral-Mini-4B-Realtime-2602-GGUF
+- https://huggingface.co/andrijdavid/Voxtral-Mini-3B-2507-GGUF
 
 The `download_model.sh` script downloads from that repository.
 
@@ -23,9 +41,13 @@ The `download_model.sh` script downloads from that repository.
 Download the pre-converted GGUF model from Hugging Face:
 
 ```bash
-# Default: Q4_0 quantization
-./tools/download_model.sh Q4_0
+# Recommended: Q4_K_M (best quality/size trade-off, ~2.7 GB)
+./tools/download_model.sh Q4_K_M
 ```
+
+Other quants are available (`Q8_0`, `Q5_K`, `Q4_0`, `Q2_K`, …); `Q4_K_M` is the
+recommended default and transcribes with no perceptible quality loss vs full
+precision.
 
 ### 2. Build
 
@@ -48,10 +70,14 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 
 ```bash
 ./build/voxtral \
-  --model models/voxtral/Q4_0.gguf \
-  --audio path/to/input.wav \
-  --threads 8
+  --model models/voxtral/Q4_K_M.gguf \
+  --audio path/to/input.wav
 ```
+
+By default the GPU is auto-detected (`--gpu auto`): **Metal** on Apple Silicon,
+**CUDA** on NVIDIA, **Vulkan** otherwise, falling back to CPU. Force a backend
+with `--gpu metal|cuda|vulkan|none`. Thread count for the CPU path defaults to
+the machine's hardware concurrency; override with `--threads N`.
 
 ---
 

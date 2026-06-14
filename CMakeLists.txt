@@ -13,6 +13,7 @@ option(VOXTRAL_AUTO_DETECT_CPU "Auto-detect CPU features and set ggml flags" ON)
 option(VOXTRAL_AUTO_DETECT_BLAS "Auto-enable ggml BLAS if found" ON)
 option(VOXTRAL_AUTO_DETECT_CUDA "Auto-enable ggml CUDA if found" ON)
 option(VOXTRAL_AUTO_DETECT_VULKAN "Auto-enable ggml Vulkan if found" ON)
+option(VOXTRAL_AUTO_DETECT_METAL "Auto-enable ggml Metal on Apple" ON)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -94,6 +95,15 @@ if(VOXTRAL_AUTO_DETECT_VULKAN)
             set(GGML_VULKAN ON CACHE BOOL "ggml: use Vulkan" FORCE)
         endif()
     endif()
+endif()
+
+if(VOXTRAL_AUTO_DETECT_METAL AND APPLE)
+    if(NOT DEFINED CACHE{GGML_METAL})
+        set(GGML_METAL ON CACHE BOOL "ggml: use Metal" FORCE)
+    endif()
+    # Embed the Metal shader library into the binary so it needs no external
+    # default.metallib at runtime (self-contained executable).
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "ggml: embed Metal library" FORCE)
 endif()
 
 add_subdirectory(ggml)

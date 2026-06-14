@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ============================================================================
@@ -35,7 +36,7 @@
 
 static constexpr float VOXTRAL_PI = 3.14159265358979323846f;
 static constexpr int32_t VOXTRAL_N_FFT       = VOXTRAL_WINDOW_SIZE;         // 400
-static constexpr int32_t VOXTRAL_N_FREQ      = VOXTRAL_N_FFT / 2 + 1;      // 201
+static constexpr int32_t VOXTRAL_N_FREQ      = VOXTRAL_N_FFT / 2 + 1;
 static constexpr int32_t VOXTRAL_ENC_CHUNK_MEL     = 3000;  // mel frames per encoder chunk
 static constexpr int32_t VOXTRAL_ENC_CHUNK_OVERLAP  = 750;  // overlap in encoder-token space (= window)
 static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens per single chunk
@@ -64,6 +65,7 @@ static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens pe
 
 struct voxtral_encoder_layer {
     ggml_tensor * attn_norm_weight;  // [enc_dim]
+    ggml_tensor * attn_norm_bias = nullptr;  // [enc_dim] — offline LayerNorm only
     ggml_tensor * attn_q_weight;     // [enc_heads*enc_head_dim, enc_dim]
     ggml_tensor * attn_q_bias;       // [enc_heads*enc_head_dim]
     ggml_tensor * attn_k_weight;     // [enc_kv_heads*enc_head_dim, enc_dim]
@@ -72,10 +74,12 @@ struct voxtral_encoder_layer {
     ggml_tensor * attn_o_weight;     // [enc_dim, enc_heads*enc_head_dim]
     ggml_tensor * attn_o_bias;       // [enc_dim]
     ggml_tensor * ffn_norm_weight;   // [enc_dim]
+    ggml_tensor * ffn_norm_bias = nullptr;   // [enc_dim] — offline LayerNorm only
     ggml_tensor * ffn_w1_weight;     // [enc_hidden, enc_dim]
+    ggml_tensor * ffn_w1_bias = nullptr;     // [enc_hidden] - offline GELU MLP only
     ggml_tensor * ffn_w2_weight;     // [enc_dim, enc_hidden]
     ggml_tensor * ffn_w2_bias;       // [enc_dim]
-    ggml_tensor * ffn_w3_weight;     // [enc_hidden, enc_dim]
+    ggml_tensor * ffn_w3_weight = nullptr;   // [enc_hidden, enc_dim] — realtime SwiGLU only
 };
 
 struct voxtral_decoder_layer {
@@ -96,7 +100,50 @@ struct voxtral_decoder_layer {
 // Model structure
 // ============================================================================
 
+// Runtime model hyperparameters from GGUF metadata at load time with the VOXTRAL_* as fallbacks.
+struct voxtral_hparams {
+    bool    is_offline      = false;  // general.architecture == "voxtral" (offline) vs "voxtral_realtime"
+
+    // Encoder
+    int32_t enc_dim         = VOXTRAL_ENC_DIM;
+    int32_t enc_layers      = VOXTRAL_ENC_LAYERS;
+    int32_t enc_heads       = VOXTRAL_ENC_HEADS;
+    int32_t enc_head_dim    = VOXTRAL_ENC_HEAD_DIM;
+    int32_t enc_hidden      = VOXTRAL_ENC_HIDDEN;
+    int32_t enc_kv_heads    = VOXTRAL_ENC_KV_HEADS;
+    bool    enc_causal      = true;                 // realtime: causal+window; offline: full bidirectional
+    float   enc_norm_eps    = VOXTRAL_ENC_NORM_EPS;
+    float   enc_rope_theta  = VOXTRAL_ENC_ROPE_THETA;
+
+    // Decoder
+    int32_t dec_dim         = VOXTRAL_DEC_DIM;
+    int32_t dec_layers      = VOXTRAL_DEC_LAYERS;
+    int32_t dec_heads       = VOXTRAL_DEC_HEADS;
+    int32_t dec_head_dim    = VOXTRAL_DEC_HEAD_DIM;
+    int32_t dec_hidden      = VOXTRAL_DEC_HIDDEN;
+    int32_t dec_kv_heads    = VOXTRAL_DEC_KV_HEADS;
+    float   dec_norm_eps    = VOXTRAL_DEC_NORM_EPS;
+    float   dec_rope_theta  = VOXTRAL_DEC_ROPE_THETA;
+    bool    ada_t_cond      = true;                 // realtime adaptive RMS norm time-conditioning
+
+    int32_t vocab_size      = VOXTRAL_VOCAB_SIZE;
+
+    // Audio
+    int32_t downsample_factor = VOXTRAL_DOWNSAMPLE_FACTOR;
+
+    // Special tokens
+    int32_t tok_bos         = VOXTRAL_TOKEN_BOS;
+    int32_t tok_eos         = VOXTRAL_TOKEN_EOS;
+    int32_t tok_audio       = VOXTRAL_TOKEN_AUDIO;
+    int32_t tok_begin_audio = VOXTRAL_TOKEN_BEGIN_AUDIO;
+    int32_t tok_transcribe  = 34;   // [TRANSCRIBE]; offline prompt only
+    int32_t tok_inst        = 3;    // [INST]
+    int32_t tok_inst_end    = 4;    // [/INST]
+};
+
 struct voxtral_model {
+    voxtral_hparams hp;
+
     // Encoder conv stem
     ggml_tensor * enc_conv0_weight;  // [enc_dim, num_mel_bins, 3]
     ggml_tensor * enc_conv0_bias;    // [enc_dim]
@@ -104,6 +151,9 @@ struct voxtral_model {
     ggml_tensor * enc_conv1_bias;    // [enc_dim]
     std::vector<voxtral_encoder_layer> enc_layers;
     ggml_tensor * enc_norm_weight;   // [enc_dim]
+    ggml_tensor * enc_norm_bias = nullptr;  // [enc_dim] — offline LayerNorm only
+    ggml_tensor * enc_pos_embedding = nullptr;  // [enc_dim, max_pos] — offline Whisper sinusoids
+    ggml_tensor * output_weight = nullptr;  // [vocab, dec_dim] — offline untied output proj
 
     // Adapter
     ggml_tensor * adapter_0_weight;  // [dec_dim, enc_dim*downsample]
@@ -155,6 +205,7 @@ struct voxtral_context {
     // Per-chunk encoder output (fixed size, reused each chunk)
     ggml_tensor * encoder_chunk_output = nullptr;  // [enc_dim, MAX_ENC_CHUNK]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
+    ggml_tensor * decoder_argmax  = nullptr;  // [1] i32 — greedy token, computed on device
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
@@ -192,7 +243,7 @@ struct voxtral_context {
 };
 
 // ============================================================================
-// Mel filterbank computation (Slaney-style, matches Python reference)
+// Mel filterbank computation (Slaney-style)
 // ============================================================================
 
 static float hertz_to_mel(float freq_hz) {
@@ -218,20 +269,16 @@ static float mel_to_hertz(float mels) {
 }
 
 static void compute_mel_filters_slaney(std::vector<float> & filters) {
-    // Output: filters[k * n_mel + m] for k in [0..n_freq), m in [0..n_mel)
-    // Matches Python compute_mel_filters() exactly
-    constexpr int32_t n_freq = VOXTRAL_N_FREQ;  // 201
-    constexpr int32_t n_mel  = VOXTRAL_NUM_MEL_BINS;  // 128
+    constexpr int32_t n_freq = VOXTRAL_N_FREQ;
+    constexpr int32_t n_mel  = VOXTRAL_NUM_MEL_BINS;
 
     filters.resize(n_freq * n_mel, 0.0f);
 
-    // FFT frequencies: linspace(0, sr/2, n_freq)
     std::vector<float> fft_freqs(n_freq);
     for (int32_t i = 0; i < n_freq; i++) {
         fft_freqs[i] = (float)(VOXTRAL_SAMPLE_RATE / 2) * (float)i / (float)(n_freq - 1);
     }
 
-    // Mel frequencies: linspace(mel(0), mel(8000), n_mel+2)
     const float mel_min = hertz_to_mel(0.0f);
     const float mel_max = hertz_to_mel(8000.0f);
 
@@ -245,7 +292,7 @@ static void compute_mel_filters_slaney(std::vector<float> & filters) {
         filter_freqs[i] = mel_to_hertz(mel_pts[i]);
     }
 
-    // Build triangular filters (matching Python slopes approach)
+    // Build triangular filters
     for (int32_t m = 0; m < n_mel; m++) {
         const float f_left   = filter_freqs[m];
         const float f_center = filter_freqs[m + 1];
@@ -612,7 +659,12 @@ static ggml_tensor * get_tensor(ggml_context * ctx, const char * name) {
     return t;
 }
 
-// ============================================================================
+// Optional tensor: returns nullptr without warning if absent (arch-dependent tensors).
+static ggml_tensor * get_tensor_opt(ggml_context * ctx, const char * name) {
+    return ggml_get_tensor(ctx, name);
+}
+
+// ==========================================================================
 // Model loading
 // ============================================================================
 
@@ -643,6 +695,61 @@ voxtral_model * voxtral_model_load_from_file(
     voxtral_model * model = new voxtral_model();
     model->gguf_ctx  = gguf_ctx;
     model->ctx_gguf  = ctx_meta;
+
+    // ---- Populate runtime hyperparameters from GGUF metadata (fallback to defaults) ----
+    {
+        voxtral_hparams & hp = model->hp;
+        auto gi32 = [&](const char * k, int32_t & dst) {
+            const int64_t kid = gguf_find_key(gguf_ctx, k);
+            if (kid >= 0) dst = gguf_get_val_i32(gguf_ctx, kid);
+        };
+        auto gf32 = [&](const char * k, float & dst) {
+            const int64_t kid = gguf_find_key(gguf_ctx, k);
+            if (kid >= 0) dst = gguf_get_val_f32(gguf_ctx, kid);
+        };
+        auto gbool = [&](const char * k, bool & dst) {
+            const int64_t kid = gguf_find_key(gguf_ctx, k);
+            if (kid >= 0) dst = gguf_get_val_bool(gguf_ctx, kid);
+        };
+
+        const int64_t arch_kid = gguf_find_key(gguf_ctx, "general.architecture");
+        if (arch_kid >= 0) {
+            const std::string arch = gguf_get_val_str(gguf_ctx, arch_kid);
+            hp.is_offline = (arch == "voxtral");          // offline arch string
+        }
+
+        gi32("voxtral.encoder.dim",          hp.enc_dim);
+        gi32("voxtral.encoder.n_layers",     hp.enc_layers);
+        gi32("voxtral.encoder.n_heads",      hp.enc_heads);
+        gi32("voxtral.encoder.head_dim",     hp.enc_head_dim);
+        gi32("voxtral.encoder.hidden_dim",   hp.enc_hidden);
+        gi32("voxtral.encoder.n_kv_heads",   hp.enc_kv_heads);
+        gf32("voxtral.encoder.norm_eps",     hp.enc_norm_eps);
+        gf32("voxtral.encoder.rope_theta",   hp.enc_rope_theta);
+        // encoder causality: explicit key if present, else from params.*, else infer from window
+        hp.enc_causal = !hp.is_offline;
+        gbool("voxtral.encoder.causal", hp.enc_causal);
+        gbool("voxtral.params.multimodal.whisper_model_args.encoder_args.causal", hp.enc_causal);
+
+        gi32("voxtral.decoder.dim",          hp.dec_dim);
+        gi32("voxtral.decoder.n_layers",     hp.dec_layers);
+        gi32("voxtral.decoder.n_heads",      hp.dec_heads);
+        gi32("voxtral.decoder.head_dim",     hp.dec_head_dim);
+        gi32("voxtral.decoder.hidden_dim",   hp.dec_hidden);
+        gi32("voxtral.decoder.n_kv_heads",   hp.dec_kv_heads);
+        gf32("voxtral.decoder.norm_eps",     hp.dec_norm_eps);
+        gf32("voxtral.decoder.rope_theta",   hp.dec_rope_theta);
+
+        hp.ada_t_cond = !hp.is_offline;
+        gbool("voxtral.ada_rms_norm_t_cond", hp.ada_t_cond);
+
+        gi32("voxtral.vocab_size",           hp.vocab_size);
+        gi32("voxtral.audio.downsample_factor", hp.downsample_factor);
+        gi32("voxtral.token.bos",            hp.tok_bos);
+        gi32("voxtral.token.eos",            hp.tok_eos);
+        gi32("voxtral.token.audio",          hp.tok_audio);
+        gi32("voxtral.token.begin_audio",    hp.tok_begin_audio);
+    }
 
     // Allocate a backend buffer for all the weights
     ggml_backend_t weights_backend = nullptr;
@@ -759,9 +866,12 @@ voxtral_model * voxtral_model_load_from_file(
     model->enc_conv1_weight = get_tensor(ctx_meta, "enc.conv1.weight");
     model->enc_conv1_bias   = get_tensor(ctx_meta, "enc.conv1.bias");
     model->enc_norm_weight  = get_tensor(ctx_meta, "enc.norm.weight");
+    model->enc_norm_bias    = get_tensor_opt(ctx_meta, "enc.norm.bias");   // offline LayerNorm
+    model->enc_pos_embedding = get_tensor_opt(ctx_meta, "enc.pos_embedding"); // offline Whisper sinusoids
+    model->output_weight    = get_tensor_opt(ctx_meta, "output.weight");   // offline untied output
 
-    model->enc_layers.resize(VOXTRAL_ENC_LAYERS);
-    for (int32_t i = 0; i < VOXTRAL_ENC_LAYERS; i++) {
+    model->enc_layers.resize(model->hp.enc_layers);
+    for (int32_t i = 0; i < model->hp.enc_layers; i++) {
         char nm[256];
         auto & L = model->enc_layers[i];
         snprintf(nm,sizeof(nm),"enc.blk.%d.attn_norm.weight",i); L.attn_norm_weight = get_tensor(ctx_meta,nm);
@@ -776,7 +886,14 @@ voxtral_model * voxtral_model_load_from_file(
         snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_w1.weight",i);    L.ffn_w1_weight = get_tensor(ctx_meta,nm);
         snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_w2.weight",i);    L.ffn_w2_weight = get_tensor(ctx_meta,nm);
         snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_w2.bias",i);      L.ffn_w2_bias   = get_tensor(ctx_meta,nm);
-        snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_w3.weight",i);    L.ffn_w3_weight = get_tensor(ctx_meta,nm);
+        if (model->hp.is_offline) {
+            // Offline Whisper encoder: LayerNorm biases + GELU-MLP w1 bias (no SwiGLU w3).
+            snprintf(nm,sizeof(nm),"enc.blk.%d.attn_norm.bias",i); L.attn_norm_bias = get_tensor_opt(ctx_meta,nm);
+            snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_norm.bias",i);  L.ffn_norm_bias  = get_tensor_opt(ctx_meta,nm);
+            snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_w1.bias",i);    L.ffn_w1_bias    = get_tensor_opt(ctx_meta,nm);
+        } else {
+            snprintf(nm,sizeof(nm),"enc.blk.%d.ffn_w3.weight",i);  L.ffn_w3_weight  = get_tensor(ctx_meta,nm);
+        }
     }
 
     model->adapter_0_weight = get_tensor(ctx_meta, "adapter.0.weight");
@@ -785,8 +902,8 @@ voxtral_model * voxtral_model_load_from_file(
     model->tok_embeddings_weight = get_tensor(ctx_meta, "tok_embeddings.weight");
     model->dec_norm_weight       = get_tensor(ctx_meta, "norm.weight");
 
-    model->dec_layers.resize(VOXTRAL_DEC_LAYERS);
-    for (int32_t i = 0; i < VOXTRAL_DEC_LAYERS; i++) {
+    model->dec_layers.resize(model->hp.dec_layers);
+    for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         char nm[256];
         auto & L = model->dec_layers[i];
         snprintf(nm,sizeof(nm),"dec.blk.%d.attn_norm.weight",i); L.attn_norm_weight = get_tensor(ctx_meta,nm);
@@ -798,8 +915,13 @@ voxtral_model * voxtral_model_load_from_file(
         snprintf(nm,sizeof(nm),"dec.blk.%d.ffn_w1.weight",i);    L.ffn_w1_weight = get_tensor(ctx_meta,nm);
         snprintf(nm,sizeof(nm),"dec.blk.%d.ffn_w2.weight",i);    L.ffn_w2_weight = get_tensor(ctx_meta,nm);
         snprintf(nm,sizeof(nm),"dec.blk.%d.ffn_w3.weight",i);    L.ffn_w3_weight = get_tensor(ctx_meta,nm);
-        snprintf(nm,sizeof(nm),"dec.blk.%d.ada0.weight",i);      L.ada0_weight   = get_tensor(ctx_meta,nm);
-        snprintf(nm,sizeof(nm),"dec.blk.%d.ada2.weight",i);      L.ada2_weight   = get_tensor(ctx_meta,nm);
+        // Adaptive RMS-norm time-conditioning weights are realtime-only.
+        L.ada0_weight = nullptr;
+        L.ada2_weight = nullptr;
+        if (model->hp.ada_t_cond) {
+            snprintf(nm,sizeof(nm),"dec.blk.%d.ada0.weight",i);  L.ada0_weight   = get_tensor(ctx_meta,nm);
+            snprintf(nm,sizeof(nm),"dec.blk.%d.ada2.weight",i);  L.ada2_weight   = get_tensor(ctx_meta,nm);
+        }
     }
 
     model->mel_filters = get_tensor(ctx_meta, "audio.mel_filters");
@@ -837,23 +959,26 @@ voxtral_model * voxtral_model_load_from_file(
         }
     }
 
-    log_info("model loaded: enc_layers=" + std::to_string(VOXTRAL_ENC_LAYERS) +
-             " dec_layers=" + std::to_string(VOXTRAL_DEC_LAYERS) +
-             " vocab=" + std::to_string(VOXTRAL_VOCAB_SIZE));
+    log_info(std::string("model arch: ") + (model->hp.is_offline ? "voxtral (offline)" : "voxtral_realtime") +
+             " enc_causal=" + (model->hp.enc_causal ? "1" : "0") +
+             " ada_t_cond=" + (model->hp.ada_t_cond ? "1" : "0"));
+    log_info("model loaded: enc_layers=" + std::to_string(model->hp.enc_layers) +
+             " dec_layers=" + std::to_string(model->hp.dec_layers) +
+             " vocab=" + std::to_string(model->hp.vocab_size));
 
     if (model->buf_weights) {
         const double sz_mb = (double) ggml_backend_buffer_get_size(model->buf_weights) / 1e6;
         log_info("model weights: " + std::to_string(sz_mb) + " MB");
     }
-    log_info("encoder: dim=" + std::to_string(VOXTRAL_ENC_DIM) +
-             " heads=" + std::to_string(VOXTRAL_ENC_HEADS) +
-             " head_dim=" + std::to_string(VOXTRAL_ENC_HEAD_DIM) +
-             " hidden=" + std::to_string(VOXTRAL_ENC_HIDDEN));
-    log_info("decoder: dim=" + std::to_string(VOXTRAL_DEC_DIM) +
-             " heads=" + std::to_string(VOXTRAL_DEC_HEADS) +
-             " head_dim=" + std::to_string(VOXTRAL_DEC_HEAD_DIM) +
-             " hidden=" + std::to_string(VOXTRAL_DEC_HIDDEN) +
-             " kv_heads=" + std::to_string(VOXTRAL_DEC_KV_HEADS));
+    log_info("encoder: dim=" + std::to_string(model->hp.enc_dim) +
+             " heads=" + std::to_string(model->hp.enc_heads) +
+             " head_dim=" + std::to_string(model->hp.enc_head_dim) +
+             " hidden=" + std::to_string(model->hp.enc_hidden));
+    log_info("decoder: dim=" + std::to_string(model->hp.dec_dim) +
+             " heads=" + std::to_string(model->hp.dec_heads) +
+             " head_dim=" + std::to_string(model->hp.dec_head_dim) +
+             " hidden=" + std::to_string(model->hp.dec_hidden) +
+             " kv_heads=" + std::to_string(model->hp.dec_kv_heads));
 
     {
         char buf[128];
@@ -885,9 +1010,13 @@ voxtral_context * voxtral_init_from_model(
     ctx->model     = model;
     ctx->log_level = params.log_level;
     ctx->logger    = params.logger;
-    ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    if (params.n_threads > 0) {
+        ctx->n_threads = params.n_threads;
+    } else {
+        const unsigned hw = std::thread::hardware_concurrency();
+        ctx->n_threads = hw > 0 ? (int32_t) std::min(hw, 16u) : 4;
+    }
 
-    // Select GPU backend — inherit from model if params say none
     voxtral_gpu_backend gpu = params.gpu;
     if (gpu == voxtral_gpu_backend::none && model && model->weights_on_gpu) {
         gpu = model->gpu_type;
@@ -960,7 +1089,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
-        constexpr size_t n_tensors = 4;
+        constexpr size_t n_tensors = 5;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -968,7 +1097,7 @@ voxtral_context * voxtral_init_from_model(
         };
         ctx->ctx_persistent = ggml_init(p);
 
-        // encoder_chunk_output: [enc_dim, MAX_ENC_CHUNK] (reused per chunk)
+        // encoder_chunk_output: [enc_dim, MAX_ENC_CHUNK]
         ctx->encoder_chunk_output = ggml_new_tensor_2d(ctx->ctx_persistent, GGML_TYPE_F32,
             VOXTRAL_ENC_DIM, VOXTRAL_MAX_ENC_CHUNK);
         ggml_set_name(ctx->encoder_chunk_output, "encoder_chunk_output");
@@ -978,14 +1107,21 @@ voxtral_context * voxtral_init_from_model(
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
 
-        // KV cache: [kv_dim, dec_window, dec_layers]
-        const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM;  // 1024
+        // decoder_argmax: [1] i32 — greedy token id computed on device, so the
+        // hot decode loop reads back 4 bytes instead of the full vocab logits.
+        ctx->decoder_argmax = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_I32, 1);
+        ggml_set_name(ctx->decoder_argmax, "decoder_argmax");
+
+        // KV cache: [kv_dim, dec_window, dec_layers] — layer count is model-dependent
+        // (realtime 26, offline 30); window is the physical cache capacity for both.
+        const int32_t kv_dim = ctx->model->hp.dec_kv_heads * ctx->model->hp.dec_head_dim;  // 1024
+        const int32_t kv_layers = ctx->model->hp.dec_layers;
         ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
-            kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
+            kv_dim, VOXTRAL_DEC_WINDOW, kv_layers);
         ggml_set_name(ctx->kv_self_k, "kv_self_k");
 
         ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
-            kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
+            kv_dim, VOXTRAL_DEC_WINDOW, kv_layers);
         ggml_set_name(ctx->kv_self_v, "kv_self_v");
 
         ctx->buf_persistent = ggml_backend_alloc_ctx_tensors(ctx->ctx_persistent, ctx->backend);
@@ -1008,7 +1144,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Schedulers — ggml requires the last backend to be CPU.
     // With GPU:    [GPU, BLAS?, CPU]
-    // Without GPU: [BLAS?, CPU]  (ctx->backend IS the CPU backend)
+    // Without GPU: [BLAS?, CPU]
     ggml_backend_t backends[4];
     int n_backends = 0;
     if (has_gpu) {
@@ -1106,7 +1242,7 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
     const size_t row_bytes = ctx->kv_self_k->nb[1];
     const size_t layer_stride = ctx->kv_self_k->nb[2];
 
-    for (int32_t l = 0; l < VOXTRAL_DEC_LAYERS; ++l) {
+    for (int32_t l = 0; l < ctx->model->hp.dec_layers; ++l) {
         uint8_t * k_base = k_data + (size_t) l * layer_stride;
         uint8_t * v_base = v_data + (size_t) l * layer_stride;
 
@@ -1231,7 +1367,8 @@ ggml_tensor * causal_conv1d_graph(
     int32_t out_channels,
     int32_t kernel_size,
     int32_t stride,
-    int32_t & out_len) {
+    int32_t & out_len,
+    bool symmetric = false) {
     out_len = 0;
     if (ctx0 == nullptr || x == nullptr || weight == nullptr || kernel_size <= 0 || stride <= 0) {
         return nullptr;
@@ -1240,7 +1377,17 @@ ggml_tensor * causal_conv1d_graph(
         return nullptr;
     }
 
-    const auto dims = compute_causal_conv1d_dims(in_len, kernel_size, stride);
+    causal_conv1d_dims dims{};
+    if (symmetric) {
+        // PyTorch Conv1d(padding=p) with p=(kernel-1)/2 — used by the offline Whisper encoder.
+        const int32_t p = (kernel_size - 1) / 2;
+        dims.pad_left = p;
+        dims.pad_right = p;
+        dims.padded_len = in_len + 2 * p;
+        dims.out_len = (dims.padded_len - kernel_size) / stride + 1;
+    } else {
+        dims = compute_causal_conv1d_dims(in_len, kernel_size, stride);
+    }
     if (dims.out_len <= 0) {
         return nullptr;
     }
@@ -1297,6 +1444,16 @@ static void log_graph_info(voxtral_context * ctx, const char * name, struct ggml
 }
 
 // Build encoder graph that writes output into ctx->encoder_chunk_output
+// Apply LayerNorm (offline Whisper: weight+bias) or RMSNorm (realtime: weight only),
+// if a bias tensor is provided.
+static ggml_tensor * enc_apply_norm(ggml_context * gctx, ggml_tensor * x,
+                                    ggml_tensor * w, ggml_tensor * b, float eps, bool layernorm) {
+    ggml_tensor * n = layernorm ? ggml_norm(gctx, x, eps) : ggml_rms_norm(gctx, x, eps);
+    n = ggml_mul(gctx, n, w);
+    if (b) n = ggml_add(gctx, n, b);
+    return n;
+}
+
 static ggml_cgraph * build_encoder_graph(
     voxtral_context * ctx,
     ggml_context * gctx,
@@ -1323,11 +1480,12 @@ static ggml_cgraph * build_encoder_graph(
     log_tensor_info(ctx, "enc.conv1.weight", model->enc_conv1_weight);
     log_tensor_info(ctx, "mel_input", mel_input);
 
+    const bool conv_sym = model->hp.is_offline;  // offline Whisper uses symmetric conv padding
     int32_t conv0_len = 0;
     ggml_tensor * conv0_out = causal_conv1d_graph(
         gctx, mel_input, n_frames,
         model->enc_conv0_weight, model->enc_conv0_bias,
-        VOXTRAL_ENC_DIM, 3, 1, conv0_len);
+        model->hp.enc_dim, 3, 1, conv0_len, conv_sym);
     if (conv0_out == nullptr) {
         LOG_ERR(ctx, "conv0_out is null");
         return gf;
@@ -1339,7 +1497,7 @@ static ggml_cgraph * build_encoder_graph(
     ggml_tensor * conv1_out = causal_conv1d_graph(
         gctx, conv0_out, conv0_len,
         model->enc_conv1_weight, model->enc_conv1_bias,
-        VOXTRAL_ENC_DIM, 3, 2, conv_out_len);
+        model->hp.enc_dim, 3, 2, conv_out_len, conv_sym);
     if (conv1_out == nullptr) {
         LOG_ERR(ctx, "conv1_out is null");
         return gf;
@@ -1353,13 +1511,13 @@ static ggml_cgraph * build_encoder_graph(
     // This is what we need for mul_mat: ggml_mul_mat(weight[out,in], x[in,seq]) -> [out,seq]
 
     // Left-truncate to multiple of downsample_factor (matching Python)
-    const int32_t trunc = conv_out_len % VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int32_t trunc = conv_out_len % model->hp.downsample_factor;
     ggml_tensor * x_len_first = conv1_out;
     int32_t seq_len = conv_out_len;
     if (trunc > 0) {
         // Skip first 'trunc' frames along length dimension (ne0)
         x_len_first = ggml_view_3d(gctx, conv1_out,
-            conv_out_len - trunc, VOXTRAL_ENC_DIM, 1,
+            conv_out_len - trunc, model->hp.enc_dim, 1,
             conv1_out->nb[1], conv1_out->nb[2],
             (size_t) trunc * conv1_out->nb[0]); // [len, enc_dim, 1]
         seq_len = conv_out_len - trunc;
@@ -1370,7 +1528,14 @@ static ggml_cgraph * build_encoder_graph(
     // Transpose to [enc_dim, seq_len] for transformer blocks
     ggml_tensor * x = ggml_permute(gctx, x_len_first, 1, 0, 2, 3); // [enc_dim, seq_len, 1]
     x = ggml_cont(gctx, x);
-    x = ggml_reshape_2d(gctx, x, VOXTRAL_ENC_DIM, seq_len);
+    x = ggml_reshape_2d(gctx, x, model->hp.enc_dim, seq_len);
+    // Offline Whisper encoder: add fixed sinusoidal positional embeddings to the
+    // conv output (it uses absolute positions, not RoPE).
+    if (model->hp.is_offline && model->enc_pos_embedding) {
+        ggml_tensor * pos = ggml_view_2d(gctx, model->enc_pos_embedding,
+            model->hp.enc_dim, seq_len, model->enc_pos_embedding->nb[1], 0);
+        x = ggml_add(gctx, x, pos);
+    }
     log_tensor_info(ctx, "encoder_x", x);
 
     // Position tensor for RoPE: [seq_len] int32
@@ -1378,87 +1543,95 @@ static ggml_cgraph * build_encoder_graph(
     ggml_set_name(enc_positions, "enc_positions");
     ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_positions, ctx->backend);
 
-    // Encoder attention mask (sliding causal window)
-    ggml_tensor * enc_attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, seq_len, seq_len);
-    ggml_set_name(enc_attn_mask, "enc_attn_mask");
-    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_attn_mask, ctx->backend);
-
-    // Cast mask to F16 for flash attention
-    ggml_tensor * enc_attn_mask_f16 = ggml_cast(gctx, enc_attn_mask, GGML_TYPE_F16);
+    // Encoder attention mask (sliding causal window) — realtime only. The offline
+    // Whisper encoder uses full bidirectional attention, so no mask is created.
+    ggml_tensor * enc_attn_mask_f16 = nullptr;
+    if (!model->hp.is_offline) {
+        ggml_tensor * enc_attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, seq_len, seq_len);
+        ggml_set_name(enc_attn_mask, "enc_attn_mask");
+        ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_attn_mask, ctx->backend);
+        enc_attn_mask_f16 = ggml_cast(gctx, enc_attn_mask, GGML_TYPE_F16);
+    }
 
     // Transformer layers
-    for (int32_t i = 0; i < VOXTRAL_ENC_LAYERS; i++) {
+    const auto & hp = model->hp;
+    const bool   ln = hp.is_offline;       // offline = LayerNorm; realtime = RMSNorm
+    const int32_t e_heads    = hp.enc_heads;
+    const int32_t e_kv_heads = hp.enc_kv_heads;
+    const int32_t e_hd       = hp.enc_head_dim;
+    for (int32_t i = 0; i < hp.enc_layers; i++) {
         auto & L = model->enc_layers[i];
 
-        // Pre-attention RMS norm
+        // Pre-attention norm (LayerNorm for offline, RMSNorm for realtime)
         ggml_tensor * residual = x; // [enc_dim, seq_len]
-        ggml_tensor * x_norm = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS); // [enc_dim, seq_len]
-        x_norm = ggml_mul(gctx, x_norm, L.attn_norm_weight); // [enc_dim, seq_len]
+        ggml_tensor * x_norm = enc_apply_norm(gctx, x, L.attn_norm_weight, L.attn_norm_bias, hp.enc_norm_eps, ln);
 
         // Q, K, V projections
-        ggml_tensor * q = ggml_mul_mat(gctx, L.attn_q_weight, x_norm); // [enc_heads*head_dim, seq_len]
-        q = ggml_add(gctx, q, L.attn_q_bias); // [enc_heads*head_dim, seq_len]
+        ggml_tensor * q = ggml_mul_mat(gctx, L.attn_q_weight, x_norm); // [e_heads*hd, seq_len]
+        q = ggml_add(gctx, q, L.attn_q_bias);
 
-        ggml_tensor * k = ggml_mul_mat(gctx, L.attn_k_weight, x_norm); // [enc_kv_heads*head_dim, seq_len]
-        // k has no bias in encoder
+        ggml_tensor * k = ggml_mul_mat(gctx, L.attn_k_weight, x_norm); // [e_kv_heads*hd, seq_len] (no bias)
 
-        ggml_tensor * v = ggml_mul_mat(gctx, L.attn_v_weight, x_norm); // [enc_kv_heads*head_dim, seq_len]
-        v = ggml_add(gctx, v, L.attn_v_bias); // [enc_kv_heads*head_dim, seq_len]
+        ggml_tensor * v = ggml_mul_mat(gctx, L.attn_v_weight, x_norm); // [e_kv_heads*hd, seq_len]
+        v = ggml_add(gctx, v, L.attn_v_bias);
 
-        // Reshape for RoPE: [head_dim, n_heads, seq_len]
-        q = ggml_reshape_3d(gctx, q, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_HEADS, seq_len);
-        k = ggml_reshape_3d(gctx, k, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, seq_len);
+        q = ggml_reshape_3d(gctx, q, e_hd, e_heads, seq_len);
+        k = ggml_reshape_3d(gctx, k, e_hd, e_kv_heads, seq_len);
 
-        // Apply RoPE (interleaved, mode=0)
-        // ggml_rope_ext expects: a=[head_dim, n_heads, seq], b=[seq] positions
-        q = ggml_rope_ext(gctx, q, enc_positions, nullptr,
-            VOXTRAL_ENC_HEAD_DIM, 0, 0,
-            VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); // [head_dim, n_heads, seq_len]
-        k = ggml_rope_ext(gctx, k, enc_positions, nullptr,
-            VOXTRAL_ENC_HEAD_DIM, 0, 0,
-            VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); // [head_dim, n_kv_heads, seq_len]
+        // Realtime encoder uses RoPE; offline Whisper encoder uses absolute
+        // sinusoidal positions added above, so no RoPE here.
+        if (!hp.is_offline) {
+            q = ggml_rope_ext(gctx, q, enc_positions, nullptr,
+                e_hd, 0, 0, hp.enc_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            k = ggml_rope_ext(gctx, k, enc_positions, nullptr,
+                e_hd, 0, 0, hp.enc_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
 
-        // Flash attention
-        // Q: [head_dim, n_heads, seq_len] -> [head_dim, seq_len, n_heads]
-        q = ggml_permute(gctx, q, 0, 2, 1, 3); // [head_dim, seq_len, n_heads]
-        k = ggml_permute(gctx, k, 0, 2, 1, 3); // [head_dim, seq_len, n_kv_heads]
+        q = ggml_permute(gctx, q, 0, 2, 1, 3); // [hd, seq_len, e_heads]
+        k = ggml_permute(gctx, k, 0, 2, 1, 3); // [hd, seq_len, e_kv_heads]
 
-        // V: [enc_kv_heads*head_dim, seq_len] -> [head_dim, n_kv_heads, seq_len] -> [head_dim, seq_len, n_kv_heads]
-        v = ggml_reshape_3d(gctx, v, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, seq_len);
-        v = ggml_permute(gctx, v, 0, 2, 1, 3); // [head_dim, seq_len, n_kv_heads]
+        v = ggml_reshape_3d(gctx, v, e_hd, e_kv_heads, seq_len);
+        v = ggml_permute(gctx, v, 0, 2, 1, 3); // [hd, seq_len, e_kv_heads]
 
-        const float scale = 1.0f / sqrtf((float)VOXTRAL_ENC_HEAD_DIM);
+        const float scale = 1.0f / sqrtf((float)e_hd);
 
-        // ggml_flash_attn_ext fuses Q@K^T, scale, mask, softmax, @V
-        ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q, k, v, enc_attn_mask_f16, scale, 0.0f, 0.0f);
-        // Output: [head_dim, n_heads, seq_len] (already permuted by flash_attn_ext)
+        // Mask: realtime passes the sliding-causal mask; offline passes none (full attention).
+        ggml_tensor * mask = ln ? nullptr : enc_attn_mask_f16;
+        ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q, k, v, mask, scale, 0.0f, 0.0f);
         attn_out = ggml_cont(gctx, attn_out);
-        attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_ENC_HEADS * VOXTRAL_ENC_HEAD_DIM, seq_len); // [n_heads*head_dim, seq_len]
+        attn_out = ggml_reshape_2d(gctx, attn_out, e_heads * e_hd, seq_len);
 
         // Output projection + residual
         ggml_tensor * attn_proj = ggml_mul_mat(gctx, L.attn_o_weight, attn_out); // [enc_dim, seq_len]
-        attn_proj = ggml_add(gctx, attn_proj, L.attn_o_bias); // [enc_dim, seq_len]
-        x = ggml_add(gctx, residual, attn_proj); // [enc_dim, seq_len]
+        attn_proj = ggml_add(gctx, attn_proj, L.attn_o_bias);
+        x = ggml_add(gctx, residual, attn_proj);
 
         // FFN
-        residual = x; // [enc_dim, seq_len]
-        x_norm = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS); // [enc_dim, seq_len]
-        x_norm = ggml_mul(gctx, x_norm, L.ffn_norm_weight); // [enc_dim, seq_len]
+        residual = x;
+        x_norm = enc_apply_norm(gctx, x, L.ffn_norm_weight, L.ffn_norm_bias, hp.enc_norm_eps, ln);
 
-        // SwiGLU: silu(w1(x)) * w3(x), then w2
-        ggml_tensor * gate = ggml_mul_mat(gctx, L.ffn_w1_weight, x_norm); // [enc_hidden, seq_len]
-        gate = ggml_silu(gctx, gate); // [enc_hidden, seq_len]
-        ggml_tensor * up = ggml_mul_mat(gctx, L.ffn_w3_weight, x_norm); // [enc_hidden, seq_len]
-        ggml_tensor * ffn_out = ggml_mul(gctx, gate, up); // [enc_hidden, seq_len]
-        ffn_out = ggml_mul_mat(gctx, L.ffn_w2_weight, ffn_out); // [enc_dim, seq_len]
-        ffn_out = ggml_add(gctx, ffn_out, L.ffn_w2_bias); // [enc_dim, seq_len]
+        ggml_tensor * ffn_out;
+        if (hp.is_offline) {
+            // Standard Whisper MLP: w2(gelu(w1 x + b1)) + b2
+            ggml_tensor * h = ggml_mul_mat(gctx, L.ffn_w1_weight, x_norm); // [enc_hidden, seq_len]
+            if (L.ffn_w1_bias) h = ggml_add(gctx, h, L.ffn_w1_bias);
+            h = ggml_gelu_erf(gctx, h);
+            ffn_out = ggml_mul_mat(gctx, L.ffn_w2_weight, h); // [enc_dim, seq_len]
+        } else {
+            // Realtime SwiGLU: silu(w1 x) * w3(x), then w2
+            ggml_tensor * gate = ggml_mul_mat(gctx, L.ffn_w1_weight, x_norm);
+            gate = ggml_silu(gctx, gate);
+            ggml_tensor * up = ggml_mul_mat(gctx, L.ffn_w3_weight, x_norm);
+            ffn_out = ggml_mul(gctx, gate, up);
+            ffn_out = ggml_mul_mat(gctx, L.ffn_w2_weight, ffn_out); // [enc_dim, seq_len]
+        }
+        if (L.ffn_w2_bias) ffn_out = ggml_add(gctx, ffn_out, L.ffn_w2_bias);
 
-        x = ggml_add(gctx, residual, ffn_out); // [enc_dim, seq_len]
+        x = ggml_add(gctx, residual, ffn_out);
     }
 
     // Final norm
-    x = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS); // [enc_dim, seq_len]
-    x = ggml_mul(gctx, x, model->enc_norm_weight); // [enc_dim, seq_len]
+    x = enc_apply_norm(gctx, x, model->enc_norm_weight, model->enc_norm_bias, hp.enc_norm_eps, ln);
 
     // Copy result to encoder_chunk_output (per-chunk buffer, reused each chunk)
     ggml_tensor * enc_out_view = ggml_view_2d(gctx, ctx->encoder_chunk_output,
@@ -1534,13 +1707,19 @@ static ggml_tensor * build_decoder_layer(
     ggml_tensor  * attn_mask)  // [n_kv, n_tokens] or nullptr
 {
     voxtral_model * model = ctx->model;
+    const auto & hp = model->hp;
     auto & L = model->dec_layers[layer_idx];
 
-    const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM; // 1024
+    const int32_t head_dim   = hp.dec_head_dim;
+    const int32_t n_heads    = hp.dec_heads;
+    const int32_t n_kv_heads = hp.dec_kv_heads;
+    const int32_t kv_dim     = n_kv_heads * head_dim;
+    const float   norm_eps   = hp.dec_norm_eps;
+    const float   dec_rope_theta = hp.dec_rope_theta;
 
     // Pre-attention RMS norm
     ggml_tensor * residual = x; // [dec_dim, n_tokens]
-    ggml_tensor * x_norm = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, n_tokens]
+    ggml_tensor * x_norm = ggml_rms_norm(gctx, x, norm_eps); // [dec_dim, n_tokens]
     x_norm = ggml_mul(gctx, x_norm, L.attn_norm_weight); // [dec_dim, n_tokens]
 
     // Q, K, V (no bias in decoder)
@@ -1549,19 +1728,17 @@ static ggml_tensor * build_decoder_layer(
     ggml_tensor * v = ggml_mul_mat(gctx, L.attn_v_weight, x_norm); // [kv_dim, n_tokens]
 
     // Reshape for RoPE: [head_dim, n_heads, n_tokens]
-    q = ggml_reshape_3d(gctx, q, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_HEADS, n_tokens);
-    k = ggml_reshape_3d(gctx, k, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, n_tokens);
+    q = ggml_reshape_3d(gctx, q, head_dim, n_heads, n_tokens);
+    k = ggml_reshape_3d(gctx, k, head_dim, n_kv_heads, n_tokens);
 
     // RoPE (interleaved, mode=0)
     q = ggml_rope_ext(gctx, q, positions, nullptr,
-        VOXTRAL_DEC_HEAD_DIM, 0, 0,
-        VOXTRAL_DEC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        head_dim, 0, 0, dec_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(gctx, k, positions, nullptr,
-        VOXTRAL_DEC_HEAD_DIM, 0, 0,
-        VOXTRAL_DEC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        head_dim, 0, 0, dec_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
     // Flatten Q back: [head_dim, n_heads, n_tokens] -> [n_heads*head_dim, n_tokens]
-    q = ggml_cont(gctx, ggml_reshape_2d(gctx, q, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, n_tokens));
+    q = ggml_cont(gctx, ggml_reshape_2d(gctx, q, n_heads * head_dim, n_tokens));
     k = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, n_tokens));
 
     // Store K, V in KV cache at positions [kv_offset .. kv_offset+n_tokens-1]
@@ -1594,18 +1771,18 @@ static ggml_tensor * build_decoder_layer(
 
     // Flash attention with GQA
     // Q: [n_heads*head_dim, n_tokens] -> [head_dim, n_heads, n_tokens] -> [head_dim, n_tokens, n_heads]
-    ggml_tensor * q3 = ggml_reshape_3d(gctx, q, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_HEADS, n_tokens);
+    ggml_tensor * q3 = ggml_reshape_3d(gctx, q, head_dim, n_heads, n_tokens);
     q3 = ggml_permute(gctx, q3, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads]
 
     // K: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
-    ggml_tensor * k3 = ggml_reshape_3d(gctx, k_full, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, n_kv);
+    ggml_tensor * k3 = ggml_reshape_3d(gctx, k_full, head_dim, n_kv_heads, n_kv);
     k3 = ggml_permute(gctx, k3, 0, 2, 1, 3); // [head_dim, n_kv, n_kv_heads]
 
     // V: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
-    ggml_tensor * v3 = ggml_reshape_3d(gctx, v_full, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, n_kv);
+    ggml_tensor * v3 = ggml_reshape_3d(gctx, v_full, head_dim, n_kv_heads, n_kv);
     v3 = ggml_permute(gctx, v3, 0, 2, 1, 3); // [head_dim, n_kv, n_kv_heads]
 
-    const float scale = 1.0f / sqrtf((float)VOXTRAL_DEC_HEAD_DIM);
+    const float scale = 1.0f / sqrtf((float) head_dim);
 
     // ggml_flash_attn_ext fuses Q@K^T, scale, mask, softmax, @V in one op
     // GQA broadcast is built-in (n_heads % n_kv_heads == 0)
@@ -1614,7 +1791,7 @@ static ggml_tensor * build_decoder_layer(
     ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask_f16, scale, 0.0f, 0.0f);
     // Output: [head_dim, n_heads, n_tokens] (already permuted by flash_attn_ext)
     attn_out = ggml_cont(gctx, attn_out);
-    attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, n_tokens);
+    attn_out = ggml_reshape_2d(gctx, attn_out, n_heads * head_dim, n_tokens);
 
     // Output projection + residual
     ggml_tensor * attn_proj = ggml_mul_mat(gctx, L.attn_o_weight, attn_out); // [dec_dim, n_tokens]
@@ -1622,13 +1799,12 @@ static ggml_tensor * build_decoder_layer(
 
     // Pre-FFN RMS norm
     residual = x; // [dec_dim, n_tokens]
-    ggml_tensor * h_norm = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, n_tokens]
+    ggml_tensor * h_norm = ggml_rms_norm(gctx, x, norm_eps); // [dec_dim, n_tokens]
     h_norm = ggml_mul(gctx, h_norm, L.ffn_norm_weight); // [dec_dim, n_tokens]
 
-    // Ada time conditioning: h_norm = h_norm * (1 + ada_mlp(time_emb))
-    // = h_norm + h_norm * ada_scale
-    // ada_mlp: Linear(3072->32) -> GELU -> Linear(32->3072)
-    {
+    // Ada time conditioning: h_norm *= (1 + ada_mlp(time_emb)).
+    // The offline Ministral decoder has no time conditioning just RMSNorm.
+    if (model->hp.ada_t_cond && L.ada0_weight && L.ada2_weight && time_emb) {
         ggml_tensor * ada_hidden = ggml_mul_mat(gctx, L.ada0_weight, time_emb); // [ada_dim]
         ada_hidden = ggml_gelu_erf(gctx, ada_hidden); // [ada_dim]
         ggml_tensor * ada_scale = ggml_mul_mat(gctx, L.ada2_weight, ada_hidden); // [dec_dim]
@@ -1695,13 +1871,13 @@ static ggml_cgraph * build_decoder_prefill_graph(
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, causal_mask, ctx->backend);
 
     // Decoder layers
-    for (int32_t i = 0; i < VOXTRAL_DEC_LAYERS; i++) {
+    for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         x = build_decoder_layer(ctx, gctx, gf, x, positions, time_emb,
             i, n_tokens, /*kv_offset=*/0, causal_mask);
     }
 
     // Final norm
-    x = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, n_tokens]
+    x = ggml_rms_norm(gctx, x, model->hp.dec_norm_eps); // [dec_dim, n_tokens]
     x = ggml_mul(gctx, x, model->dec_norm_weight); // [dec_dim, n_tokens]
 
     // Logits for last token only: extract last token -> matmul with embeddings
@@ -1714,6 +1890,17 @@ static ggml_cgraph * build_decoder_prefill_graph(
     ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
 
     return gf;
+}
+
+// Emit logits = W @ last_hidden into the persistent decoder_logits tensor, plus an
+// on-device greedy argmax into decoder_argmax (so the hot loop reads back 4 bytes).
+// last_hidden is [dec_dim]; W is the tied (tok_embeddings) or untied output proj.
+static void emit_logits_argmax(voxtral_context * ctx, ggml_context * gctx, ggml_cgraph * gf,
+                               ggml_tensor * last_hidden, ggml_tensor * W) {
+    ggml_tensor * logits = ggml_mul_mat(gctx, W, last_hidden); // [vocab]
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    ggml_tensor * amax = ggml_argmax(gctx, ggml_reshape_2d(gctx, logits, ctx->model->hp.vocab_size, 1));
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, amax, ctx->decoder_argmax));
 }
 
 // ============================================================================
@@ -1758,22 +1945,102 @@ static ggml_cgraph * build_decoder_step_graph(
     ggml_tensor * x = ggml_add(gctx, tok_emb, audio_emb); // [dec_dim, 1]
 
     // Decoder layers (no mask needed for single token - all KV positions are valid)
-    for (int32_t i = 0; i < VOXTRAL_DEC_LAYERS; i++) {
+    for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         x = build_decoder_layer(ctx, gctx, gf, x, pos_tensor, time_emb,
             i, 1, /*kv_offset=*/kv_used, /*attn_mask=*/nullptr);
     }
 
     // Final norm
-    x = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, 1]
+    x = ggml_rms_norm(gctx, x, model->hp.dec_norm_eps); // [dec_dim, 1]
     x = ggml_mul(gctx, x, model->dec_norm_weight); // [dec_dim, 1]
 
-    // Logits
+    // Logits (tied to token embeddings) + on-device argmax.
     ggml_tensor * x_flat = ggml_reshape_1d(gctx, x, VOXTRAL_DEC_DIM); // [dec_dim]
-    ggml_tensor * logits = ggml_mul_mat(gctx, model->tok_embeddings_weight, x_flat); // [vocab_size]
+    emit_logits_argmax(ctx, gctx, gf, x_flat, model->tok_embeddings_weight);
 
-    // Copy to persistent
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    return gf;
+}
 
+// ============================================================================
+// Graph Building: Offline decode (Voxtral-Mini-3B-2507)
+//
+// The offline model is a standard audio-LLM: the prompt is a mixed sequence of
+// text-token embeddings and audio embeddings (the adapter output substituted at
+// the [AUDIO] placeholder positions), prefilled once; then text tokens are
+// generated autoregressively until EOS. No per-frame audio indexing, no ada.
+// ============================================================================
+
+// Final RMS norm + (untied) output projection + argmax for the LAST token only.
+static void offline_logits_tail(voxtral_context * ctx, ggml_context * gctx, ggml_cgraph * gf,
+                                ggml_tensor * x /*[dec_dim, n_tokens]*/, int32_t n_tokens) {
+    voxtral_model * m = ctx->model;
+    ggml_tensor * last = ggml_view_1d(gctx, x, m->hp.dec_dim,
+        (size_t)(n_tokens - 1) * x->nb[1]); // [dec_dim]
+    last = ggml_rms_norm(gctx, last, m->hp.dec_norm_eps);
+    last = ggml_mul(gctx, last, m->dec_norm_weight);
+    // Offline model has an untied output projection; fall back to tied embeddings.
+    ggml_tensor * W = m->output_weight ? m->output_weight : m->tok_embeddings_weight;
+    emit_logits_argmax(ctx, gctx, gf, last, W);
+}
+
+// Prefill: prefix text tokens + n_audio audio embeddings + suffix text tokens.
+static ggml_cgraph * build_offline_prefill_graph(
+    voxtral_context * ctx, ggml_context * gctx,
+    int32_t n_prefix, int32_t n_audio, int32_t n_suffix) {
+    voxtral_model * model = ctx->model;
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
+    const int32_t n_tokens = n_prefix + n_audio + n_suffix;
+
+    ggml_tensor * prefix_ids = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_prefix);
+    ggml_set_name(prefix_ids, "prefix_ids");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, prefix_ids, ctx->backend);
+    ggml_tensor * suffix_ids = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_suffix);
+    ggml_set_name(suffix_ids, "suffix_ids");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, suffix_ids, ctx->backend);
+
+    ggml_tensor * prefix_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, prefix_ids); // [dec_dim, n_prefix]
+    ggml_tensor * audio_emb = ggml_cont(gctx, ggml_view_2d(gctx, ctx->decoder_memory,
+        model->hp.dec_dim, n_audio, ctx->decoder_memory->nb[1], 0)); // [dec_dim, n_audio]
+    ggml_tensor * suffix_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, suffix_ids); // [dec_dim, n_suffix]
+
+    ggml_tensor * x = ggml_concat(gctx, prefix_emb, audio_emb, 1);
+    x = ggml_concat(gctx, x, suffix_emb, 1); // [dec_dim, n_tokens]
+
+    ggml_tensor * positions = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(positions, "positions");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, positions, ctx->backend);
+
+    ggml_tensor * causal_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    ggml_set_name(causal_mask, "causal_mask");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, causal_mask, ctx->backend);
+
+    for (int32_t i = 0; i < model->hp.dec_layers; i++) {
+        x = build_decoder_layer(ctx, gctx, gf, x, positions, /*time_emb=*/nullptr,
+            i, n_tokens, /*kv_offset=*/0, causal_mask);
+    }
+    offline_logits_tail(ctx, gctx, gf, x, n_tokens);
+    return gf;
+}
+
+// Single-token autoregressive step (no audio embedding).
+static ggml_cgraph * build_offline_step_graph(voxtral_context * ctx, ggml_context * gctx) {
+    voxtral_model * model = ctx->model;
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
+    const int32_t kv_used = ctx->kv_used;
+
+    ggml_tensor * token_id = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ggml_set_name(token_id, "token_id");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, token_id, ctx->backend);
+    ggml_tensor * pos_tensor = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ggml_set_name(pos_tensor, "position");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, pos_tensor, ctx->backend);
+
+    ggml_tensor * x = ggml_get_rows(gctx, model->tok_embeddings_weight, token_id); // [dec_dim, 1]
+    for (int32_t i = 0; i < model->hp.dec_layers; i++) {
+        x = build_decoder_layer(ctx, gctx, gf, x, pos_tensor, /*time_emb=*/nullptr,
+            i, 1, /*kv_offset=*/kv_used, /*attn_mask=*/nullptr);
+    }
+    offline_logits_tail(ctx, gctx, gf, x, 1);
     return gf;
 }
 
@@ -1783,6 +2050,53 @@ static ggml_cgraph * build_decoder_step_graph(
 
 static ggml_tensor * find_tensor_in_graph(ggml_cgraph * gf, const char * name) {
     return ggml_graph_get_tensor(gf, name);
+}
+
+// Set a named graph input tensor if it exists (no-op if absent).
+static void set_graph_input(ggml_cgraph * gf, const char * name, const void * data, size_t bytes) {
+    if (ggml_tensor * t = find_tensor_in_graph(gf, name)) {
+        ggml_backend_tensor_set(t, data, 0, bytes);
+    }
+}
+
+// Allocate a no_alloc graph context backed by `buf` (resized as needed). The
+// graph_mult scales the default node budget (step graphs use 4, larger prefill 8).
+static ggml_context * init_graph_ctx(std::vector<uint8_t> & buf, int32_t graph_mult) {
+    const size_t meta = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * graph_mult +
+                        ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * graph_mult, false);
+    if (buf.size() < meta) buf.resize(meta);
+    ggml_init_params p = { meta, buf.data(), /*.no_alloc=*/ true };
+    return ggml_init(p);
+}
+
+// Reset + allocate the graph on `sched`, run `set_inputs(gf)`, compute, then reset
+// and free `gctx`. Readbacks target persistent tensors, so the caller reads them
+// after this returns. Returns false (and frees gctx) on allocation failure.
+template <typename SetInputs>
+static bool run_graph(voxtral_context * ctx, ggml_backend_sched_t sched,
+                      ggml_context * gctx, ggml_cgraph * gf,
+                      SetInputs && set_inputs, const char * what) {
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        LOG_ERR(ctx, "%s: failed to allocate graph", what);
+        ggml_free(gctx);
+        return false;
+    }
+    set_inputs(gf);
+    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_sched_reset(sched);
+    ggml_free(gctx);
+    return true;
+}
+
+// Fill an [n, n] lower-triangular causal mask (0 = attend, -inf = masked).
+static void fill_causal_mask(std::vector<float> & mask, int32_t n) {
+    mask.assign((size_t) n * n, 0.0f);
+    for (int32_t i = 0; i < n; ++i) {
+        for (int32_t j = i + 1; j < n; ++j) {
+            mask[(size_t) i * n + j] = -INFINITY;
+        }
+    }
 }
 
 // ============================================================================
@@ -1874,6 +2188,38 @@ static bool run_encoder_chunk(
 }
 
 // Process mel spectrogram in overlapping chunks, accumulating encoder output on device
+// Encoder token count for the offline (symmetric-conv) Whisper encoder.
+static int32_t mel_frames_to_enc_tokens_sym(int32_t n_frames) {
+    const int32_t c0 = n_frames;            // conv0 k3 s1 pad1 -> same length
+    const int32_t c1 = (c0 - 1) / 2 + 1;    // conv1 k3 s2 pad1 -> (n+2-3)/2 + 1
+    return c1 - (c1 % VOXTRAL_DOWNSAMPLE_FACTOR);
+}
+
+// Offline encoder: single full-window pass (<=30s), non-causal, no chunk overlap.
+static bool run_encoder_offline(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames) {
+    int32_t est = mel_frames_to_enc_tokens_sym(total_mel_frames);
+    if (est <= 0) { LOG_ERR(ctx, "encoder offline: audio too short"); return false; }
+    if (est > VOXTRAL_MAX_ENC_CHUNK) est = VOXTRAL_MAX_ENC_CHUNK;
+    if (!alloc_encoder_output(ctx, est)) {
+        LOG_ERR(ctx, "encoder offline: failed to allocate output (%d tokens)", est);
+        return false;
+    }
+    int32_t seq_len = 0;
+    if (!run_encoder_chunk(ctx, mel_data, total_mel_frames, /*rope_pos_offset=*/0, &seq_len)) {
+        return false;
+    }
+    if (seq_len > est) seq_len = est;
+    const size_t bytes = (size_t) seq_len * VOXTRAL_ENC_DIM * sizeof(float);
+    std::vector<uint8_t> tmp(bytes);
+    ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), 0, bytes);
+    ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), 0, bytes);
+    // Trim to a multiple of the downsample factor for the adapter.
+    ctx->enc_seq_used = (seq_len / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+    ctx->total_enc_tokens = ctx->enc_seq_used;
+    LOG_INFO(ctx, "encoder offline: %d mel frames -> %d enc tokens", total_mel_frames, ctx->enc_seq_used);
+    return true;
+}
+
 static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames) {
     const int32_t mel_overlap = VOXTRAL_ENC_CHUNK_OVERLAP * 2;  // mel frames of overlap (1500)
     const int32_t mel_stride = VOXTRAL_ENC_CHUNK_MEL - mel_overlap;  // 1500
@@ -1958,7 +2304,7 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
                  chunk_seq_len, skip, stride, rope_offset);
 
         // Copy stride portion from encoder_chunk_output to encoder_output
-        // Goes through CPU (device->CPU->device), but stride data is small (~3.8 MB max)
+        // Goes through CPU (device->CPU->device)
         {
             const size_t elem_bytes = VOXTRAL_ENC_DIM * sizeof(float);
             const size_t src_offset = (size_t) skip * elem_bytes;
@@ -2049,67 +2395,26 @@ static bool run_decoder_prefill(
         return false;
     }
 
-    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
-                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
-
-    ggml_init_params p = {
-        /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
-        /*.no_alloc  =*/ true,
-    };
-    ggml_context * gctx = ggml_init(p);
-
+    static thread_local std::vector<uint8_t> meta_buf;
+    ggml_context * gctx = init_graph_ctx(meta_buf, 4);
     ggml_cgraph * gf = build_decoder_prefill_graph(ctx, gctx, n_tokens);
     log_graph_info(ctx, "decoder prefill", gf);
 
-    ggml_backend_sched_reset(ctx->sched_dec_pre);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_pre, gf)) {
-        LOG_ERR(ctx, "decoder prefill: failed to allocate graph");
-        ggml_free(gctx);
+    if (!run_graph(ctx, ctx->sched_dec_pre, gctx, gf, [&](ggml_cgraph * g) {
+        set_graph_input(g, "token_ids", token_ids, n_tokens * sizeof(int32_t));
+        std::vector<int32_t> pos(n_tokens);
+        std::iota(pos.begin(), pos.end(), 0);
+        set_graph_input(g, "positions", pos.data(), n_tokens * sizeof(int32_t));
+        set_graph_input(g, "time_emb", ctx->time_emb_cpu.data(), VOXTRAL_DEC_DIM * sizeof(float));
+        std::vector<float> mask;
+        fill_causal_mask(mask, n_tokens);
+        set_graph_input(g, "causal_mask", mask.data(), mask.size() * sizeof(float));
+    }, "decoder prefill")) {
         return false;
     }
 
-    // Set inputs
-    ggml_tensor * tok_t = find_tensor_in_graph(gf, "token_ids");
-    if (tok_t) {
-        ggml_backend_tensor_set(tok_t, token_ids, 0, n_tokens * sizeof(int32_t));
-    }
-
-    ggml_tensor * pos_t = find_tensor_in_graph(gf, "positions");
-    if (pos_t) {
-        std::vector<int32_t> pos(n_tokens);
-        std::iota(pos.begin(), pos.end(), 0);
-        ggml_backend_tensor_set(pos_t, pos.data(), 0, n_tokens * sizeof(int32_t));
-    }
-
-    ggml_tensor * time_t = find_tensor_in_graph(gf, "time_emb");
-    if (time_t) {
-        ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
-    }
-
-    // Set causal mask: lower-triangular (0 for allowed, -inf for masked)
-    ggml_tensor * mask_t = find_tensor_in_graph(gf, "causal_mask");
-    if (mask_t) {
-        std::vector<float> mask(n_tokens * n_tokens);
-        for (int32_t i = 0; i < n_tokens; i++) {
-            for (int32_t j = 0; j < n_tokens; j++) {
-                mask[i * n_tokens + j] = (j <= i) ? 0.0f : -INFINITY;
-            }
-        }
-        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
-    }
-
-    // Compute
-    ggml_backend_sched_graph_compute(ctx->sched_dec_pre, gf);
-
-    // Read logits
     ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
-
     ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
-
-    ggml_backend_sched_reset(ctx->sched_dec_pre);
-    ggml_free(gctx);
 
     LOG_INFO(ctx, "decoder prefill done");
     return true;
@@ -2124,64 +2429,204 @@ static bool run_decoder_step(
     int32_t           token_id,
     int32_t           position,     // absolute position in decoder sequence
     int32_t           audio_pos,    // position in adapter output for audio embedding
-    float           * logits_out)   // [vocab_size]
+    float           * logits_out,   // [vocab_size] — optional, full logits readback
+    int32_t         * token_out)    // optional — greedy argmax token (cheap readback)
 {
     if (ctx->kv_used >= VOXTRAL_DEC_WINDOW) {
         kv_cache_shift_left(ctx, 1);
         ctx->kv_used = VOXTRAL_DEC_WINDOW - 1;
     }
 
-    // Use thread-local buffer to avoid per-step heap allocation
     static thread_local std::vector<uint8_t> step_meta_buf;
-    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
-                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    if (step_meta_buf.size() < meta_size) {
-        step_meta_buf.resize(meta_size);
-    }
-
-    ggml_init_params p = {
-        /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ step_meta_buf.data(),
-        /*.no_alloc  =*/ true,
-    };
-    ggml_context * gctx = ggml_init(p);
-
+    ggml_context * gctx = init_graph_ctx(step_meta_buf, 4);
     ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
 
-    ggml_backend_sched_reset(ctx->sched_dec_step);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_step, gf)) {
-        LOG_ERR(ctx, "decoder step: failed to allocate graph");
-        ggml_free(gctx);
+    if (!run_graph(ctx, ctx->sched_dec_step, gctx, gf, [&](ggml_cgraph * g) {
+        set_graph_input(g, "token_id", &token_id, sizeof(int32_t));
+        set_graph_input(g, "position", &position, sizeof(int32_t));
+        set_graph_input(g, "time_emb", ctx->time_emb_cpu.data(), VOXTRAL_DEC_DIM * sizeof(float));
+    }, "decoder step")) {
         return false;
     }
 
-    // Set inputs
-    ggml_tensor * tok_t = find_tensor_in_graph(gf, "token_id");
-    if (tok_t) {
-        ggml_backend_tensor_set(tok_t, &token_id, 0, sizeof(int32_t));
+    // Read back the greedy token (4 bytes) and/or full logits if requested.
+    if (token_out) {
+        ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
     }
-
-    ggml_tensor * pos_t = find_tensor_in_graph(gf, "position");
-    if (pos_t) {
-        ggml_backend_tensor_set(pos_t, &position, 0, sizeof(int32_t));
+    if (logits_out) {
+        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
     }
-
-    ggml_tensor * time_t = find_tensor_in_graph(gf, "time_emb");
-    if (time_t) {
-        ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
-    }
-
-    // Compute
-    ggml_backend_sched_graph_compute(ctx->sched_dec_step, gf);
-
-    // Read logits
-    ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
 
     ctx->kv_used += 1;
+    return true;
+}
 
-    ggml_backend_sched_reset(ctx->sched_dec_step);
-    ggml_free(gctx);
+// Offline prefill: prefix tokens + audio embeddings + suffix tokens in one graph.
+static bool run_offline_prefill(voxtral_context * ctx,
+    const int32_t * prefix_ids, int32_t n_prefix,
+    int32_t n_audio,
+    const int32_t * suffix_ids, int32_t n_suffix,
+    int32_t * token_out, float * logits_out) {
+    const int32_t n_tokens = n_prefix + n_audio + n_suffix;
+    static thread_local std::vector<uint8_t> meta_buf;
+    ggml_context * gctx = init_graph_ctx(meta_buf, 8);
+    ggml_cgraph * gf = build_offline_prefill_graph(ctx, gctx, n_prefix, n_audio, n_suffix);
 
+    if (!run_graph(ctx, ctx->sched_dec_pre, gctx, gf, [&](ggml_cgraph * g) {
+        set_graph_input(g, "prefix_ids", prefix_ids, n_prefix * sizeof(int32_t));
+        set_graph_input(g, "suffix_ids", suffix_ids, n_suffix * sizeof(int32_t));
+        std::vector<int32_t> pos(n_tokens);
+        std::iota(pos.begin(), pos.end(), 0);
+        set_graph_input(g, "positions", pos.data(), n_tokens * sizeof(int32_t));
+        std::vector<float> mask;
+        fill_causal_mask(mask, n_tokens);
+        set_graph_input(g, "causal_mask", mask.data(), mask.size() * sizeof(float));
+    }, "offline prefill")) {
+        return false;
+    }
+
+    if (token_out)  ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    if (logits_out) ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    ctx->kv_used = n_tokens;
+    return true;
+}
+
+// Offline single-token step.
+static bool run_offline_step(voxtral_context * ctx, int32_t token_id, int32_t position, int32_t * token_out) {
+    static thread_local std::vector<uint8_t> step_meta_buf;
+    ggml_context * gctx = init_graph_ctx(step_meta_buf, 4);
+    ggml_cgraph * gf = build_offline_step_graph(ctx, gctx);
+
+    if (!run_graph(ctx, ctx->sched_dec_step, gctx, gf, [&](ggml_cgraph * g) {
+        set_graph_input(g, "token_id", &token_id, sizeof(int32_t));
+        set_graph_input(g, "position", &position, sizeof(int32_t));
+    }, "offline step")) {
+        return false;
+    }
+
+    if (token_out) ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    ctx->kv_used += 1;
+    return true;
+}
+
+// ============================================================================
+// High-level: Transcribe (offline Voxtral-Mini-3B-2507)
+// ============================================================================
+
+static constexpr int32_t VOXTRAL_OFFLINE_WINDOW_SEC = 30;
+static constexpr int32_t VOXTRAL_OFFLINE_MAX_DECODE = 448;
+
+static void compute_mel_even(voxtral_context & ctx, const float * samples, int32_t n_samples,
+                             std::vector<float> & mel_data, int32_t & n_frames) {
+    const int32_t max_frames = n_samples / VOXTRAL_HOP_LENGTH + 1;
+    mel_data.assign((size_t) VOXTRAL_NUM_MEL_BINS * max_frames, 0.0f);
+    n_frames = 0;
+    compute_mel_spectrogram(samples, n_samples, ctx.mel_filters_cpu.data(),
+        ctx.hann_window.data(), mel_data.data(), &n_frames);
+    if (n_frames % 2 != 0) {
+        for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++)
+            memmove(mel_data.data() + (size_t) m * (n_frames - 1),
+                    mel_data.data() + (size_t) m * n_frames + 1,
+                    (size_t) (n_frames - 1) * sizeof(float));
+        n_frames -= 1;
+    }
+}
+
+static bool transcribe_offline_window(
+    voxtral_context & ctx, const float * wav, int32_t n_wav,
+    int32_t max_tokens, float * first_logits_or_null,
+    std::vector<int32_t> & out_tokens)
+{
+    const int32_t win = VOXTRAL_OFFLINE_WINDOW_SEC * VOXTRAL_SAMPLE_RATE;
+    std::vector<float> padded((size_t) win, 0.0f);
+    const int32_t ncopy = std::min(n_wav, win);
+    memcpy(padded.data(), wav, (size_t) ncopy * sizeof(float));
+
+    int32_t n_frames = 0;
+    std::vector<float> mel_data;
+    compute_mel_even(ctx, padded.data(), win, mel_data, n_frames);
+
+    if (!run_encoder_offline(&ctx, mel_data.data(), n_frames)) return false;
+    if (!run_adapter(&ctx)) return false;
+
+    const auto & hp = ctx.model->hp;
+    const int32_t n_audio = ctx.dec_seq_len;
+    // Prompt: <s>[INST][BEGIN_AUDIO] [AUDIO]xN [/INST] lang:en [TRANSCRIBE]
+    // The middle three suffix ids are the tekken ranks for the text "lang:en"
+    // (language is currently fixed to English).
+    static const int32_t kLangEn[3] = { 9909, 1058, 1262 };
+    const int32_t prefix[3] = { hp.tok_bos, hp.tok_inst, hp.tok_begin_audio };
+    const int32_t suffix[5] = { hp.tok_inst_end, kLangEn[0], kLangEn[1], kLangEn[2], hp.tok_transcribe };
+    const int32_t L = 3 + n_audio + 5;
+
+    clear_kv_cache(&ctx);
+    int32_t token = 0;
+    if (!run_offline_prefill(&ctx, prefix, 3, n_audio, suffix, 5, &token, first_logits_or_null)) return false;
+    if (token != VOXTRAL_TOKEN_EOS) out_tokens.push_back(token);
+
+    const int32_t cap = (max_tokens > 0) ? max_tokens : VOXTRAL_OFFLINE_MAX_DECODE;
+    for (int32_t i = 0; i < cap && token != VOXTRAL_TOKEN_EOS; ++i) {
+        if (!run_offline_step(&ctx, token, L + i, &token)) return false;
+        if (token == VOXTRAL_TOKEN_EOS) break;
+        out_tokens.push_back(token);
+    }
+    return true;
+}
+
+static std::string trim_copy(const std::string & s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static bool voxtral_transcribe_offline(
+    voxtral_context & ctx,
+    const float     * audio,
+    int32_t           n_samples,
+    int32_t           max_tokens,
+    voxtral_result  & result)
+{
+    const int32_t win = VOXTRAL_OFFLINE_WINDOW_SEC * VOXTRAL_SAMPLE_RATE;
+    int32_t n_windows = (n_samples + win - 1) / win;
+    if (n_windows < 1) n_windows = 1;
+    LOG_INFO(&ctx, "offline: %d samples (%.1fs) -> %d window(s) of %ds",
+        n_samples, (float) n_samples / VOXTRAL_SAMPLE_RATE, n_windows, VOXTRAL_OFFLINE_WINDOW_SEC);
+
+    auto t_all = std::chrono::steady_clock::now();
+    std::string full;
+    int32_t total_steps = 0;
+    for (int32_t w = 0; w < n_windows; ++w) {
+        const int32_t start = w * win;
+        const int32_t len = std::min(win, n_samples - start);
+        if (len <= 0) break;
+
+        std::vector<int32_t> wtoks;
+        // Capture the first window's prefill logits for diagnostics (--dump-logits).
+        float * flog = nullptr;
+        if (w == 0) {
+            result.first_step_logits.resize(VOXTRAL_VOCAB_SIZE);
+            flog = result.first_step_logits.data();
+        }
+        auto tw = std::chrono::steady_clock::now();
+        if (!transcribe_offline_window(ctx, audio + start, len, max_tokens, flog, wtoks)) return false;
+        total_steps += (int32_t) wtoks.size();
+
+        std::string wtext = trim_copy(decode_tokens(*ctx.model, wtoks));
+        LOG_INFO(&ctx, "window %d/%d: %.1f-%.1fs -> %d tokens, %.0f ms",
+            w + 1, n_windows, (float) start / VOXTRAL_SAMPLE_RATE,
+            (float) (start + len) / VOXTRAL_SAMPLE_RATE, (int) wtoks.size(), elapsed_ms(tw));
+
+        result.tokens.insert(result.tokens.end(), wtoks.begin(), wtoks.end());
+        if (!wtext.empty()) {
+            if (!full.empty()) full += " ";
+            full += wtext;
+        }
+    }
+    result.text = full;
+    const double ms = elapsed_ms(t_all);
+    LOG_INFO(&ctx, "offline total: %d windows, %d tokens, %.0f ms (RTF %.3f)",
+        n_windows, total_steps, ms, ms / 1000.0 / ((double) n_samples / VOXTRAL_SAMPLE_RATE));
     return true;
 }
 
@@ -2211,7 +2656,12 @@ static bool voxtral_transcribe_from_audio(
             (float)n_samples / VOXTRAL_SAMPLE_RATE);
     }
 
-    // 2. Streaming padding (matching Python pad_audio_streaming)
+    // Offline: different preprocessing, prompt and decode.
+    if (ctx.model->hp.is_offline) {
+        return voxtral_transcribe_offline(ctx, audio, n_samples, max_tokens, result);
+    }
+
+    // Streaming padding (matching Python pad_audio_streaming)
     constexpr int32_t mult_of   = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;   // 1280
     const int32_t n_raw     = n_samples;
     const int32_t align_pad = (mult_of - (n_raw % mult_of)) % mult_of;
@@ -2223,40 +2673,20 @@ static bool voxtral_transcribe_from_audio(
 
     LOG_INFO(&ctx, "padded audio: %d samples (left=%d, right=%d)", (int)padded.size(), left_pad, right_pad);
 
-    // 3. Compute mel spectrogram
+    // Compute mel spectrogram (truncated to an even frame count for conv stride 2)
     int32_t n_frames = 0;
-    const int32_t max_frames = (int32_t)padded.size() / VOXTRAL_HOP_LENGTH + 1;
-    std::vector<float> mel_data(VOXTRAL_NUM_MEL_BINS * max_frames);
-
-    compute_mel_spectrogram(
-        padded.data(), (int32_t)padded.size(),
-        ctx.mel_filters_cpu.data(),
-        ctx.hann_window.data(),
-        mel_data.data(), &n_frames);
-
+    std::vector<float> mel_data;
+    compute_mel_even(ctx, padded.data(), (int32_t) padded.size(), mel_data, n_frames);
     LOG_INFO(&ctx, "mel spectrogram: %d frames", n_frames);
 
-    // Truncate to even number of frames (for conv stride=2)
-    if (n_frames % 2 != 0) {
-        // Drop first frame (matching Python mel[:, 1:])
-        // Shift mel data left by 1 frame
-        for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++) {
-            memmove(mel_data.data() + m * (n_frames - 1),
-                    mel_data.data() + m * n_frames + 1,
-                    (n_frames - 1) * sizeof(float));
-        }
-        n_frames -= 1;
-        LOG_INFO(&ctx, "mel truncated to %d frames (even)", n_frames);
-    }
-
-    // 4. Run encoder (chunked for arbitrarily long audio)
+    // Run encoder (chunked for arbitrarily long audio)
     auto t_encoder = std::chrono::steady_clock::now();
     if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames)) {
         return false;
     }
     LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
 
-    // 5. Run adapter
+    // Run adapter
     auto t_adapter = std::chrono::steady_clock::now();
     if (!run_adapter(&ctx)) {
         return false;
@@ -2265,7 +2695,7 @@ static bool voxtral_transcribe_from_audio(
 
     const int32_t n_audio = ctx.dec_seq_len;
 
-    // 6. Build prompt tokens: [BOS] + [STREAMING_PAD] * (N_LEFT_PAD_TOKENS + N_DELAY_TOKENS)
+    // Build prompt tokens: [BOS] + [STREAMING_PAD] * (N_LEFT_PAD_TOKENS + N_DELAY_TOKENS)
     std::vector<int32_t> prompt_ids;
     prompt_ids.push_back(VOXTRAL_TOKEN_BOS);
     for (int32_t i = 0; i < VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS; i++) {
@@ -2280,10 +2710,10 @@ static bool voxtral_transcribe_from_audio(
         return false;
     }
 
-    // 7. Reset KV cache
+    // Reset KV cache
     clear_kv_cache(&ctx);
 
-    // 8. Decoder prefill
+    // Decoder prefill
     auto t_prefill = std::chrono::steady_clock::now();
     std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
     if (L > 1) {
@@ -2292,14 +2722,13 @@ static bool voxtral_transcribe_from_audio(
         }
     }
 
-    // 8b. One step with last prefix token (matches Python prefill + forward_one)
-    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data())) {
+    // One step with last prefix token
+    // Request full logits here so we can store first_step_logits for diagnostics.
+    int32_t token = 0;
+    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data(), &token)) {
         return false;
     }
     LOG_INFO(&ctx, "prefill time: %.1f ms", elapsed_ms(t_prefill));
-
-    // First token from prefill
-    int32_t token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 
     // Store first step logits
     result.first_step_logits = logits;
@@ -2307,36 +2736,30 @@ static bool voxtral_transcribe_from_audio(
 
     LOG_INFO(&ctx, "first token: %d", token);
 
-    // 9. Autoregressive decoding
+    // Autoregressive decoding
+    //
+    // The realtime model emits one token per audio frame. To transcribe the
+    // whole file we must decode every audio position and only stop on EOS (or
+    // the optional max_tokens cap, where <= 0 means until end of audio).
+    //
+    // we deliberately do NOT early-stop on a run of consecutive pad
+    // tokens. A pad run only means a pause in speech, which is indistinguishable
+    // from end-of-audio without lookahead, so a pad-based early stop truncates
+    // longform transcripts at the first pause. Trailing pads are filtered out
+    // during detokenization, so decoding to the end costs only the (bounded)
+    // trailing-silence frames.
+    const bool unlimited = (max_tokens <= 0);
     auto t_decode = std::chrono::steady_clock::now();
-    int32_t consecutive_pad = 0;
-    bool seen_text = false;
-    for (int32_t pos = L; pos < n_audio && (int32_t)result.tokens.size() < max_tokens; pos++) {
+    for (int32_t pos = L; pos < n_audio && (unlimited || (int32_t)result.tokens.size() < max_tokens); pos++) {
         if (token == VOXTRAL_TOKEN_EOS) break;
 
-        if (!run_decoder_step(&ctx, token, pos, pos, logits.data())) {
+        // Hot path: read back only the on-device greedy argmax token (4 bytes),
+        // not the full 131072-float logits vector.
+        if (!run_decoder_step(&ctx, token, pos, pos, /*logits_out=*/nullptr, &token)) {
             return false;
         }
 
-        // Greedy argmax
-        token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
-
         result.tokens.push_back(token);
-
-        // Early stopping: if we've seen real text and then get enough
-        // consecutive streaming pad tokens, the transcript is complete.
-        if (token == VOXTRAL_TOKEN_STREAMING_PAD) {
-            consecutive_pad++;
-        } else {
-            consecutive_pad = 0;
-            if (token >= ctx.model->tokenizer_num_special_tokens) {
-                seen_text = true;
-            }
-        }
-        if (seen_text && consecutive_pad >= VOXTRAL_N_RIGHT_PAD_TOKENS) {
-            LOG_INFO(&ctx, "early stop: %d consecutive pad tokens after text", consecutive_pad);
-            break;
-        }
     }
     LOG_INFO(&ctx, "decode time: %.1f ms (%d steps, %.1f ms/step)",
         elapsed_ms(t_decode), (int)result.tokens.size() - 1,

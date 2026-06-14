@@ -24,9 +24,9 @@ struct cli_params {
     std::string output_text;
     int32_t threads = 0;
     uint32_t seed = 0;
-    int32_t max_tokens = 256;
+    int32_t max_tokens = 0;   // 0 = decode whole file (until end of audio / EOS)
     voxtral_log_level log_level = voxtral_log_level::info;
-    voxtral_gpu_backend gpu = voxtral_gpu_backend::none;
+    voxtral_gpu_backend gpu = voxtral_gpu_backend::auto_detect;
 };
 
 struct backend_reg_info {
@@ -204,14 +204,14 @@ void print_usage(const char * argv0) {
         << "  --seed N              rng seed (reserved for sampling)\n"
         << "  --prompt TEXT         prompt text (compatibility, currently ignored for realtime mode)\n"
         << "  --n-tokens N          max decode tokens (alias of --max-len)\n"
-        << "  --max-len N           max decode tokens\n"
+        << "  --max-len N           max decode tokens (0 = whole file, default)\n"
         << "  --verbose             equivalent to --log-level debug\n"
         << "  --log-level LEVEL     error|warn|info|debug\n"
         << "  --dump-logits PATH    write step-0 logits (first 32 values) as text\n"
         << "  --dump-logits-bin P   write full step-0 logits as float32 raw bytes\n"
         << "  --dump-tokens PATH    write generated token ids as a single line\n"
         << "  --output-text PATH    write decoded text to file (still prints to stdout)\n"
-        << "  --gpu BACKEND         gpu backend: auto|cuda|metal|vulkan|none (default: none)\n"
+        << "  --gpu BACKEND         gpu backend: auto|cuda|metal|vulkan|none (default: auto)\n"
         << "  --metal               alias for --gpu metal\n"
         << "  -h, --help            show this help\n";
 }
@@ -371,10 +371,6 @@ bool parse_args(int argc, char ** argv, cli_params & p) {
     if (p.audio.empty()) {
         std::cerr << "--audio is required\n";
         return false;
-    }
-
-    if (p.max_tokens <= 0) {
-        p.max_tokens = 1;
     }
 
     return true;

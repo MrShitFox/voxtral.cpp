@@ -345,9 +345,10 @@ int quantize_voxtral_gguf(
         }
 
         const std::string arch = get_kv_str(gguf_in, "general.architecture");
-        if (arch != kVoxtralArch) {
+        if (arch != kVoxtralArch && arch != "voxtral") {
             throw std::runtime_error(
-                "unsupported architecture '" + arch + "', expected '" + std::string(kVoxtralArch) + "'");
+                "unsupported architecture '" + arch + "', expected '" +
+                std::string(kVoxtralArch) + "' or 'voxtral'");
         }
 
         gguf_out = gguf_init_empty();
