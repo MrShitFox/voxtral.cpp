@@ -9,12 +9,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VOXTRAL_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(VOXTRAL_NATIVE_OPT "Enable native CPU tuning flags" ON)
-option(VOXTRAL_AUTO_DETECT_CPU "Auto-detect CPU features and set ggml flags" ON)
-option(VOXTRAL_AUTO_DETECT_BLAS "Auto-enable ggml BLAS if found" ON)
-option(VOXTRAL_AUTO_DETECT_CUDA "Auto-enable ggml CUDA if found" ON)
-option(VOXTRAL_AUTO_DETECT_VULKAN "Auto-enable ggml Vulkan if found" ON)
-option(VOXTRAL_AUTO_DETECT_METAL "Auto-enable ggml Metal on Apple" ON)
-option(VOXTRAL_USE_SYSTEM_GGML "Link a system-installed ggml instead of the bundled submodule" OFF)
+# Homebrew uses the system ggml formula; everywhere else ggml is built from source
+# via FetchContent (no vendored submodule). Backends are discovered at runtime via
+# the ggml registry, so no backend flags are needed here.
+option(VOXTRAL_USE_SYSTEM_GGML "Link a system ggml instead of building it from source" OFF)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -22,99 +20,23 @@ endif()
 
 find_package(Threads REQUIRED)
 
-set(GGML_BUILD_TESTS OFF CACHE BOOL "Disable ggml tests" FORCE)
-set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "Disable ggml examples" FORCE)
-
-if(VOXTRAL_AUTO_DETECT_CPU AND NOT CMAKE_CROSSCOMPILING)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
-        include(CheckCXXSourceRuns)
-
-        function(voxtral_check_cpu_supports feature outvar)
-            set(_src "
-                #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
-                int main() { return 1; }
-                #endif
-                #if defined(__GNUC__) || defined(__clang__)
-                int main() { return __builtin_cpu_supports(\"${feature}\") ? 0 : 1; }
-                #else
-                int main() { return 1; }
-                #endif
-            ")
-            check_cxx_source_runs("${_src}" ${outvar})
-        endfunction()
-
-        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            voxtral_check_cpu_supports("avx"    VOXTRAL_CPU_HAS_AVX)
-            voxtral_check_cpu_supports("avx2"   VOXTRAL_CPU_HAS_AVX2)
-            voxtral_check_cpu_supports("fma"    VOXTRAL_CPU_HAS_FMA)
-            voxtral_check_cpu_supports("f16c"   VOXTRAL_CPU_HAS_F16C)
-            voxtral_check_cpu_supports("bmi2"   VOXTRAL_CPU_HAS_BMI2)
-            voxtral_check_cpu_supports("avx512f" VOXTRAL_CPU_HAS_AVX512)
-
-            set(VOXTRAL_CPU_FEATURES_DETECTED ON)
-        endif()
-    endif()
-endif()
-
-if(VOXTRAL_CPU_FEATURES_DETECTED)
-    # Use explicit ISA flags instead of -march=native when auto-detecting.
-    set(GGML_NATIVE OFF CACHE BOOL "ggml: optimize the build for the current system" FORCE)
-    set(GGML_AVX    ${VOXTRAL_CPU_HAS_AVX}    CACHE BOOL "ggml: enable AVX" FORCE)
-    set(GGML_AVX2   ${VOXTRAL_CPU_HAS_AVX2}   CACHE BOOL "ggml: enable AVX2" FORCE)
-    set(GGML_FMA    ${VOXTRAL_CPU_HAS_FMA}    CACHE BOOL "ggml: enable FMA" FORCE)
-    set(GGML_F16C   ${VOXTRAL_CPU_HAS_F16C}   CACHE BOOL "ggml: enable F16C" FORCE)
-    set(GGML_BMI2   ${VOXTRAL_CPU_HAS_BMI2}   CACHE BOOL "ggml: enable BMI2" FORCE)
-    set(GGML_AVX512 ${VOXTRAL_CPU_HAS_AVX512} CACHE BOOL "ggml: enable AVX512F" FORCE)
-endif()
-
-if(VOXTRAL_AUTO_DETECT_BLAS)
-    if(NOT DEFINED CACHE{GGML_BLAS})
-        find_package(BLAS QUIET)
-        if(BLAS_FOUND)
-            set(GGML_BLAS ON CACHE BOOL "ggml: use BLAS" FORCE)
-        endif()
-    endif()
-endif()
-
-if(VOXTRAL_AUTO_DETECT_CUDA)
-    if(NOT DEFINED CACHE{GGML_CUDA})
-        find_package(CUDAToolkit QUIET)
-        if(CUDAToolkit_FOUND AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
-            include(CheckLanguage)
-            check_language(CUDA)
-            if(CMAKE_CUDA_COMPILER)
-                set(GGML_CUDA ON CACHE BOOL "ggml: use CUDA" FORCE)
-            endif()
-        endif()
-    endif()
-endif()
-
-if(VOXTRAL_AUTO_DETECT_VULKAN)
-    if(NOT DEFINED CACHE{GGML_VULKAN})
-        find_package(Vulkan QUIET)
-        if(Vulkan_FOUND)
-            set(GGML_VULKAN ON CACHE BOOL "ggml: use Vulkan" FORCE)
-        endif()
-    endif()
-endif()
-
-if(VOXTRAL_AUTO_DETECT_METAL AND APPLE)
-    if(NOT DEFINED CACHE{GGML_METAL})
-        set(GGML_METAL ON CACHE BOOL "ggml: use Metal" FORCE)
-    endif()
-    # Embed the Metal shader library into the binary so it needs no external
-    # default.metallib at runtime (self-contained executable).
-    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "ggml: embed Metal library" FORCE)
-endif()
-
 if(VOXTRAL_USE_SYSTEM_GGML)
     find_package(ggml CONFIG REQUIRED)
     set(VOXTRAL_GGML_TARGETS ggml::ggml ggml::ggml-base)
-    # The ggml::ggml/ggml-base imported targets don't carry the include dir when the
-    # backends are dynamically loaded; the package exports GGML_INCLUDE_DIR for it.
+    # Imported targets omit the include dir with dynamically-loaded backends.
     set(VOXTRAL_GGML_INCLUDES ${GGML_INCLUDE_DIR})
 else()
-    add_subdirectory(ggml)
+    include(FetchContent)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    if(APPLE)
+        # Embed Metal shaders so the binary needs no external default.metallib.
+        set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+    endif()
+    FetchContent_Declare(ggml
+        GIT_REPOSITORY https://github.com/ggml-org/ggml.git
+        GIT_TAG        5cecdad692d868e28dbd2f7c468504770108f30c)
+    FetchContent_MakeAvailable(ggml)
     set(VOXTRAL_GGML_TARGETS ggml)
     set(VOXTRAL_GGML_INCLUDES "")
 endif()
@@ -190,6 +112,9 @@ if(VOXTRAL_NATIVE_OPT AND NOT MSVC)
         target_compile_options(voxtral-quantize PRIVATE -march=native -mtune=native)
     endif()
 endif()
+
+# Install the CLI tools (used by `cmake --install` and the Homebrew formula).
+install(TARGETS voxtral voxtral-quantize RUNTIME DESTINATION bin)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)

@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [ main ]
 
+# ggml is built from source via FetchContent (see CMakeLists), so no system ggml
+# is required on any platform. Static build => self-contained binary artifacts.
 jobs:
   build:
     name: build on ${{ matrix.os }} (${{ matrix.arch }})
@@ -24,45 +26,22 @@ jobs:
             arch: x86_64
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libsdl2-dev build-essential cmake
-
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install sdl2 cmake
-
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          vcpkg install sdl2:x64-windows
-          vcpkg integrate install
-
-      - name: Configure CMake
-        run: >
-          cmake -S . -B build
-          -DCMAKE_BUILD_TYPE=Release
-          ${{ runner.os == 'Windows' && '-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake' || '' }}
-          ${{ runner.os == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"' || '' }}
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
 
       - name: Build
         run: cmake --build build --config Release -j
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: voxtral-${{ runner.os }}-${{ matrix.arch }}
           path: |
-            build/voxtral*
-            build/examples/stream/voxtral-stream*
-            !build/**/*.dir
-            !build/**/*.obj
-            !build/**/*.o
+            build/voxtral
+            build/voxtral.exe
+            build/voxtral-quantize
+            build/voxtral-quantize.exe
+            build/Release/voxtral.exe
+            build/Release/voxtral-quantize.exe
+          if-no-files-found: ignore

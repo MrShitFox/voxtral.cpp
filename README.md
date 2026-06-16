@@ -58,6 +58,13 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+Or via Homebrew (`Formula/voxtral.rb`):
+
+```bash
+brew tap andrijdavid/voxtral https://github.com/andrijdavid/voxtral.cpp
+brew install --HEAD voxtral
+```
+
 ### 3. Audio Preparation
 
 The model expects **16-bit PCM WAV** files at **16kHz (mono)**. You can use `ffmpeg` to convert your audio files:
