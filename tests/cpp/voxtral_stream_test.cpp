@@ -4,17 +4,23 @@
 // This is NOT a production CLI or server. It exists only to drive the internal
 // voxtral_stream compatibility path from a chunked PCM feed and emit a single
 // machine-readable JSON object on stdout (backend logs go to stderr), so the
-// Node.js acceptance suite can assert chunk invariance and batch parity.
+// Node.js acceptance suite can assert chunk invariance, batch parity and the
+// ownership contract (model shared; each stream owns its own context).
 //
 // Usage:
 //   voxtral-stream-test --model M.gguf --wav in.wav [--gpu auto|vulkan|none]
 //                       [--plan-file plan.txt] [--mode MODE] [--max-tokens N]
+//                       [--ab]
 //
 //   --plan-file : text file, one integer per line = a feed's sample count
 //                 (0 = an explicit zero-length feed). Must sum to the WAV's
 //                 sample count. Takes precedence over --mode.
 //   --mode      : full | 80ms | 160ms | 320ms | 480ms | 1000ms |
 //                 single-sample | seeded-random:SEED   (default: full)
+//   --ab        : load the model ONCE, then create two streams A and B from it
+//                 (each owns its own context), run the same plan through both
+//                 sequentially, and emit both results plus a distinctContexts
+//                 flag. Proves model-shared / context-per-stream ownership.
 // ============================================================================
 
 #include "voxtral-stream.h"
@@ -265,81 +271,33 @@ void log_stderr(voxtral_log_level lvl, const std::string & msg) {
     std::cerr << "voxtral_" << tag << ": " << msg << "\n";
 }
 
-} // namespace
+// ----------------------------------------------------------------------------
+// A single stream run: create a stream from the shared model (owning its own
+// context), feed the plan, finish, and capture everything the acceptance suite
+// needs. The stream is created and destroyed by the caller so an --ab run can
+// keep A and B alive together to prove their contexts are distinct.
+// ----------------------------------------------------------------------------
+struct StreamRun {
+    std::string          state;
+    std::string          finishStatus;
+    uint64_t             samplesReceived = 0;
+    uint64_t             samplesConsumed = 0;
+    uint64_t             feedCalls       = 0;
+    uint64_t             inferenceRuns   = 0;
+    size_t               pcmFloats       = 0;
+    std::string          pcmSha;
+    std::vector<int32_t> tokens;
+    std::string          text;
+    std::vector<voxtral_stream_event> events;
+    bool                 contextOwned = false;
+    bool                 ok           = false;
+};
 
-int main(int argc, char ** argv) {
-    std::string model_path, wav_path, plan_file, mode = "full";
-    voxtral_gpu_backend gpu = voxtral_gpu_backend::auto_detect;
-    int32_t max_tokens = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto val = [&](const char * name) -> const char * {
-            if (i + 1 >= argc) { std::cerr << "missing value for " << name << "\n"; return nullptr; }
-            return argv[++i];
-        };
-        if (a == "--model")            { const char * v = val("--model"); if (!v) return 2; model_path = v; }
-        else if (a == "--wav")         { const char * v = val("--wav"); if (!v) return 2; wav_path = v; }
-        else if (a == "--plan-file")   { const char * v = val("--plan-file"); if (!v) return 2; plan_file = v; }
-        else if (a == "--mode")        { const char * v = val("--mode"); if (!v) return 2; mode = v; }
-        else if (a == "--max-tokens")  { const char * v = val("--max-tokens"); if (!v) return 2; max_tokens = int32_t(std::strtol(v, nullptr, 10)); }
-        else if (a == "--gpu") {
-            const char * v = val("--gpu"); if (!v) return 2;
-            std::string g = v;
-            if (g == "none") gpu = voxtral_gpu_backend::none;
-            else if (g == "auto") gpu = voxtral_gpu_backend::auto_detect;
-            else if (g == "cuda") gpu = voxtral_gpu_backend::cuda;
-            else if (g == "metal") gpu = voxtral_gpu_backend::metal;
-            else if (g == "vulkan") gpu = voxtral_gpu_backend::vulkan;
-            else { std::cerr << "invalid --gpu\n"; return 2; }
-        } else { std::cerr << "unknown option: " << a << "\n"; return 2; }
-    }
-
-    if (model_path.empty() || wav_path.empty()) {
-        std::cerr << "usage: voxtral-stream-test --model M.gguf --wav in.wav "
-                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n]\n";
-        return 2;
-    }
-
-    // Read audio.
-    std::vector<int16_t> pcm16;
-    std::string err;
-    if (!read_wav_pcm16_mono16k(wav_path, pcm16, err)) {
-        std::cerr << "wav error: " << err << "\n";
-        return 3;
-    }
-    const size_t total = pcm16.size();
-
-    // Build the feed plan.
-    std::vector<size_t> counts;
-    if (!plan_file.empty()) {
-        if (!plan_from_file(plan_file, counts, err)) { std::cerr << err << "\n"; return 4; }
-        size_t sum = 0; for (size_t c : counts) sum += c;
-        if (sum != total) {
-            std::cerr << "plan sample sum " << sum << " != wav samples " << total << "\n";
-            return 4;
-        }
-    } else {
-        counts = plan_from_mode(mode, total);
-    }
-
-    // Load model + context (weights shared; context is the per-stream engine).
-    voxtral_log_callback logger = log_stderr;
-    voxtral_model * model = voxtral_model_load_from_file(model_path, logger, gpu);
-    if (!model) { std::cerr << "failed to load model\n"; return 5; }
-
-    voxtral_context_params cp;
-    cp.log_level = voxtral_log_level::info;
-    cp.logger    = logger;
-    cp.gpu       = gpu;
-    voxtral_context * ctx = voxtral_init_from_model(model, cp);
-    if (!ctx) { std::cerr << "failed to init context\n"; voxtral_model_free(model); return 6; }
-
-    // Drive the stream.
-    voxtral_stream_params sp;
-    sp.max_tokens = max_tokens;
-    voxtral_stream * stream = voxtral_stream_create_internal(ctx, sp);
-    if (!stream) { std::cerr << "failed to create stream\n"; voxtral_free(ctx); voxtral_model_free(model); return 7; }
+// Feed `counts` into an already-created stream, finish it and capture results.
+StreamRun drive_stream(voxtral_stream * stream,
+                       const std::vector<int16_t> & pcm16,
+                       const std::vector<size_t> & counts) {
+    StreamRun r;
 
     size_t off = 0;
     uint64_t feed_calls = 0;
@@ -371,54 +329,191 @@ int main(int argc, char ** argv) {
         sha.update(voxtral_stream_pcm_data(stream),
                    voxtral_stream_pcm_size(stream) * sizeof(float));
     }
-    const std::string pcm_sha = sha.hex();
+    r.pcmSha = sha.hex();
 
     // Drain events (order preserved).
-    std::vector<voxtral_stream_event> evs;
     voxtral_stream_event ev;
-    while (voxtral_stream_poll_event(stream, ev)) evs.push_back(ev);
+    while (voxtral_stream_poll_event(stream, ev)) r.events.push_back(ev);
 
-    // Emit JSON to stdout.
-    std::ostringstream js;
-    js << "{";
-    js << "\"state\":\"" << voxtral_stream_state_name(voxtral_stream_get_state(stream)) << "\",";
-    js << "\"finishStatus\":\"" << voxtral_stream_status_name(finst) << "\",";
-    js << "\"sampleRate\":" << sp.sample_rate << ",";
-    js << "\"channels\":" << sp.channels << ",";
-    js << "\"wavSamples\":" << total << ",";
-    js << "\"samplesReceived\":" << voxtral_stream_samples_received(stream) << ",";
-    js << "\"samplesConsumed\":" << voxtral_stream_samples_consumed(stream) << ",";
-    js << "\"feedCalls\":" << feed_calls << ",";
-    js << "\"inferenceRuns\":" << voxtral_stream_inference_runs(stream) << ",";
-    js << "\"pcmFloats\":" << voxtral_stream_pcm_size(stream) << ",";
-    js << "\"pcmSha256\":\"" << pcm_sha << "\",";
+    r.state           = voxtral_stream_state_name(voxtral_stream_get_state(stream));
+    r.finishStatus    = voxtral_stream_status_name(finst);
+    r.samplesReceived = voxtral_stream_samples_received(stream);
+    r.samplesConsumed = voxtral_stream_samples_consumed(stream);
+    r.feedCalls       = feed_calls;
+    r.inferenceRuns   = voxtral_stream_inference_runs(stream);
+    r.pcmFloats       = voxtral_stream_pcm_size(stream);
+    r.tokens          = voxtral_stream_tokens(stream);
+    r.text            = voxtral_stream_transcript(stream);
+    r.contextOwned    = voxtral_stream_owns_context(stream);
+    r.ok              = (finst == voxtral_status::ok);
+    return r;
+}
 
+// Emit a StreamRun's fields into an open JSON object body (no surrounding braces).
+void write_run_fields(std::ostringstream & js, const StreamRun & r) {
+    js << "\"state\":\"" << r.state << "\",";
+    js << "\"finishStatus\":\"" << r.finishStatus << "\",";
+    js << "\"samplesReceived\":" << r.samplesReceived << ",";
+    js << "\"samplesConsumed\":" << r.samplesConsumed << ",";
+    js << "\"feedCalls\":" << r.feedCalls << ",";
+    js << "\"inferenceRuns\":" << r.inferenceRuns << ",";
+    js << "\"pcmFloats\":" << r.pcmFloats << ",";
+    js << "\"pcmSha256\":\"" << r.pcmSha << "\",";
+    js << "\"contextOwnedByStream\":" << (r.contextOwned ? "true" : "false") << ",";
     js << "\"tokens\":[";
-    {
-        const std::vector<int32_t> & toks = voxtral_stream_tokens(stream);
-        for (size_t i = 0; i < toks.size(); ++i) { if (i) js << ","; js << toks[i]; }
-    }
+    for (size_t i = 0; i < r.tokens.size(); ++i) { if (i) js << ","; js << r.tokens[i]; }
     js << "],";
-
-    js << "\"text\":\"" << json_escape(voxtral_stream_transcript(stream)) << "\",";
-
+    js << "\"text\":\"" << json_escape(r.text) << "\",";
     js << "\"events\":[";
-    for (size_t i = 0; i < evs.size(); ++i) {
+    for (size_t i = 0; i < r.events.size(); ++i) {
         if (i) js << ",";
-        js << "{\"type\":\"" << voxtral_stream_event_name(evs[i].type) << "\"";
-        if (evs[i].type == voxtral_stream_event_type::error) {
-            js << ",\"code\":" << evs[i].error_code;
+        js << "{\"type\":\"" << voxtral_stream_event_name(r.events[i].type) << "\"";
+        if (r.events[i].type == voxtral_stream_event_type::error) {
+            js << ",\"code\":" << r.events[i].error_code;
         }
         js << "}";
     }
     js << "]";
-    js << "}";
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    std::string model_path, wav_path, plan_file, mode = "full";
+    voxtral_gpu_backend gpu = voxtral_gpu_backend::auto_detect;
+    int32_t max_tokens = 0;
+    bool ab = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto val = [&](const char * name) -> const char * {
+            if (i + 1 >= argc) { std::cerr << "missing value for " << name << "\n"; return nullptr; }
+            return argv[++i];
+        };
+        if (a == "--model")            { const char * v = val("--model"); if (!v) return 2; model_path = v; }
+        else if (a == "--wav")         { const char * v = val("--wav"); if (!v) return 2; wav_path = v; }
+        else if (a == "--plan-file")   { const char * v = val("--plan-file"); if (!v) return 2; plan_file = v; }
+        else if (a == "--mode")        { const char * v = val("--mode"); if (!v) return 2; mode = v; }
+        else if (a == "--max-tokens")  { const char * v = val("--max-tokens"); if (!v) return 2; max_tokens = int32_t(std::strtol(v, nullptr, 10)); }
+        else if (a == "--ab")          { ab = true; }
+        else if (a == "--gpu") {
+            const char * v = val("--gpu"); if (!v) return 2;
+            std::string g = v;
+            if (g == "none") gpu = voxtral_gpu_backend::none;
+            else if (g == "auto") gpu = voxtral_gpu_backend::auto_detect;
+            else if (g == "cuda") gpu = voxtral_gpu_backend::cuda;
+            else if (g == "metal") gpu = voxtral_gpu_backend::metal;
+            else if (g == "vulkan") gpu = voxtral_gpu_backend::vulkan;
+            else { std::cerr << "invalid --gpu\n"; return 2; }
+        } else { std::cerr << "unknown option: " << a << "\n"; return 2; }
+    }
+
+    if (model_path.empty() || wav_path.empty()) {
+        std::cerr << "usage: voxtral-stream-test --model M.gguf --wav in.wav "
+                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n] [--ab]\n";
+        return 2;
+    }
+
+    // Read audio.
+    std::vector<int16_t> pcm16;
+    std::string err;
+    if (!read_wav_pcm16_mono16k(wav_path, pcm16, err)) {
+        std::cerr << "wav error: " << err << "\n";
+        return 3;
+    }
+    const size_t total = pcm16.size();
+
+    // Build the feed plan.
+    std::vector<size_t> counts;
+    if (!plan_file.empty()) {
+        if (!plan_from_file(plan_file, counts, err)) { std::cerr << err << "\n"; return 4; }
+        size_t sum = 0; for (size_t c : counts) sum += c;
+        if (sum != total) {
+            std::cerr << "plan sample sum " << sum << " != wav samples " << total << "\n";
+            return 4;
+        }
+    } else {
+        counts = plan_from_mode(mode, total);
+    }
+
+    // Load the model ONCE (shared, immutable). Each stream will create and own
+    // its own execution context from it via voxtral_stream_create_internal.
+    voxtral_log_callback logger = log_stderr;
+    voxtral_model * model = voxtral_model_load_from_file(model_path, logger, gpu);
+    if (!model) { std::cerr << "failed to load model\n"; return 5; }
+
+    voxtral_context_params cp;
+    cp.log_level = voxtral_log_level::info;
+    cp.logger    = logger;
+    cp.gpu       = gpu;
+
+    voxtral_stream_params sp;
+    sp.max_tokens = max_tokens;
+
+    int exit_code = 0;
+    std::ostringstream js;
+
+    if (ab) {
+        // Two streams from one model, both alive: their contexts must be distinct
+        // (each stream owns its own). Execution stays strictly sequential — A is
+        // fully finished before B is fed; this is NOT concurrent streaming.
+        voxtral_stream * a = voxtral_stream_create_internal(model, cp, sp);
+        voxtral_stream * b = voxtral_stream_create_internal(model, cp, sp);
+        if (!a || !b) {
+            std::cerr << "failed to create A/B streams\n";
+            voxtral_stream_destroy_internal(a);
+            voxtral_stream_destroy_internal(b);
+            voxtral_model_free(model);
+            return 7;
+        }
+        const void * ctx_a = voxtral_stream_context_ptr(a);
+        const void * ctx_b = voxtral_stream_context_ptr(b);
+        const bool distinct = (ctx_a != nullptr && ctx_b != nullptr && ctx_a != ctx_b);
+
+        StreamRun run_a = drive_stream(a, pcm16, counts);
+        StreamRun run_b = drive_stream(b, pcm16, counts);
+
+        // Destroy each stream (frees its OWN context); the model outlives both.
+        voxtral_stream_destroy_internal(a);
+        voxtral_stream_destroy_internal(b);
+
+        js << "{";
+        js << "\"mode\":\"ab\",";
+        js << "\"modelShared\":true,";
+        js << "\"threading\":\"externally_serialized\",";
+        js << "\"distinctContexts\":" << (distinct ? "true" : "false") << ",";
+        js << "\"sampleRate\":" << sp.sample_rate << ",";
+        js << "\"channels\":" << sp.channels << ",";
+        js << "\"wavSamples\":" << total << ",";
+        js << "\"a\":{"; write_run_fields(js, run_a); js << "},";
+        js << "\"b\":{"; write_run_fields(js, run_b); js << "}";
+        js << "}";
+
+        exit_code = (run_a.ok && run_b.ok && distinct) ? 0 : 1;
+    } else {
+        voxtral_stream * stream = voxtral_stream_create_internal(model, cp, sp);
+        if (!stream) { std::cerr << "failed to create stream\n"; voxtral_model_free(model); return 7; }
+
+        StreamRun run = drive_stream(stream, pcm16, counts);
+
+        // Destroy the stream (frees its owned context), then free the model.
+        voxtral_stream_destroy_internal(stream);
+
+        js << "{";
+        js << "\"mode\":\"single\",";
+        js << "\"modelShared\":true,";
+        js << "\"threading\":\"externally_serialized\",";
+        js << "\"sampleRate\":" << sp.sample_rate << ",";
+        js << "\"channels\":" << sp.channels << ",";
+        js << "\"wavSamples\":" << total << ",";
+        write_run_fields(js, run);
+        js << "}";
+
+        exit_code = run.ok ? 0 : 1;
+    }
 
     std::cout << js.str() << "\n";
 
-    voxtral_stream_destroy_internal(stream);
-    voxtral_free(ctx);
     voxtral_model_free(model);
-
-    return (finst == voxtral_status::ok) ? 0 : 1;
+    return exit_code;
 }

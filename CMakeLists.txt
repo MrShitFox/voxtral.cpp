@@ -13,14 +13,17 @@ option(VOXTRAL_NATIVE_OPT "Enable native CPU tuning flags" ON)
 # via FetchContent (no vendored submodule). Backends are discovered at runtime via
 # the ggml registry, so no backend flags are needed here.
 option(VOXTRAL_USE_SYSTEM_GGML "Link a system ggml instead of building it from source" OFF)
-# Internal C++ tests + the streaming skeleton harness. ON by default so the
-# existing local/remote build+ctest workflow picks them up without extra flags.
-# Neither target is installed (see install() below).
-option(VOXTRAL_BUILD_TESTS "Build internal C++ test targets" ON)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+# Standard testing switch. include(CTest) defines the cache option BUILD_TESTING
+# (default ON) and calls enable_testing(). The internal C++ tests and the
+# streaming-skeleton harness below are gated on it, so a production build with
+# -DBUILD_TESTING=OFF builds only the installed CLI tools. The existing
+# local/remote build+ctest workflow keeps working with no extra flags.
+include(CTest)
 
 find_package(Threads REQUIRED)
 
@@ -135,17 +138,19 @@ if(Python3_Interpreter_FOUND)
         VERBATIM)
 endif()
 
-enable_testing()
-if(Python3_Interpreter_FOUND)
-    add_test(
-        NAME voxtral_python_reference
-        COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_voxtral_reference.py)
-endif()
+# ----------------------------------------------------------------------------
+# Tests (standard BUILD_TESTING). enable_testing() was already called by
+# include(CTest) above. A production build (-DBUILD_TESTING=OFF) skips this
+# block entirely, so no test-only executable is created. The internal streaming
+# header lives in src/.
+# ----------------------------------------------------------------------------
+if(BUILD_TESTING)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME voxtral_python_reference
+            COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_voxtral_reference.py)
+    endif()
 
-# ----------------------------------------------------------------------------
-# Internal streaming-skeleton test targets. The internal header lives in src/.
-# ----------------------------------------------------------------------------
-if(VOXTRAL_BUILD_TESTS)
     # Model-free unit tests for the stream lifecycle / state machine / PCM path.
     add_executable(voxtral_stream_unit tests/cpp/test_stream_state.cpp)
     target_link_libraries(voxtral_stream_unit PRIVATE voxtral_lib)

@@ -42,6 +42,7 @@ export async function runStreamSession({
   audioPath = null,
   modelPath = null,
   maxTokens = 0,
+  ab = false,
   timeoutMs = 300_000,
 } = {}) {
   const binary = remoteStreamBinary(config);
@@ -55,6 +56,12 @@ export async function runStreamSession({
     "--gpu", "vulkan",
     "--max-tokens", String(maxTokens),
   ];
+
+  // --ab: load the model once, run two streams (A then B) each owning its own
+  // context, and emit both results plus a distinctContexts flag.
+  if (ab) {
+    args.push("--ab");
+  }
 
   let planFile = null;
   if (counts) {

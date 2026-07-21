@@ -66,6 +66,12 @@ describe.skipIf(!enabled).sequential("RX 6600 streaming skeleton acceptance", ()
       expect.soft(result.samplesReceived, `${spec}: samples received`).toBe(totalSamples);
       expect.soft(result.samplesConsumed, `${spec}: samples consumed`).toBe(totalSamples);
 
+      // Ownership contract surfaced by the harness: the model is shared and each
+      // stream owns its own execution context; threading is externally serialized.
+      expect.soft(result.modelShared, `${spec}: model shared`).toBe(true);
+      expect.soft(result.contextOwnedByStream, `${spec}: context owned by stream`).toBe(true);
+      expect.soft(result.threading, `${spec}: threading`).toBe("externally_serialized");
+
       // Exactly one FINAL_TEXT followed by one COMPLETED; no duplicate finals.
       expect.soft(result.events.map((e) => e.type), `${spec}: events`).toEqual(["final_text", "completed"]);
 
@@ -125,5 +131,65 @@ describe.skipIf(!enabled).sequential("RX 6600 streaming skeleton acceptance", ()
       },
     });
     expect(artifact.directory).toContain(config.artifactDir);
+  }, 900_000);
+
+  test("one model, two sequential streams, each owning a distinct context", async () => {
+    await checkRemoteConnection({ config });
+    const build = await buildRemoteVulkan({ config });
+    expect(build.binaryPath).toBe(config.remoteBinary);
+
+    const prepared = await prepareStreamingAudio(config.localSmokeAudio);
+    const totalSamples = prepared.pcm.length / 2;
+    const counts = planCounts(createChunkPlan(prepared.pcm, { strategy: "80ms" }));
+    expect(counts.reduce((a, b) => a + b, 0)).toBe(totalSamples);
+
+    // Single harness process: load model once, create stream A then stream B,
+    // each with its own execution context, run the same plan through both.
+    const result = await runStreamSession({ config, planName: "ab", counts, ab: true });
+
+    // --- Ownership contract ---
+    expect(result.mode).toBe("ab");
+    expect(result.modelShared).toBe(true);
+    expect(result.threading).toBe("externally_serialized");
+    // A and B must use physically separate mutable contexts (both alive at once).
+    expect(result.distinctContexts).toBe(true);
+
+    // --- Each stream ran independently to completion, owning its context ---
+    for (const key of ["a", "b"]) {
+      const run = result[key];
+      expect.soft(run.state, `${key}: state`).toBe("completed");
+      expect.soft(run.finishStatus, `${key}: finishStatus`).toBe("ok");
+      expect.soft(run.inferenceRuns, `${key}: inference runs once`).toBe(1);
+      expect.soft(run.contextOwnedByStream, `${key}: owns its context`).toBe(true);
+      expect.soft(run.samplesReceived, `${key}: samples received`).toBe(totalSamples);
+      expect.soft(run.samplesConsumed, `${key}: samples consumed`).toBe(totalSamples);
+      expect.soft(run.events.map((e) => e.type), `${key}: events`).toEqual(["final_text", "completed"]);
+    }
+
+    // --- Both streams from the same model yield identical output ---
+    expect(result.a.pcmSha256).toBe(result.b.pcmSha256);
+    expect(result.a.tokens).toEqual(result.b.tokens);
+    expect(result.a.text).toBe(result.b.text);
+
+    // --- Vulkan / RX 6600 evidence ---
+    expect(result.evidence.vulkanEnabled).toBe(true);
+    expect(result.evidence.rx6600Detected).toBe(true);
+    expect(result.evidence.cpuOnlyFallbackDetected).toBe(false);
+
+    await writeArtifactBundle({
+      config,
+      testName: "stream-skeleton-ownership-ab",
+      backend: "Vulkan",
+      command: result.commandLine,
+      result: {
+        exitCode: 0,
+        backend: "Vulkan",
+        totalSamples,
+        distinctContexts: result.distinctContexts,
+        a: { tokens: result.a.tokens.length, transcript: result.a.text, pcmSha256: result.a.pcmSha256 },
+        b: { tokens: result.b.tokens.length, transcript: result.b.text, pcmSha256: result.b.pcmSha256 },
+        evidence: result.evidence,
+      },
+    });
   }, 900_000);
 });

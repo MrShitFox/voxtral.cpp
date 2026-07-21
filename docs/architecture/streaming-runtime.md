@@ -807,33 +807,99 @@ real-time inference — аудио всё ещё буферизуется цел
 - Строгая state machine с таблицей переходов в комментарии `voxtral-stream.h`
   (запрещённые вызовы возвращают статус, не падают; нет скрытых переходов).
 - Инкрементальный PCM16-feed (канонический формат — **float32 mono [-1,1]**,
-  конверсия `s/32768.0f`, `-32768 → -1.0f`) и float32-feed (проверка finite, без
-  тихого clamp — сохраняет паритет с батчем).
+  конверсия `s/32768.0f`, `-32768 → -1.0f`) и float32-feed: принимается **любой
+  finite** сэмпл, значения вне `[-1,1]` **не** отклоняются и **не** clamp'ятся
+  (паритет с батчем); NaN/±Inf отклоняются с `invalid_argument`, не мутируя буфер.
 - 64-битный учёт (`total_samples_received/consumed`), zero-length/single-sample feed,
-  произвольные границы чанков, guard'ы переполнения и bounded-накопление
-  (`max_total_samples`, по умолчанию 10 мин — держит decode ниже KV-окна и **не**
-  достигает небезопасного `kv_cache_shift_left`).
-- Внутренняя bounded event-queue: `final_text`, `completed`, `cancelled`, `error`
-  (события владеют текстом; `token`/`partial_text` зарезервированы, не эмитятся).
-- `finish()` идемпотентен (второй запуск не выполняет модель повторно), `cancel` до
-  `finish` предотвращает inference, `reset` полностью очищает per-stream state.
+  произвольные границы чанков. Per-call sanity ceiling (`invalid_argument`) и
+  bounded-накопление `max_total_samples` (по умолчанию 10 мин): превышение —
+  **`limit_exceeded`** (а не `out_of_memory`), т.к. это временный предел
+  full-buffer compatibility path, удерживающий decode ниже KV-окна и **не**
+  достигающий небезопасного `kv_cache_shift_left`. `out_of_memory` остаётся только
+  за настоящим отказом аллокации.
+- Строго **bounded** event-queue (hard limit `kMaxEvents = 4096`): `final_text`,
+  `completed`, `cancelled`, `error` (события владеют текстом; `token`/`partial_text`
+  зарезервированы, не эмитятся). При переполнении новое событие **не** добавляется,
+  выставляется overflow-флаг + `last_error` (`limit_exceeded`); очередь никогда не
+  растёт сверх лимита и не теряет события молча. В v1 переполнение недостижимо
+  (2–4 события на сессию) — это защита от будущей ошибки.
+- `finish()` **синхронный** и идемпотентен (повторный запуск модель не выполняет),
+  `cancel` **до** `finish` предотвращает inference, `reset` дёшево переиспользует
+  stream (полная очистка runtime-состояния, **без** `shrink_to_fit` — capacity PCM
+  сохраняется), owned-контекст/params при reset сохраняются.
+- **Reentrancy guard:** все mutating-методы (`feed/finish/reset/cancel`) берут
+  дешёвый неблокирующий guard; конкурентный/повторно-входящий вызов возвращает
+  **`busy`** и не мутирует состояние. `cancel` во время in-flight `finish` → `busy`
+  (не прерывает inference и **не** переводит в `cancelled`), поэтому перехода
+  `cancelled → completed` не существует. In-flight (GGML) cancellation не реализована.
 
-### Ownership
+### Ownership (исправлено в сессии 4.1)
 
-`voxtral_model ⊃ voxtral_context ⊃ voxtral_stream` (строгий контракт, без refcount).
-Стрим **заимствует** context (исполнительный движок с моделью+устройством) и владеет
-только своим mutable-состоянием (PCM, счётчики, события, transcript); модель/устройство
-не освобождает. `ctx == nullptr` допустим для lifecycle/PCM-тестов без модели.
+`voxtral_model` (immutable, shared) **живёт дольше** `voxtral_stream`; каждый stream
+**создаёт и эксклюзивно владеет собственным** mutable `voxtral_context` (через
+`voxtral_init_from_model`) и освобождает его в `destroy`. Модель stream'ом не
+освобождается. Весь per-inference mutable state (decoder KV-cache, `kv_used`,
+decoder/encoder memory, schedulers, scratch, размеры текущей транскрипции) физически
+находится **в этом owned-контексте**, поэтому один `voxtral_context` **никогда** не
+разделяется активными streams.
+
+    model  outlives  stream  ⊃  its own context
+
+Из одной модели можно **последовательно** создать несколько streams — каждый получает
+свой контекст (в harness `--ab` два alive-стрима имеют физически разные контексты —
+`distinctContexts`). Одновременное исполнение streams в этой сессии не поддерживается.
+
+Внутренний конструктор: `voxtral_stream_create_internal(model, ctx_params, params)`.
+`model == nullptr` допустим для lifecycle/PCM-тестов без backend'а (stream тогда не
+владеет контекстом; `finish` на непустом аудио честно возвращает `backend_error`).
+Ошибка создания контекста возвращает stream в состоянии `failed` со статусом
+`backend_error` (не тихий `nullptr`).
+
+### Corrected contracts (session 4.1) — current implementation
+
+```text
+- model can be shared;
+- each stream owns (creates + frees) one mutable voxtral_context;
+- one voxtral_context must never be shared by active streams;
+- stream methods are externally serialized (single-threaded contract);
+- concurrent/reentrant calls return `busy`; they never mutate state;
+- finish is synchronous;
+- cancel/reset/feed during an in-flight finish return `busy`, never `cancelled`;
+- there is no cancelled -> completed transition;
+- in-flight (GGML graph) cancellation is NOT implemented;
+- the 10-minute cap returns `limit_exceeded`, not `out_of_memory`;
+- the event queue is a true hard bound (overflow is recorded, never silent);
+- reset reuses the stream cheaply (no shrink_to_fit);
+- audio is still fully buffered; inference still runs only at finish;
+- no partial transcript exists; this is NOT real-time inference yet.
+```
+
+Устаревшие формулировки предыдущего отчёта (стрим *заимствует* context; mutable
+inference state «физически отделён» и лежит прямо в `voxtral_stream`; schedulers уже
+безопасно shared между streams; cancel поддерживается во время finish) — **неверны**
+и заменены выше. Рекомендации §4/§10 о shared schedulers относятся к будущей
+concurrency-сессии, а не к текущей реализации.
 
 ### Тесты
 
 - C++ unit (`tests/cpp/test_stream_state.cpp`, target `voxtral_stream_unit`, CTest):
-  17 кейсов, 102 проверки, без модели. Регистрируется автоматически.
+  24 кейса, 169 проверок, без модели. Помимо прежних lifecycle/PCM-кейсов покрывает
+  ownership (lifecycle-only / owned-context-freed / context-creation-failure /
+  sequential distinct contexts — через test seam: подменяемый context factory/free),
+  reentrancy guard + transient `finishing` (finishing hook → все reentrant-вызовы
+  `busy`, нет `cancelled`), hard-bound event-queue, `limit_exceeded`. Регистрируется
+  автоматически под `BUILD_TESTING`.
 - Model-driven harness `voxtral-stream-test` (`tests/cpp/voxtral_stream_test.cpp`) —
-  JSON на stdout, логи на stderr; **не** production CLI/server.
+  JSON на stdout, логи на stderr; **не** production CLI/server. Каждый stream создаёт
+  собственный context из shared model; флаг `--ab` гоняет два последовательных стрима
+  A/B из одной модели (`distinctContexts`, `modelShared`, `contextOwnedByStream`,
+  `threading:externally_serialized`).
+- Тесты собираются под стандартным `BUILD_TESTING` (default ON через `include(CTest)`);
+  production-сборка `-DBUILD_TESTING=OFF` собирает только `voxtral`/`voxtral-quantize`.
 - Node.js acceptance `tests/node/baseline/stream-skeleton.test.js`
   (`npm run acceptance:stream-skeleton` / `test:stream-skeleton:gpu`), переиспользует
-  `prepareStreamingAudio`/`createChunkPlan`/`StreamingEventCollector`.
+  `prepareStreamingAudio`/`createChunkPlan`/`StreamingEventCollector`; добавлен
+  сценарий «одна модель → два последовательных стрима A/B с раздельными контекстами».
 
 ### Подтверждённая chunk-invariance (RX 6600, Vulkan) 🧪 EXP
 
