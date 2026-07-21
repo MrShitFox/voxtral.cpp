@@ -1,4 +1,6 @@
 #include "voxtral.h"
+#include "voxtral-mel.h"
+#include "voxtral-internal.h"
 #include "gguf.h"
 #include <algorithm>
 #include <array>
@@ -20,9 +22,8 @@
 // Internal constants
 // ============================================================================
 
-static constexpr float VOXTRAL_PI = 3.14159265358979323846f;
-static constexpr int32_t VOXTRAL_N_FFT       = VOXTRAL_WINDOW_SIZE;         // 400
-static constexpr int32_t VOXTRAL_N_FREQ      = VOXTRAL_N_FFT / 2 + 1;
+// STFT / Mel constants live in voxtral-mel.h (VOXTRAL_MEL_*); the DFT + mel
+// filterbank + normalization math is shared with the incremental frontend.
 static constexpr int32_t VOXTRAL_ENC_CHUNK_MEL     = 3000;  // mel frames per encoder chunk
 static constexpr int32_t VOXTRAL_ENC_CHUNK_OVERLAP  = 750;  // overlap in encoder-token space (= window)
 static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens per single chunk
@@ -229,74 +230,6 @@ struct voxtral_context {
 };
 
 // ============================================================================
-// Mel filterbank computation (Slaney-style)
-// ============================================================================
-
-static float hertz_to_mel(float freq_hz) {
-    constexpr float min_log_hertz = 1000.0f;
-    constexpr float min_log_mel   = 15.0f;
-    const float logstep       = 27.0f / logf(6.4f);
-    float mels = 3.0f * freq_hz / 200.0f;
-    if (freq_hz >= min_log_hertz) {
-        mels = min_log_mel + logf(freq_hz / min_log_hertz) * logstep;
-    }
-    return mels;
-}
-
-static float mel_to_hertz(float mels) {
-    constexpr float min_log_hertz = 1000.0f;
-    constexpr float min_log_mel   = 15.0f;
-    const float logstep       = logf(6.4f) / 27.0f;
-    float freq = 200.0f * mels / 3.0f;
-    if (mels >= min_log_mel) {
-        freq = min_log_hertz * expf(logstep * (mels - min_log_mel));
-    }
-    return freq;
-}
-
-static void compute_mel_filters_slaney(std::vector<float> & filters) {
-    constexpr int32_t n_freq = VOXTRAL_N_FREQ;
-    constexpr int32_t n_mel  = VOXTRAL_NUM_MEL_BINS;
-
-    filters.resize(n_freq * n_mel, 0.0f);
-
-    std::vector<float> fft_freqs(n_freq);
-    for (int32_t i = 0; i < n_freq; i++) {
-        fft_freqs[i] = (float)(VOXTRAL_SAMPLE_RATE / 2) * (float)i / (float)(n_freq - 1);
-    }
-
-    const float mel_min = hertz_to_mel(0.0f);
-    const float mel_max = hertz_to_mel(8000.0f);
-
-    std::vector<float> mel_pts(n_mel + 2);
-    for (int32_t i = 0; i < n_mel + 2; i++) {
-        mel_pts[i] = mel_min + (mel_max - mel_min) * (float)i / (float)(n_mel + 1);
-    }
-
-    std::vector<float> filter_freqs(n_mel + 2);
-    for (int32_t i = 0; i < n_mel + 2; i++) {
-        filter_freqs[i] = mel_to_hertz(mel_pts[i]);
-    }
-
-    // Build triangular filters
-    for (int32_t m = 0; m < n_mel; m++) {
-        const float f_left   = filter_freqs[m];
-        const float f_center = filter_freqs[m + 1];
-        const float f_right  = filter_freqs[m + 2];
-        const float enorm    = 2.0f / (f_right - f_left);
-
-        for (int32_t k = 0; k < n_freq; k++) {
-            const float f = fft_freqs[k];
-            float down_slope = -(f - f_center) / (f_center - f_left);   // -slopes[:, :-2] / filter_diff[:-1]
-            float up_slope   =  (f_right - f)  / (f_right - f_center);  // slopes[:, 2:] / filter_diff[1:]
-
-            float val = std::max(0.0f, std::min(down_slope, up_slope));
-            filters[k * n_mel + m] = val * enorm;
-        }
-    }
-}
-
-// ============================================================================
 // Time embedding (sinusoidal, matches Python compute_time_embedding)
 // ============================================================================
 
@@ -410,24 +343,6 @@ static std::string decode_tokens(const voxtral_model & model, const std::vector<
 }
 
 // ============================================================================
-// Reflect padding helper (matches PyTorch pad(mode="reflect"))
-// ============================================================================
-
-static inline int32_t reflect_index(int32_t idx, int32_t len) {
-    if (len <= 1) {
-        return 0;
-    }
-    while (idx < 0 || idx >= len) {
-        if (idx < 0) {
-            idx = -idx;
-        } else {
-            idx = 2 * len - 2 - idx;
-        }
-    }
-    return idx;
-}
-
-// ============================================================================
 // WAV file loading (16-bit PCM or 32-bit float, mono/stereo)
 // ============================================================================
 
@@ -504,134 +419,8 @@ static bool load_wav_file(const std::string & path, std::vector<float> & audio_o
     return true;
 }
 
-// ============================================================================
-// Mel spectrogram computation (CPU, matches Python compute_mel_spectrogram)
-// ============================================================================
-
-struct stft_plan {
-    int32_t n_fft = 0;
-    int32_t n_bins = 0;
-    std::vector<float> cos_table;
-    std::vector<float> sin_table;
-};
-
-static const stft_plan & get_stft_plan() {
-    static stft_plan plan = []() {
-        stft_plan p;
-        p.n_fft  = VOXTRAL_N_FFT;
-        p.n_bins = VOXTRAL_N_FREQ;
-        p.cos_table.resize((size_t) p.n_bins * (size_t) p.n_fft);
-        p.sin_table.resize((size_t) p.n_bins * (size_t) p.n_fft);
-        for (int32_t k = 0; k < p.n_bins; ++k) {
-            for (int32_t n = 0; n < p.n_fft; ++n) {
-                const float angle = 2.0f * VOXTRAL_PI * (float) k * (float) n / (float) p.n_fft;
-                const size_t idx = (size_t) k * (size_t) p.n_fft + (size_t) n;
-                p.cos_table[idx] = cosf(angle);
-                p.sin_table[idx] = sinf(angle);
-            }
-        }
-        return p;
-    }();
-    return plan;
-}
-
-static void compute_mel_spectrogram(
-    const float * audio,
-    int32_t       n_samples,
-    const float * mel_filters,   // [n_freq * n_mel]
-    const float * hann_window,   // [window_size]
-    float       * mel_out,       // [n_mel, n_frames]  (pre-allocated)
-    int32_t     * out_n_frames)
-{
-    // torch.stft with window_size, hop_length, return_complex=True
-    // produces (n_freq, n_stft_frames) where n_stft_frames = n_samples/hop + 1
-    // Then magnitudes = stft[..., :-1].abs()**2  -> drops last frame
-    const int32_t n_stft_frames = n_samples / VOXTRAL_HOP_LENGTH + 1;
-    const int32_t n_frames = n_stft_frames - 1;  // drop last frame (matching Python [:-1])
-    *out_n_frames = n_frames;
-
-    constexpr int32_t n_freq = VOXTRAL_N_FREQ;
-    constexpr int32_t n_mel  = VOXTRAL_NUM_MEL_BINS;
-    constexpr int32_t n_fft  = VOXTRAL_N_FFT;
-    constexpr int32_t hop    = VOXTRAL_HOP_LENGTH;
-    constexpr int32_t pad    = n_fft / 2;
-
-    if (n_frames <= 0) {
-        return;
-    }
-
-    const stft_plan & plan = get_stft_plan();
-
-    // Reflect padding once (equivalent to center=True, pad_mode="reflect")
-    const int32_t centered_len = n_samples + 2 * pad;
-    std::vector<float> centered((size_t) centered_len, 0.0f);
-    if (n_samples > 0) {
-        for (int32_t i = 0; i < centered_len; ++i) {
-            const int32_t src = i - pad;
-            const int32_t ridx = (src >= 0 && src < n_samples) ? src : reflect_index(src, n_samples);
-            centered[(size_t) i] = audio[(size_t) ridx];
-        }
-    }
-
-    // Pre-allocate per-call buffers
-    std::vector<float> windowed((size_t) n_fft);
-    std::vector<float> power((size_t) n_freq);
-    std::vector<float> mel_accum((size_t) n_mel);
-
-    for (int32_t frame = 0; frame < n_frames; ++frame) {
-        const int32_t start = frame * hop;
-        const float * frame_ptr = centered.data() + (size_t) start;
-
-        for (int32_t i = 0; i < n_fft; ++i) {
-            windowed[(size_t) i] = frame_ptr[(size_t) i] * hann_window[(size_t) i];
-        }
-
-        // DFT with precomputed sin/cos tables
-        for (int32_t k = 0; k < n_freq; ++k) {
-            const float * cos_row = plan.cos_table.data() + (size_t) k * (size_t) n_fft;
-            const float * sin_row = plan.sin_table.data() + (size_t) k * (size_t) n_fft;
-            float re = 0.0f;
-            float im = 0.0f;
-
-            int32_t i = 0;
-            for (; i + 3 < n_fft; i += 4) {
-                const float x0 = windowed[(size_t) i + 0];
-                const float x1 = windowed[(size_t) i + 1];
-                const float x2 = windowed[(size_t) i + 2];
-                const float x3 = windowed[(size_t) i + 3];
-
-                re += x0 * cos_row[i + 0] + x1 * cos_row[i + 1] + x2 * cos_row[i + 2] + x3 * cos_row[i + 3];
-                im -= x0 * sin_row[i + 0] + x1 * sin_row[i + 1] + x2 * sin_row[i + 2] + x3 * sin_row[i + 3];
-            }
-            for (; i < n_fft; ++i) {
-                const float x = windowed[(size_t) i];
-                re += x * cos_row[i];
-                im -= x * sin_row[i];
-            }
-
-            power[(size_t) k] = re * re + im * im;
-        }
-
-        // Apply mel filterbank (k-major for cache-friendly access)
-        std::fill(mel_accum.begin(), mel_accum.end(), 0.0f);
-        for (int32_t k = 0; k < n_freq; ++k) {
-            const float * w = mel_filters + (size_t) k * (size_t) n_mel;
-            const float  pk = power[(size_t) k];
-            for (int32_t m = 0; m < n_mel; ++m) {
-                mel_accum[(size_t) m] += w[m] * pk;
-            }
-        }
-
-        for (int32_t m = 0; m < n_mel; ++m) {
-            float val = mel_accum[(size_t) m];
-            val = std::max(val, 1e-10f);
-            val = log10f(val);
-            val = std::max(val, VOXTRAL_GLOBAL_LOG_MEL_MAX - 8.0f);
-            val = (val + 4.0f) / 4.0f;
-            mel_out[(size_t) m * (size_t) n_frames + (size_t) frame] = val;
-        }
-    }
-}
+// Batch Mel spectrogram: thin wrapper over the shared frontend kernel. See
+// voxtral_mel_compute_batch() in voxtral-mel.cpp for the (unchanged) STFT math.
 
 // ============================================================================
 // GGUF tensor loading helper
@@ -1174,20 +963,16 @@ voxtral_context * voxtral_init_from_model(
     ctx->sched_dec_pre  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
     ctx->sched_dec_step = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
 
-    // Hann window
-    ctx->hann_window.resize(VOXTRAL_WINDOW_SIZE);
-    for (int32_t i = 0; i < VOXTRAL_WINDOW_SIZE; i++) {
-        // Match torch.hann_window(W, periodic=True)
-        ctx->hann_window[i] = 0.5f * (1.0f - cosf(2.0f * VOXTRAL_PI * (float)i / (float)(VOXTRAL_WINDOW_SIZE)));
-    }
+    // Hann window (shared frontend implementation)
+    voxtral_mel_build_hann_window(ctx->hann_window);
 
     // Mel filters (compute on CPU if not available from model, else load from GGUF)
     if (model->mel_filters) {
-        constexpr int32_t n = VOXTRAL_N_FREQ * VOXTRAL_NUM_MEL_BINS;
+        constexpr int32_t n = VOXTRAL_MEL_N_FREQ * VOXTRAL_NUM_MEL_BINS;
         ctx->mel_filters_cpu.resize(n);
         ggml_backend_tensor_get(model->mel_filters, ctx->mel_filters_cpu.data(), 0, n * sizeof(float));
     } else {
-        compute_mel_filters_slaney(ctx->mel_filters_cpu);
+        voxtral_mel_build_slaney_filters(ctx->mel_filters_cpu);
     }
 
     // Time embedding for t = N_DELAY_TOKENS
@@ -1195,6 +980,14 @@ voxtral_context * voxtral_init_from_model(
 
     LOG_INFO(ctx, "context initialized");
     return ctx;
+}
+
+const float * voxtral_ctx_hann_window(const voxtral_context * ctx) {
+    return (ctx && !ctx->hann_window.empty()) ? ctx->hann_window.data() : nullptr;
+}
+
+const float * voxtral_ctx_mel_filters(const voxtral_context * ctx) {
+    return (ctx && !ctx->mel_filters_cpu.empty()) ? ctx->mel_filters_cpu.data() : nullptr;
 }
 
 void voxtral_free(voxtral_context * ctx) {
@@ -2527,7 +2320,7 @@ static void compute_mel_even(voxtral_context & ctx, const float * samples, int32
     const int32_t max_frames = n_samples / VOXTRAL_HOP_LENGTH + 1;
     mel_data.assign((size_t) VOXTRAL_NUM_MEL_BINS * max_frames, 0.0f);
     n_frames = 0;
-    compute_mel_spectrogram(samples, n_samples, ctx.mel_filters_cpu.data(),
+    voxtral_mel_compute_batch(samples, n_samples, ctx.mel_filters_cpu.data(),
         ctx.hann_window.data(), mel_data.data(), &n_frames);
     if (n_frames % 2 != 0) {
         for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++)
@@ -2640,54 +2433,33 @@ static bool voxtral_transcribe_offline(
 // High-level: Transcribe
 // ============================================================================
 
-static bool voxtral_transcribe_from_audio(
+// Realtime Mel -> text. Shared by the batch path and the streaming finish():
+// runs encoder / adapter / decoder over a precomputed even-trimmed, channel-major
+// [n_mel, n_frames] Mel matrix. Encoder / adapter / decoder are defined exactly
+// once and never duplicated across the batch and streaming entry points.
+bool voxtral_transcribe_mel_internal(
     voxtral_context & ctx,
-    const float     * audio,
-    int32_t           n_samples,
+    const float     * mel,
+    int32_t           n_frames,
     int32_t           max_tokens,
-    voxtral_result  & result,
-    bool              log_audio)
+    voxtral_result  & result)
 {
     result.text.clear();
     result.tokens.clear();
     result.first_step_logits.clear();
 
-    if (audio == nullptr || n_samples <= 0) {
-        LOG_ERR(&ctx, "audio input is empty");
+    if (ctx.model->hp.is_offline) {
+        LOG_ERR(&ctx, "voxtral_transcribe_mel_internal: realtime-only path");
+        return false;
+    }
+    if (mel == nullptr || n_frames <= 0) {
+        LOG_ERR(&ctx, "voxtral_transcribe_mel_internal: empty mel");
         return false;
     }
 
-    if (log_audio) {
-        LOG_INFO(&ctx, "audio input: %d samples (%.1f s)", n_samples,
-            (float)n_samples / VOXTRAL_SAMPLE_RATE);
-    }
-
-    // Offline: different preprocessing, prompt and decode.
-    if (ctx.model->hp.is_offline) {
-        return voxtral_transcribe_offline(ctx, audio, n_samples, max_tokens, result);
-    }
-
-    // Streaming padding (matching Python pad_audio_streaming)
-    constexpr int32_t mult_of   = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;   // 1280
-    const int32_t n_raw     = n_samples;
-    const int32_t align_pad = (mult_of - (n_raw % mult_of)) % mult_of;
-    const int32_t right_pad = align_pad + VOXTRAL_N_RIGHT_PAD_TOKENS * mult_of;
-    constexpr int32_t left_pad  = VOXTRAL_N_LEFT_PAD_TOKENS * mult_of;
-
-    std::vector<float> padded(left_pad + n_raw + right_pad, 0.0f);
-    memcpy(padded.data() + left_pad, audio, n_raw * sizeof(float));
-
-    LOG_INFO(&ctx, "padded audio: %d samples (left=%d, right=%d)", (int)padded.size(), left_pad, right_pad);
-
-    // Compute mel spectrogram (truncated to an even frame count for conv stride 2)
-    int32_t n_frames = 0;
-    std::vector<float> mel_data;
-    compute_mel_even(ctx, padded.data(), (int32_t) padded.size(), mel_data, n_frames);
-    LOG_INFO(&ctx, "mel spectrogram: %d frames", n_frames);
-
     // Run encoder (chunked for arbitrarily long audio)
     auto t_encoder = std::chrono::steady_clock::now();
-    if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames)) {
+    if (!run_encoder_chunked(&ctx, mel, n_frames)) {
         return false;
     }
     LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
@@ -2778,10 +2550,59 @@ static bool voxtral_transcribe_from_audio(
 
     LOG_INFO(&ctx, "generated %d tokens", (int)result.tokens.size());
 
-    // 10. Decode tokens to text (Tekken vocab from GGUF metadata)
+    // Decode tokens to text (Tekken vocab from GGUF metadata)
     result.text = decode_tokens(*ctx.model, result.tokens);
 
     return true;
+}
+
+static bool voxtral_transcribe_from_audio(
+    voxtral_context & ctx,
+    const float     * audio,
+    int32_t           n_samples,
+    int32_t           max_tokens,
+    voxtral_result  & result,
+    bool              log_audio)
+{
+    result.text.clear();
+    result.tokens.clear();
+    result.first_step_logits.clear();
+
+    if (audio == nullptr || n_samples <= 0) {
+        LOG_ERR(&ctx, "audio input is empty");
+        return false;
+    }
+
+    if (log_audio) {
+        LOG_INFO(&ctx, "audio input: %d samples (%.1f s)", n_samples,
+            (float)n_samples / VOXTRAL_SAMPLE_RATE);
+    }
+
+    // Offline: different preprocessing, prompt and decode.
+    if (ctx.model->hp.is_offline) {
+        return voxtral_transcribe_offline(ctx, audio, n_samples, max_tokens, result);
+    }
+
+    // Streaming padding (matching Python pad_audio_streaming)
+    constexpr int32_t mult_of   = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;   // 1280
+    const int32_t n_raw     = n_samples;
+    const int32_t align_pad = (mult_of - (n_raw % mult_of)) % mult_of;
+    const int32_t right_pad = align_pad + VOXTRAL_N_RIGHT_PAD_TOKENS * mult_of;
+    constexpr int32_t left_pad  = VOXTRAL_N_LEFT_PAD_TOKENS * mult_of;
+
+    std::vector<float> padded(left_pad + n_raw + right_pad, 0.0f);
+    memcpy(padded.data() + left_pad, audio, n_raw * sizeof(float));
+
+    LOG_INFO(&ctx, "padded audio: %d samples (left=%d, right=%d)", (int)padded.size(), left_pad, right_pad);
+
+    // Compute mel spectrogram (truncated to an even frame count for conv stride 2)
+    int32_t n_frames = 0;
+    std::vector<float> mel_data;
+    compute_mel_even(ctx, padded.data(), (int32_t) padded.size(), mel_data, n_frames);
+    LOG_INFO(&ctx, "mel spectrogram: %d frames", n_frames);
+
+    // Shared Mel -> text path (encoder / adapter / decoder / detokenize).
+    return voxtral_transcribe_mel_internal(ctx, mel_data.data(), n_frames, max_tokens, result);
 }
 
 bool voxtral_transcribe_audio(

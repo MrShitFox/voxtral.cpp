@@ -50,6 +50,7 @@ endif()
 
 add_library(voxtral_lib
     src/voxtral.cpp
+    src/voxtral-mel.cpp
     src/voxtral-stream.cpp)
 
 # On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
@@ -156,6 +157,13 @@ if(BUILD_TESTING)
     target_link_libraries(voxtral_stream_unit PRIVATE voxtral_lib)
     target_include_directories(voxtral_stream_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_stream_unit COMMAND voxtral_stream_unit)
+
+    # Model-free numerical parity + memory-bound tests for the incremental Mel
+    # frontend (batch vs incremental, one-shot frames, bounded PCM retention).
+    add_executable(voxtral_mel_unit tests/cpp/test_mel_incremental.cpp)
+    target_link_libraries(voxtral_mel_unit PRIVATE voxtral_lib)
+    target_include_directories(voxtral_mel_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME voxtral_mel_unit COMMAND voxtral_mel_unit)
 
     # Model-driven harness used by the Node.js acceptance suite. Not a CLI/server.
     add_executable(voxtral-stream-test tests/cpp/voxtral_stream_test.cpp)

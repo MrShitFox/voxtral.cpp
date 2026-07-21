@@ -25,9 +25,12 @@
 
 #include "voxtral-stream.h"
 #include "voxtral.h"
+#include "voxtral-mel.h"
+#include "voxtral-internal.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -284,14 +287,73 @@ struct StreamRun {
     uint64_t             samplesConsumed = 0;
     uint64_t             feedCalls       = 0;
     uint64_t             inferenceRuns   = 0;
-    size_t               pcmFloats       = 0;
+    uint64_t             pcmFloats       = 0;
     std::string          pcmSha;
     std::vector<int32_t> tokens;
     std::string          text;
     std::vector<voxtral_stream_event> events;
     bool                 contextOwned = false;
     bool                 ok           = false;
+
+    // Incremental Mel frontend evidence.
+    bool     incrementalMel          = false;
+    int64_t  melFrames               = 0;
+    int64_t  melFramesBeforeFinish   = 0;
+    int64_t  melFramesFlushedAtFinish= 0;
+    int64_t  dftFramesComputed       = 0;
+    int64_t  pcmRetainedSamples      = 0;
+    int64_t  pcmPeakRetainedSamples  = 0;
+    int64_t  pcmBaseSample           = 0;
+    bool     fullPcmBufferedAtFinish = false;
+    std::string melSha;
+    double   melMaxAbsDeltaVsBatch   = 0.0;
 };
+
+// Reconstruct the batch even-trimmed Mel of the fully padded audio (the exact
+// reference the incremental frontend must reproduce) so the harness can report a
+// true batch-vs-incremental max abs delta. Uses the model's own Hann / mel
+// filters via the context so the reference is apples-to-apples.
+double mel_delta_vs_batch(const voxtral_context * ctx,
+                          const std::vector<int16_t> & pcm16,
+                          const float * inc_mel, int32_t inc_frames) {
+    const float * hann = voxtral_ctx_hann_window(ctx);
+    const float * filt = voxtral_ctx_mel_filters(ctx);
+    if (!ctx || !hann || !filt || !inc_mel || inc_frames <= 0) return -1.0;
+
+    const int32_t n_mel   = VOXTRAL_MEL_N_MEL;
+    const int64_t n_raw   = (int64_t) pcm16.size();
+    const int64_t mult    = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+    const int64_t left    = (int64_t) VOXTRAL_N_LEFT_PAD_TOKENS * mult;
+    const int64_t align   = (mult - (n_raw % mult)) % mult;
+    const int64_t right   = align + (int64_t) VOXTRAL_N_RIGHT_PAD_TOKENS * mult;
+
+    std::vector<float> padded((size_t) (left + n_raw + right), 0.0f);
+    for (int64_t i = 0; i < n_raw; ++i) {
+        padded[(size_t) (left + i)] = (float) pcm16[(size_t) i] / 32768.0f;
+    }
+
+    const int32_t nf_full = voxtral_mel_batch_frame_count((int32_t) padded.size());
+    std::vector<float> mel((size_t) n_mel * std::max(0, nf_full), 0.0f);
+    int32_t nf = 0;
+    voxtral_mel_compute_batch(padded.data(), (int32_t) padded.size(), filt, hann, mel.data(), &nf);
+
+    // Even trim (drop first frame if odd), matching compute_mel_even.
+    const bool drop_first = (nf % 2 != 0);
+    const int32_t n_out = drop_first ? (nf - 1) : nf;
+    if (n_out != inc_frames) return 1e9;   // frame-count mismatch surfaces loudly
+    const int32_t src_off = drop_first ? 1 : 0;
+
+    double md = 0.0;
+    for (int32_t m = 0; m < n_mel; ++m) {
+        for (int32_t j = 0; j < n_out; ++j) {
+            const double ref = mel[(size_t) m * nf + (j + src_off)];
+            const double got = inc_mel[(size_t) m * n_out + j];
+            const double d = std::fabs(ref - got);
+            if (d > md) md = d;
+        }
+    }
+    return md;
+}
 
 // Feed `counts` into an already-created stream, finish it and capture results.
 StreamRun drive_stream(voxtral_stream * stream,
@@ -323,13 +385,39 @@ StreamRun drive_stream(voxtral_stream * stream,
         }
     }
 
-    // Hash the canonical float32 PCM.
-    Sha256 sha;
-    if (voxtral_stream_pcm_size(stream) > 0) {
-        sha.update(voxtral_stream_pcm_data(stream),
-                   voxtral_stream_pcm_size(stream) * sizeof(float));
+    // Chunk-invariant SHA-256 of the full canonical PCM (maintained incrementally
+    // by the stream; no full-PCM retention needed).
+    r.pcmSha = voxtral_stream_pcm_sha256(stream);
+
+    // Incremental Mel frontend evidence.
+    r.incrementalMel           = voxtral_stream_uses_incremental_mel(stream);
+    r.melFrames                = voxtral_stream_mel_frames(stream);
+    r.melFramesBeforeFinish    = voxtral_stream_mel_frames_before_finish(stream);
+    r.melFramesFlushedAtFinish = voxtral_stream_mel_frames_flushed_at_finish(stream);
+    r.dftFramesComputed        = voxtral_stream_dft_frames_computed(stream);
+    r.pcmRetainedSamples       = voxtral_stream_pcm_retained_samples(stream);
+    r.pcmPeakRetainedSamples   = voxtral_stream_pcm_peak_retained_samples(stream);
+    r.pcmBaseSample            = voxtral_stream_pcm_base_sample(stream);
+    r.fullPcmBufferedAtFinish  = voxtral_stream_full_pcm_buffered_at_finish(stream);
+
+    // SHA-256 over the assembled even Mel matrix (byte layout: channel-major
+    // [n_mel, n_frames] float32) + max abs delta vs the batch Mel of the same
+    // audio, both while the stream (and its context) is still alive.
+    const float * inc_mel   = voxtral_stream_mel_data(stream);
+    const int32_t inc_frames = voxtral_stream_mel_data_frames(stream);
+    {
+        Sha256 msha;
+        if (inc_mel && inc_frames > 0) {
+            msha.update(inc_mel, (size_t) VOXTRAL_MEL_N_MEL * (size_t) inc_frames * sizeof(float));
+        }
+        r.melSha = msha.hex();
     }
-    r.pcmSha = sha.hex();
+    {
+        const voxtral_context * ctx =
+            static_cast<const voxtral_context *>(voxtral_stream_context_ptr(stream));
+        const double d = mel_delta_vs_batch(ctx, pcm16, inc_mel, inc_frames);
+        r.melMaxAbsDeltaVsBatch = (d < 0.0) ? 0.0 : d;
+    }
 
     // Drain events (order preserved).
     voxtral_stream_event ev;
@@ -341,7 +429,7 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.samplesConsumed = voxtral_stream_samples_consumed(stream);
     r.feedCalls       = feed_calls;
     r.inferenceRuns   = voxtral_stream_inference_runs(stream);
-    r.pcmFloats       = voxtral_stream_pcm_size(stream);
+    r.pcmFloats       = voxtral_stream_samples_received(stream);
     r.tokens          = voxtral_stream_tokens(stream);
     r.text            = voxtral_stream_transcript(stream);
     r.contextOwned    = voxtral_stream_owns_context(stream);
@@ -359,6 +447,17 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"inferenceRuns\":" << r.inferenceRuns << ",";
     js << "\"pcmFloats\":" << r.pcmFloats << ",";
     js << "\"pcmSha256\":\"" << r.pcmSha << "\",";
+    js << "\"incrementalMel\":" << (r.incrementalMel ? "true" : "false") << ",";
+    js << "\"melFrames\":" << r.melFrames << ",";
+    js << "\"melFramesBeforeFinish\":" << r.melFramesBeforeFinish << ",";
+    js << "\"melFramesFlushedAtFinish\":" << r.melFramesFlushedAtFinish << ",";
+    js << "\"dftFramesComputed\":" << r.dftFramesComputed << ",";
+    js << "\"melSha256\":\"" << r.melSha << "\",";
+    js << "\"melMaxAbsDeltaVsBatch\":" << r.melMaxAbsDeltaVsBatch << ",";
+    js << "\"pcmRetainedSamples\":" << r.pcmRetainedSamples << ",";
+    js << "\"pcmPeakRetainedSamples\":" << r.pcmPeakRetainedSamples << ",";
+    js << "\"pcmBaseSample\":" << r.pcmBaseSample << ",";
+    js << "\"fullPcmBufferedAtFinish\":" << (r.fullPcmBufferedAtFinish ? "true" : "false") << ",";
     js << "\"contextOwnedByStream\":" << (r.contextOwned ? "true" : "false") << ",";
     js << "\"tokens\":[";
     for (size_t i = 0; i < r.tokens.size(); ++i) { if (i) js << ","; js << r.tokens[i]; }

@@ -8,9 +8,12 @@
 // ============================================================================
 
 #include "voxtral-stream.h"
+#include "voxtral-internal.h"   // voxtral_transcribe_mel_internal (Mel -> text path)
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <new>
@@ -41,7 +44,107 @@ constexpr size_t kMaxEvents = 4096;
 voxtral_stream_context_factory_fn g_context_factory = &voxtral_init_from_model;
 voxtral_stream_context_free_fn    g_context_free    = &voxtral_free;
 
+// ----------------------------------------------------------------------------
+// Minimal incremental SHA-256 over the canonical PCM. Lets the stream report a
+// stable, chunk-invariant digest of the whole audio without retaining it. The
+// running state is copied before finalization so it can be queried repeatedly.
+// ----------------------------------------------------------------------------
+struct Sha256 {
+    uint32_t h[8];
+    uint64_t len = 0;
+    uint8_t  buf[64];
+    size_t   buf_len = 0;
+
+    Sha256() { reset(); }
+
+    void reset() {
+        static const uint32_t init[8] = {
+            0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+            0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+        std::memcpy(h, init, sizeof(init));
+        len = 0;
+        buf_len = 0;
+    }
+
+    static uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+
+    void block(const uint8_t * p) {
+        static const uint32_t k[64] = {
+            0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+            0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+            0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+            0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+            0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+            0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+            0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+            0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u};
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (uint32_t(p[i * 4]) << 24) | (uint32_t(p[i * 4 + 1]) << 16) |
+                   (uint32_t(p[i * 4 + 2]) << 8) | uint32_t(p[i * 4 + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + k[i] + w[i];
+            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+
+    void update(const void * data, size_t n) {
+        const uint8_t * p = static_cast<const uint8_t *>(data);
+        len += n;
+        while (n > 0) {
+            size_t take = 64 - buf_len;
+            if (take > n) take = n;
+            std::memcpy(buf + buf_len, p, take);
+            buf_len += take; p += take; n -= take;
+            if (buf_len == 64) { block(buf); buf_len = 0; }
+        }
+    }
+
+    // Finalize a COPY, leaving `this` usable for further updates.
+    std::string hex() const {
+        Sha256 s = *this;
+        uint64_t bits = s.len * 8;
+        uint8_t pad = 0x80;
+        s.update(&pad, 1);
+        uint8_t zero = 0;
+        while (s.buf_len != 56) s.update(&zero, 1);
+        uint8_t lenbe[8];
+        for (int i = 0; i < 8; ++i) lenbe[i] = uint8_t(bits >> (56 - i * 8));
+        s.update(lenbe, 8);
+        static const char * hexd = "0123456789abcdef";
+        std::string out;
+        out.reserve(64);
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 3; j >= 0; --j) {
+                uint8_t byte = uint8_t(s.h[i] >> (j * 8));
+                out.push_back(hexd[byte >> 4]);
+                out.push_back(hexd[byte & 0xf]);
+            }
+        }
+        return out;
+    }
+};
+
 } // namespace
+
+// Streaming left/right zero padding (mirrors the batch pad_audio_streaming in
+// voxtral_transcribe_from_audio): left = 32 tokens, right = align-to-1280 + 17
+// tokens, one token = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK raw samples.
+static constexpr int64_t kStreamLeftPad =
+    (int64_t) VOXTRAL_N_LEFT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
 
 // ----------------------------------------------------------------------------
 // The stream object.
@@ -64,11 +167,25 @@ struct voxtral_stream {
     bool cancel_requested = false;
     bool cancelled_emitted = false;
 
-    // Canonical PCM: float32 mono in nominal [-1, 1]. Append-only in v1.
+    // Canonical PCM buffer. Used ONLY by lifecycle-only streams (no context):
+    // inference streams route samples straight into the incremental Mel frontend
+    // and never retain the full PCM here.
     std::vector<float> pcm;
-    // Reserved for the incremental frontend: the first unconsumed sample index.
-    // Stays 0 in v1 (the whole buffer is handed to the batch path at finish).
-    size_t   pcm_read_offset      = 0;
+    // Scratch buffer reused each feed to convert PCM16/f32 to canonical float32.
+    std::vector<float> feed_scratch;
+
+    // Incremental Mel frontend (inference streams only; null for lifecycle-only).
+    // Owns the bounded rolling PCM tail and the accumulated Mel frames.
+    voxtral_mel_frontend * mel_fe = nullptr;
+    bool     left_pad_injected    = false;  // streaming left zero-pad injected once
+    bool     full_pcm_buffered_at_finish = false;
+
+    // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
+    Sha256   pcm_sha;
+
+    // Even-trimmed Mel matrix [n_mel, n_frames] assembled at finish() (batch path).
+    std::vector<float> mel_even;
+    int32_t            mel_even_frames = 0;
 
     uint64_t total_samples_received = 0;
     uint64_t total_samples_consumed = 0;
@@ -170,6 +287,41 @@ bool feed_allowed(voxtral_stream_state st) {
     return st == voxtral_stream_state::created || st == voxtral_stream_state::running;
 }
 
+// Lazily create the incremental Mel frontend for an inference stream on first
+// feed. Deferred (not done in create) so the model-free ownership tests, which
+// substitute an opaque sentinel context and never feed, never dereference it.
+// Returns false only on a genuine allocation failure. A lifecycle-only stream
+// (no owned context) or a context without frontend tables leaves mel_fe null and
+// keeps the full-PCM path.
+bool ensure_frontend(voxtral_stream * s) {
+    if (s->mel_fe) return true;
+    if (!s->owns_context || !s->ctx) return true;
+    const float * hann    = voxtral_ctx_hann_window(s->ctx);
+    const float * filters = voxtral_ctx_mel_filters(s->ctx);
+    if (!hann || !filters) return true;
+    s->mel_fe = voxtral_mel_frontend_create(hann, filters);
+    if (!s->mel_fe) {
+        set_error(s, voxtral_status::out_of_memory, "failed to create incremental Mel frontend");
+        return false;
+    }
+    return true;
+}
+
+// Inject the streaming left zero-padding into the Mel frontend exactly once,
+// before the first real sample. Mirrors the batch left_pad prefix. Bounded: the
+// injected silence is emitted to stable Mel frames and the PCM tail compacted
+// before this returns, so it does not create a lasting 40960-sample buffer.
+void ensure_left_pad(voxtral_stream * s) {
+    if (s->mel_fe && !s->left_pad_injected) {
+        s->left_pad_injected = true;
+        voxtral_mel_frontend_feed_silence(s->mel_fe, (size_t) kStreamLeftPad);
+    }
+}
+
+voxtral_mel_metrics stream_mel_metrics(const voxtral_stream * s) {
+    return (s && s->mel_fe) ? voxtral_mel_frontend_metrics(s->mel_fe) : voxtral_mel_metrics{};
+}
+
 // Common core for both feed variants: guard reentrancy, validate state/args,
 // size guards, then append via the caller-provided converter. `convert(dst)`
 // must append exactly `count` floats to `dst`.
@@ -219,19 +371,51 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
         return voxtral_status::limit_exceeded;
     }
 
-    try {
-        s->pcm.reserve(s->pcm.size() + count);
-    } catch (const std::exception & e) {
-        // A genuine allocation failure (distinct from the compatibility limit).
-        set_error(s, voxtral_status::out_of_memory, std::string("pcm reserve failed: ") + e.what());
+    // Lazily bring up the incremental Mel frontend (inference streams). Done
+    // before any state mutation so a failure leaves the stream untouched.
+    if (!ensure_frontend(s)) {
         return voxtral_status::out_of_memory;
     }
 
-    if (!convert(s->pcm)) {
-        // Converter rejected the payload (e.g. non-finite float). It must not
-        // have mutated the buffer; state is unchanged.
+    // Convert into a reusable scratch buffer first, so a rejected payload never
+    // mutates any persistent state.
+    s->feed_scratch.clear();
+    try {
+        s->feed_scratch.reserve(count);
+    } catch (const std::exception & e) {
+        set_error(s, voxtral_status::out_of_memory, std::string("pcm reserve failed: ") + e.what());
+        return voxtral_status::out_of_memory;
+    }
+    if (!convert(s->feed_scratch)) {
+        // Converter rejected the payload (e.g. non-finite float); nothing changed.
+        s->feed_scratch.clear();
         return s->last_status;
     }
+
+    // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
+    s->pcm_sha.update(s->feed_scratch.data(), s->feed_scratch.size() * sizeof(float));
+
+    if (s->mel_fe) {
+        // Inference stream: stream samples through the incremental Mel frontend.
+        // No full PCM is retained — only the frontend's bounded rolling tail.
+        ensure_left_pad(s);
+        if (!voxtral_mel_frontend_feed(s->mel_fe, s->feed_scratch.data(), s->feed_scratch.size())) {
+            set_error(s, voxtral_status::backend_error, "incremental Mel frontend rejected feed");
+            s->feed_scratch.clear();
+            return voxtral_status::backend_error;
+        }
+    } else {
+        // Lifecycle-only stream (no context): retain the full canonical PCM as
+        // before (used by model-free tests; never runs inference).
+        try {
+            s->pcm.insert(s->pcm.end(), s->feed_scratch.begin(), s->feed_scratch.end());
+        } catch (const std::exception & e) {
+            set_error(s, voxtral_status::out_of_memory, std::string("pcm append failed: ") + e.what());
+            s->feed_scratch.clear();
+            return voxtral_status::out_of_memory;
+        }
+    }
+    s->feed_scratch.clear();
 
     s->total_samples_received += static_cast<uint64_t>(count);
     s->feed_calls++;
@@ -286,8 +470,12 @@ voxtral_stream * voxtral_stream_create_internal(
         }
         s->ctx          = ctx;
         s->owns_context = true;
+        // The incremental Mel frontend is created lazily on the first feed (see
+        // ensure_frontend): the model-free ownership tests substitute an opaque
+        // sentinel context via the test seam and never feed, so create() must not
+        // dereference the returned context here.
     }
-    // model == nullptr: lifecycle-only stream, no owned context.
+    // model == nullptr: lifecycle-only stream, no owned context / frontend.
     return s;
 }
 
@@ -295,6 +483,9 @@ void voxtral_stream_destroy_internal(voxtral_stream * stream) {
     if (!stream) return;   // destroy(nullptr) is safe.
     // Owns only its own context (and mutable state); never frees the model. The
     // caller guarantees no operation is in flight (threading contract).
+    if (stream->mel_fe) {
+        voxtral_mel_frontend_destroy(stream->mel_fe);
+    }
     if (stream->owns_context && stream->ctx) {
         g_context_free(stream->ctx);
     }
@@ -380,21 +571,34 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
         return voxtral_status::ok;
     }
 
-    if (stream->ctx == nullptr) {
+    if (stream->ctx == nullptr || stream->mel_fe == nullptr) {
         set_error(stream, voxtral_status::backend_error,
-                  "no execution context: cannot transcribe buffered audio");
+                  "no execution context / Mel frontend: cannot transcribe audio");
         emit_error(stream, voxtral_status::backend_error, stream->last_error);
         stream->state = voxtral_stream_state::failed;
         return voxtral_status::backend_error;
     }
 
-    // Compatibility path: hand the fully buffered canonical PCM to the existing
-    // batch inference exactly once. Chunk boundaries do not affect the result
-    // because the accumulated buffer is byte-identical regardless of feeding.
+    // Incremental frontend path: no full PCM was buffered. Push the streaming
+    // right zero-padding (equivalent to the batch pad_audio_streaming tail),
+    // flush the final Mel frames, then run the shared Mel -> text pipeline over
+    // the accumulated incremental Mel. Chunk boundaries do not affect the Mel (it
+    // is bit-for-bit the batch Mel of the same audio), so tokens are invariant.
     voxtral_result result;
     bool ok = false;
     try {
-        ok = voxtral_transcribe_audio(*stream->ctx, stream->pcm, stream->params.max_tokens, result);
+        ensure_left_pad(stream);   // no-op if already injected during feed
+        const int64_t n_raw     = (int64_t) stream->total_samples_received;
+        const int64_t mult      = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+        const int64_t align_pad = (mult - (n_raw % mult)) % mult;
+        const int64_t right_pad = align_pad + (int64_t) VOXTRAL_N_RIGHT_PAD_TOKENS * mult;
+        voxtral_mel_frontend_feed_silence(stream->mel_fe, (size_t) right_pad);
+        voxtral_mel_frontend_finish(stream->mel_fe);
+        voxtral_mel_frontend_assemble_even(stream->mel_fe, stream->mel_even, stream->mel_even_frames);
+        stream->full_pcm_buffered_at_finish = false;
+
+        ok = voxtral_transcribe_mel_internal(*stream->ctx, stream->mel_even.data(),
+                                             stream->mel_even_frames, stream->params.max_tokens, result);
         stream->inference_runs++;   // one execution per finish, success or failure
     } catch (const std::exception & e) {
         set_error(stream, voxtral_status::backend_error,
@@ -405,7 +609,7 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
     }
 
     if (!ok) {
-        set_error(stream, voxtral_status::backend_error, "batch inference reported failure");
+        set_error(stream, voxtral_status::backend_error, "incremental Mel inference reported failure");
         emit_error(stream, voxtral_status::backend_error, stream->last_error);
         stream->state = voxtral_stream_state::failed;
         return voxtral_status::backend_error;
@@ -431,10 +635,18 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
 
     // Clears all per-stream mutable runtime state; the owned context, params,
     // and test knobs (max_events / finishing hook) are kept for cheap reuse.
-    // Deliberately no shrink_to_fit(): keep the PCM capacity so reuse does not
+    // Deliberately no shrink_to_fit(): keep buffer capacities so reuse does not
     // re-allocate.
     stream->pcm.clear();
-    stream->pcm_read_offset        = 0;
+    stream->feed_scratch.clear();
+    if (stream->mel_fe) {
+        voxtral_mel_frontend_reset(stream->mel_fe);   // clears rolling PCM, frames, counters
+    }
+    stream->left_pad_injected            = false;
+    stream->full_pcm_buffered_at_finish  = false;
+    stream->pcm_sha.reset();
+    stream->mel_even.clear();
+    stream->mel_even_frames        = 0;
     stream->total_samples_received = 0;
     stream->total_samples_consumed = 0;
     stream->feed_calls             = 0;
@@ -540,6 +752,44 @@ const float * voxtral_stream_pcm_data(const voxtral_stream * s) {
 }
 size_t voxtral_stream_pcm_size(const voxtral_stream * s) {
     return s ? s->pcm.size() : 0;
+}
+std::string voxtral_stream_pcm_sha256(const voxtral_stream * s) {
+    return s ? s->pcm_sha.hex() : Sha256{}.hex();
+}
+
+// --- Incremental Mel frontend introspection --------------------------------
+bool voxtral_stream_uses_incremental_mel(const voxtral_stream * s) {
+    return s ? (s->mel_fe != nullptr) : false;
+}
+int64_t voxtral_stream_mel_frames(const voxtral_stream * s) {
+    return stream_mel_metrics(s).frames_total;
+}
+int64_t voxtral_stream_mel_frames_before_finish(const voxtral_stream * s) {
+    return stream_mel_metrics(s).frames_during_feed;
+}
+int64_t voxtral_stream_mel_frames_flushed_at_finish(const voxtral_stream * s) {
+    return stream_mel_metrics(s).frames_at_finish;
+}
+int64_t voxtral_stream_dft_frames_computed(const voxtral_stream * s) {
+    return stream_mel_metrics(s).dft_frames_computed;
+}
+int64_t voxtral_stream_pcm_retained_samples(const voxtral_stream * s) {
+    return stream_mel_metrics(s).pcm_retained;
+}
+int64_t voxtral_stream_pcm_peak_retained_samples(const voxtral_stream * s) {
+    return stream_mel_metrics(s).pcm_peak_retained;
+}
+int64_t voxtral_stream_pcm_base_sample(const voxtral_stream * s) {
+    return stream_mel_metrics(s).pcm_base;
+}
+bool voxtral_stream_full_pcm_buffered_at_finish(const voxtral_stream * s) {
+    return s ? s->full_pcm_buffered_at_finish : false;
+}
+const float * voxtral_stream_mel_data(const voxtral_stream * s) {
+    return (s && !s->mel_even.empty()) ? s->mel_even.data() : nullptr;
+}
+int32_t voxtral_stream_mel_data_frames(const voxtral_stream * s) {
+    return s ? s->mel_even_frames : 0;
 }
 
 // ============================================================================

@@ -69,6 +69,7 @@
 
 #include "voxtral.h"   // public API: voxtral_model, voxtral_context, voxtral_context_params,
                         // voxtral_init_from_model, voxtral_free, voxtral_transcribe_audio, constants
+#include "voxtral-mel.h"  // incremental Mel frontend + voxtral_mel_metrics
 
 #include <cstddef>
 #include <cstdint>
@@ -262,11 +263,41 @@ bool                 voxtral_stream_owns_context     (const voxtral_stream * str
 // streams). Only meaningful for identity comparison while the stream is alive.
 const void *         voxtral_stream_context_ptr      (const voxtral_stream * stream);
 
-// Canonical accumulated PCM: float32 mono in nominal [-1, 1]. Valid until the
-// next feed/reset/destroy. Used by tests to verify chunk invariance and the
-// PCM16 conversion.
+// Canonical PCM view: float32 mono in nominal [-1, 1]. For lifecycle-only streams
+// (no context) this is the full accumulated buffer; for inference streams the
+// full PCM is NOT retained (only a bounded rolling tail lives inside the Mel
+// frontend), so this returns nullptr / 0. Valid until the next feed/reset/destroy.
 const float *        voxtral_stream_pcm_data         (const voxtral_stream * stream);
 size_t               voxtral_stream_pcm_size         (const voxtral_stream * stream);
+
+// SHA-256 (lowercase hex) of the full canonical PCM, maintained incrementally as
+// samples are fed. Byte-for-byte over the float32 samples in feed order, so it is
+// invariant to chunk boundaries and does not require retaining the PCM. Empty
+// digest string ("e3b0c4...") for an empty stream.
+std::string          voxtral_stream_pcm_sha256       (const voxtral_stream * stream);
+
+// ----------------------------------------------------------------------------
+// Incremental Mel frontend introspection. For inference streams these track the
+// true incremental STFT/log-Mel state; for lifecycle-only streams they are all
+// zero / false (no frontend runs). See docs/architecture/streaming-runtime.md.
+// ----------------------------------------------------------------------------
+bool        voxtral_stream_uses_incremental_mel        (const voxtral_stream * stream);
+int64_t     voxtral_stream_mel_frames                  (const voxtral_stream * stream);
+int64_t     voxtral_stream_mel_frames_before_finish    (const voxtral_stream * stream);
+int64_t     voxtral_stream_mel_frames_flushed_at_finish(const voxtral_stream * stream);
+int64_t     voxtral_stream_dft_frames_computed         (const voxtral_stream * stream);
+int64_t     voxtral_stream_pcm_retained_samples        (const voxtral_stream * stream);
+int64_t     voxtral_stream_pcm_peak_retained_samples   (const voxtral_stream * stream);
+int64_t     voxtral_stream_pcm_base_sample             (const voxtral_stream * stream);
+// True iff the whole PCM was still buffered when finish() ran (always false for
+// inference streams; the incremental frontend only keeps a bounded tail).
+bool        voxtral_stream_full_pcm_buffered_at_finish (const voxtral_stream * stream);
+
+// Assembled even-trimmed Mel matrix [n_mel, n_frames], channel-major, produced by
+// finish() (empty / nullptr before finish or for lifecycle-only streams). Borrowed;
+// valid until reset/destroy. Used by the acceptance harness for Mel SHA / parity.
+const float * voxtral_stream_mel_data       (const voxtral_stream * stream);
+int32_t       voxtral_stream_mel_data_frames(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
 // Events. poll copies and removes the front event, returning false when empty.
