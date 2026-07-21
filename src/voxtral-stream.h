@@ -300,6 +300,32 @@ const float * voxtral_stream_mel_data       (const voxtral_stream * stream);
 int32_t       voxtral_stream_mel_data_frames(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
+// Incremental causal encoder introspection. For inference streams these track the
+// true incremental encoder state (bounded-window recomputation replaying the batch
+// chunk schedule); zero / false for lifecycle-only streams. See
+// docs/architecture/streaming-runtime.md.
+// ----------------------------------------------------------------------------
+bool    voxtral_stream_uses_incremental_encoder        (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_frames                  (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_frames_before_finish    (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_frames_flushed_at_finish(const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_executions              (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_input_frames_processed  (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_frames_recomputed       (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_max_window_frames       (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_peak_context_frames     (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_context_frames_retained (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_state_bytes             (const voxtral_stream * stream);
+int64_t voxtral_stream_encoder_output_accumulated_bytes(const voxtral_stream * stream);
+
+// Accumulated encoder output [enc_dim, frames], channel-major (borrowed; valid
+// until the next feed/finish/reset/destroy). The incremental counterpart of the
+// batch ctx.encoder_output; used by the acceptance harness for encoder tensor
+// parity against voxtral_encode_mel_batch_internal.
+const float * voxtral_stream_encoder_output_data        (const voxtral_stream * stream);
+int32_t       voxtral_stream_encoder_output_frames_count (const voxtral_stream * stream);
+
+// ----------------------------------------------------------------------------
 // Events. poll copies and removes the front event, returning false when empty.
 // Repeated polling after drain is safe. reset() clears the queue. The queue is
 // strictly bounded (see voxtral_stream_test_set_max_events for the default); a

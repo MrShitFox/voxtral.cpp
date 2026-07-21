@@ -1092,6 +1092,11 @@ static int32_t mel_frames_to_enc_tokens(int32_t n_frames) {
     return d1.out_len - trunc;
 }
 
+// Model-free accessor (see voxtral-internal.h): encoder frames from Mel frames.
+int32_t voxtral_enc_frames_for_mel_internal(int32_t mel_frames) {
+    return mel_frames > 0 ? mel_frames_to_enc_tokens(mel_frames) : 0;
+}
+
 // Pre-compute total encoder tokens for a given mel frame count (for buffer allocation)
 static int32_t compute_total_enc_tokens(int32_t total_mel_frames) {
     const int32_t mel_stride = VOXTRAL_ENC_CHUNK_MEL - VOXTRAL_ENC_CHUNK_OVERLAP * 2;
@@ -2130,6 +2135,278 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
 }
 
 // ============================================================================
+// Incremental causal encoder (streaming) — bounded-window recomputation that
+// REPLAYS the exact run_encoder_chunked schedule, driven by stable Mel frames as
+// they arrive during feed(). Reuses run_encoder_chunk() (and hence
+// build_encoder_graph): batch and streaming share one transformer implementation.
+//
+// Strategy (see docs/architecture/streaming-runtime.md, session 6):
+//   * chunk c covers Mel [c*mel_stride, c*mel_stride + CHUNK_MEL); mel_stride =
+//     CHUNK_MEL - 2*OVERLAP = 1500. skip_c = (c==0?0:OVERLAP). enc-frame index ==
+//     global conv1 index (the realtime padding forces left-trunc = 0).
+//   * chunk 0 is emitted PROGRESSIVELY during feed (throttled, always trunc 0 by
+//     running only whole-8 Mel prefixes); chunks c>=1 are emitted only when the
+//     chunk's 3000-frame window is fully covered (a full, trunc-0 chunk identical
+//     to batch); the last incomplete chunk is run once at finish() EXACTLY as
+//     run_encoder_chunked's final iteration (build_encoder_graph's own trunc).
+//   * RoPE is shift-invariant, so absolute positions are free; rope_offset mirrors
+//     batch for clarity. Every emitted frame therefore matches batch bit-for-bit.
+//   * work per chunk is bounded (<= CHUNK_MEL Mel); finish() runs at most the last
+//     one/two chunks, never the whole Mel again.
+// ============================================================================
+
+static constexpr int32_t VOXTRAL_ENC_MEL_STRIDE =
+    VOXTRAL_ENC_CHUNK_MEL - 2 * VOXTRAL_ENC_CHUNK_OVERLAP;   // 1500 Mel frames
+// Chunk-0 progressive re-run granularity: emit newly-stable frames once this many
+// new stable Mel frames have accumulated since the last chunk-0 run. Multiple of 8
+// (one adapter group = 8 Mel), coarse enough to bound the (bounded, one-time)
+// chunk-0 recomputation, fine enough that short single-chunk streams still emit
+// encoder frames before finish().
+static constexpr int32_t VOXTRAL_ENC_STREAM_EMIT_MEL = 256;
+
+struct voxtral_encoder_stream {
+    voxtral_context * ctx = nullptr;
+
+    // Bounded Mel window, frame-major: relative frame r (absolute window_base + r)
+    // occupies [r*n_mel, (r+1)*n_mel). window_base == cur_chunk*mel_stride, so the
+    // retained span never exceeds ~CHUNK_MEL frames (plus one transient feed).
+    std::vector<float> mel_window;
+    int64_t window_base = 0;   // absolute Mel frame index of mel_window[0]
+    int64_t stable_mel  = 0;   // absolute count of stable Mel frames received
+
+    int32_t cur_chunk        = 0;   // chunk currently being filled / emitted
+    int64_t emitted          = 0;   // enc frames emitted so far (== global conv1 index)
+    int64_t last_run_mel_end = 0;   // absolute Mel end of the last chunk-0 progressive run
+    bool    finalized        = false;
+
+    // Accumulated encoder output, host, channel-major [enc_dim, emitted]: frame f
+    // at [f*enc_dim, (f+1)*enc_dim). Uploaded once to ctx.encoder_output at finish.
+    std::vector<float> enc_accum;
+
+    // Scratch: one chunk's Mel transposed to channel-major [n_mel, run_len].
+    std::vector<float> chunk_mel_cm;
+
+    // Instrumentation (Stage 12/13).
+    int64_t mel_frames_received       = 0;
+    int64_t encoder_executions        = 0;
+    int64_t encoder_input_frames      = 0;   // sum of Mel lengths run (recompute-inclusive)
+    int64_t encoder_new_frames        = 0;   // == emitted at finish
+    int32_t encoder_max_window        = 0;   // max chunk Mel length run
+    int64_t encoder_peak_context      = 0;   // peak mel_window size, frames
+    int64_t frames_before_finish      = 0;   // enc frames emitted during feed
+    int64_t frames_at_finish          = 0;   // enc frames emitted by finish()
+};
+
+static void encoder_stream_update_peak(voxtral_encoder_stream * es) {
+    const int64_t frames = (int64_t) (es->mel_window.size() / (size_t) VOXTRAL_MEL_N_MEL);
+    if (frames > es->encoder_peak_context) es->encoder_peak_context = frames;
+}
+
+// Run one chunk over window[Lc .. Lc+run_len) and append the newly-emitted enc
+// frames to enc_accum. `at_finish` routes the emitted count to the right counter.
+static bool encoder_stream_run_chunk(voxtral_encoder_stream * es,
+                                     int32_t run_len, bool at_finish) {
+    voxtral_context * ctx = es->ctx;
+    const int32_t n_mel = VOXTRAL_MEL_N_MEL;
+    const int64_t Lc    = (int64_t) es->cur_chunk * VOXTRAL_ENC_MEL_STRIDE;
+    const int64_t r0    = Lc - es->window_base;   // 0 by construction
+    if (r0 < 0 || (r0 + run_len) * n_mel > (int64_t) es->mel_window.size()) {
+        return false;   // window does not cover the requested range
+    }
+
+    // Transpose frame-major window slice -> channel-major [n_mel, run_len].
+    es->chunk_mel_cm.resize((size_t) n_mel * run_len);
+    for (int32_t m = 0; m < n_mel; ++m) {
+        float * dst = es->chunk_mel_cm.data() + (size_t) m * run_len;
+        for (int32_t i = 0; i < run_len; ++i) {
+            dst[i] = es->mel_window[(size_t) (r0 + i) * n_mel + m];
+        }
+    }
+
+    const int32_t rope_offset = es->cur_chunk * VOXTRAL_ENC_CHUNK_OVERLAP;
+    int32_t seq_len = 0;
+    if (!run_encoder_chunk(ctx, es->chunk_mel_cm.data(), run_len, rope_offset, &seq_len)) {
+        return false;
+    }
+    es->encoder_executions++;
+    es->encoder_input_frames += run_len;
+    if (run_len > es->encoder_max_window) es->encoder_max_window = run_len;
+    es->last_run_mel_end = Lc + run_len;
+
+    // Emit local frames [src_local_start, seq_len): src_local_start is skip for a
+    // fresh chunk c>=1, or the number already emitted for the progressive chunk 0.
+    const int32_t skip = (es->cur_chunk == 0) ? 0 : VOXTRAL_ENC_CHUNK_OVERLAP;
+    int64_t src_local_start = es->emitted - (int64_t) es->cur_chunk * VOXTRAL_ENC_CHUNK_OVERLAP;
+    if (src_local_start < skip) src_local_start = skip;
+    if ((int64_t) seq_len > src_local_start) {
+        const int32_t n_new = (int32_t) ((int64_t) seq_len - src_local_start);
+        const size_t old = es->enc_accum.size();
+        es->enc_accum.resize(old + (size_t) n_new * VOXTRAL_ENC_DIM);
+        ggml_backend_tensor_get(ctx->encoder_chunk_output,
+                                es->enc_accum.data() + old,
+                                (size_t) src_local_start * VOXTRAL_ENC_DIM * sizeof(float),
+                                (size_t) n_new * VOXTRAL_ENC_DIM * sizeof(float));
+        es->emitted = (int64_t) es->cur_chunk * VOXTRAL_ENC_CHUNK_OVERLAP + seq_len;
+        es->encoder_new_frames = es->emitted;
+        if (at_finish) es->frames_at_finish += n_new;
+        else           es->frames_before_finish += n_new;
+    }
+    return true;
+}
+
+// Advance through as many chunks as the currently-stable Mel allows. `final` runs
+// the last, incomplete chunk exactly as run_encoder_chunked's final iteration.
+static bool encoder_stream_drive(voxtral_encoder_stream * es, bool final) {
+    for (;;) {
+        const int64_t Lc = (int64_t) es->cur_chunk * VOXTRAL_ENC_MEL_STRIDE;
+        if (Lc >= es->stable_mel) break;
+        const int64_t avail    = es->stable_mel - Lc;
+        const bool    complete = (avail >= VOXTRAL_ENC_CHUNK_MEL);
+        const int32_t skip     = (es->cur_chunk == 0) ? 0 : VOXTRAL_ENC_CHUNK_OVERLAP;
+
+        int32_t run_len = 0;
+        bool    advance = false;
+        if (complete) {
+            run_len = VOXTRAL_ENC_CHUNK_MEL;   // full, trunc-0 chunk (== batch)
+            advance = true;
+        } else if (final) {
+            run_len = (int32_t) avail;         // last partial chunk, batch-exact
+            advance = false;
+        } else if (es->cur_chunk != 0) {
+            break;                              // c>=1 emits only on completion
+        } else {
+            // chunk 0, incomplete, during feed: progressive whole-8 prefix, throttled.
+            // The re-run interval grows with the prefix (max(EMIT_MEL, prefix/2)) so
+            // the number of progressive runs is logarithmic and the total chunk-0
+            // recomputation stays a bounded multiple of the chunk — while a small
+            // floor still lets short single-chunk streams emit during feed.
+            const int32_t m8 = (int32_t) ((avail / 8) * 8);
+            if (m8 <= 0) break;
+            const int64_t need = std::max<int64_t>(VOXTRAL_ENC_STREAM_EMIT_MEL, es->last_run_mel_end / 2);
+            if ((int64_t) m8 - es->last_run_mel_end < need) break;
+            run_len = m8;
+            advance = false;
+        }
+
+        // Batch pre-check: a chunk that cannot produce more than `skip` enc frames
+        // contributes nothing (mirrors run_encoder_chunked's early break).
+        if (mel_frames_to_enc_tokens(run_len) - skip <= 0) break;
+
+        if (!encoder_stream_run_chunk(es, run_len, final)) return false;
+
+        if (advance) {
+            es->cur_chunk++;
+            const int64_t new_base = (int64_t) es->cur_chunk * VOXTRAL_ENC_MEL_STRIDE;
+            if (new_base > es->window_base) {
+                const size_t drop = (size_t) (new_base - es->window_base) * VOXTRAL_MEL_N_MEL;
+                if (drop >= es->mel_window.size()) es->mel_window.clear();
+                else es->mel_window.erase(es->mel_window.begin(),
+                                          es->mel_window.begin() + (std::ptrdiff_t) drop);
+                es->window_base = new_base;
+            }
+            continue;   // the next chunk may already be complete
+        }
+        break;
+    }
+    return true;
+}
+
+voxtral_encoder_stream * voxtral_encoder_stream_create(voxtral_context * ctx) {
+    if (!ctx) return nullptr;
+    auto * es = new (std::nothrow) voxtral_encoder_stream();
+    if (!es) return nullptr;
+    es->ctx = ctx;
+    return es;
+}
+
+void voxtral_encoder_stream_destroy(voxtral_encoder_stream * es) { delete es; }
+
+void voxtral_encoder_stream_reset(voxtral_encoder_stream * es) {
+    if (!es) return;
+    es->mel_window.clear();
+    es->window_base = 0;
+    es->stable_mel  = 0;
+    es->cur_chunk   = 0;
+    es->emitted     = 0;
+    es->last_run_mel_end = 0;
+    es->finalized   = false;
+    es->enc_accum.clear();
+    es->chunk_mel_cm.clear();
+    es->mel_frames_received  = 0;
+    es->encoder_executions   = 0;
+    es->encoder_input_frames = 0;
+    es->encoder_new_frames   = 0;
+    es->encoder_max_window   = 0;
+    es->encoder_peak_context = 0;
+    es->frames_before_finish = 0;
+    es->frames_at_finish     = 0;
+    // Keep vector capacities for cheap reuse.
+}
+
+// Push newly-stable, frame-major Mel frames [base_frame, base_frame+n) (each
+// n_mel contiguous) and run any chunks that became available. base_frame must
+// equal the running stable_mel (contiguous, in order).
+bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
+                                     const float * frames, int64_t base_frame, int32_t n) {
+    if (!es || es->finalized) return false;
+    if (n <= 0) return true;
+    if (!frames) return false;
+    if (base_frame != es->stable_mel) return false;   // must be contiguous
+    es->mel_window.insert(es->mel_window.end(), frames,
+                          frames + (size_t) n * VOXTRAL_MEL_N_MEL);
+    es->stable_mel += n;
+    es->mel_frames_received += n;
+    encoder_stream_update_peak(es);
+    const bool ok = encoder_stream_drive(es, /*final=*/false);
+    encoder_stream_update_peak(es);
+    return ok;
+}
+
+// Finalize: drive the remaining (last, possibly incomplete) chunk(s) exactly as
+// the batch tail, then the accumulated output is complete.
+bool voxtral_encoder_stream_finish(voxtral_encoder_stream * es) {
+    if (!es) return false;
+    if (es->finalized) return true;
+    const bool ok = encoder_stream_drive(es, /*final=*/true);
+    es->finalized = true;
+    es->encoder_new_frames = es->emitted;
+    // Frames are complete; the retained Mel window is no longer needed.
+    es->mel_window.clear();
+    es->window_base = es->stable_mel;
+    return ok;
+}
+
+const float * voxtral_encoder_stream_output(const voxtral_encoder_stream * es) {
+    return (es && !es->enc_accum.empty()) ? es->enc_accum.data() : nullptr;
+}
+
+int32_t voxtral_encoder_stream_output_frames(const voxtral_encoder_stream * es) {
+    return es ? (int32_t) es->emitted : 0;
+}
+
+voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_stream * es) {
+    voxtral_encoder_metrics m{};
+    if (!es) return m;
+    m.melFramesReceived           = es->mel_frames_received;
+    m.encoderExecutions           = es->encoder_executions;
+    m.encoderInputFramesProcessed = es->encoder_input_frames;
+    m.encoderNewFramesProduced    = es->emitted;
+    m.encoderFramesRecomputed     = es->encoder_input_frames - es->mel_frames_received;
+    m.encoderMaxWindowFrames      = es->encoder_max_window;
+    m.encoderContextFramesRetained= (int64_t) (es->mel_window.size() / (size_t) VOXTRAL_MEL_N_MEL);
+    m.encoderPeakContextFrames    = es->encoder_peak_context;
+    m.encoderFramesBeforeFinish   = es->frames_before_finish;
+    m.encoderFramesFlushedAtFinish= es->frames_at_finish;
+    m.encoderOutputFrames         = es->emitted;
+    m.encoderStateBytes           = (int64_t) (es->mel_window.capacity() * sizeof(float) +
+                                               es->chunk_mel_cm.capacity() * sizeof(float));
+    m.encoderOutputAccumulatedBytes = (int64_t) (es->enc_accum.size() * sizeof(float));
+    m.curChunk                    = es->cur_chunk;
+    m.finalized                   = es->finalized;
+    return m;
+}
+
+// ============================================================================
 // Run Adapter
 // ============================================================================
 
@@ -2433,37 +2710,17 @@ static bool voxtral_transcribe_offline(
 // High-level: Transcribe
 // ============================================================================
 
-// Realtime Mel -> text. Shared by the batch path and the streaming finish():
-// runs encoder / adapter / decoder over a precomputed even-trimmed, channel-major
-// [n_mel, n_frames] Mel matrix. Encoder / adapter / decoder are defined exactly
-// once and never duplicated across the batch and streaming entry points.
-bool voxtral_transcribe_mel_internal(
+// Adapter + decoder + detokenize, over an encoder output already resident in
+// ctx.encoder_output with ctx.enc_seq_used set (a multiple of downsample_factor).
+// This is the second half of the realtime Mel->text path, factored out so both
+// the batch encoder (run_encoder_chunked) and the streaming incremental encoder
+// (which accumulates the identical encoder output during feed) share exactly one
+// adapter/decoder implementation. See voxtral_transcribe_encoder_output_internal.
+static bool run_adapter_and_decode_realtime(
     voxtral_context & ctx,
-    const float     * mel,
-    int32_t           n_frames,
     int32_t           max_tokens,
     voxtral_result  & result)
 {
-    result.text.clear();
-    result.tokens.clear();
-    result.first_step_logits.clear();
-
-    if (ctx.model->hp.is_offline) {
-        LOG_ERR(&ctx, "voxtral_transcribe_mel_internal: realtime-only path");
-        return false;
-    }
-    if (mel == nullptr || n_frames <= 0) {
-        LOG_ERR(&ctx, "voxtral_transcribe_mel_internal: empty mel");
-        return false;
-    }
-
-    // Run encoder (chunked for arbitrarily long audio)
-    auto t_encoder = std::chrono::steady_clock::now();
-    if (!run_encoder_chunked(&ctx, mel, n_frames)) {
-        return false;
-    }
-    LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
-
     // Run adapter
     auto t_adapter = std::chrono::steady_clock::now();
     if (!run_adapter(&ctx)) {
@@ -2553,6 +2810,121 @@ bool voxtral_transcribe_mel_internal(
     // Decode tokens to text (Tekken vocab from GGUF metadata)
     result.text = decode_tokens(*ctx.model, result.tokens);
 
+    return true;
+}
+
+// Realtime Mel -> text. Shared by the batch path and the streaming finish():
+// runs encoder / adapter / decoder over a precomputed even-trimmed, channel-major
+// [n_mel, n_frames] Mel matrix. Encoder / adapter / decoder are defined exactly
+// once and never duplicated across the batch and streaming entry points.
+bool voxtral_transcribe_mel_internal(
+    voxtral_context & ctx,
+    const float     * mel,
+    int32_t           n_frames,
+    int32_t           max_tokens,
+    voxtral_result  & result)
+{
+    result.text.clear();
+    result.tokens.clear();
+    result.first_step_logits.clear();
+
+    if (ctx.model->hp.is_offline) {
+        LOG_ERR(&ctx, "voxtral_transcribe_mel_internal: realtime-only path");
+        return false;
+    }
+    if (mel == nullptr || n_frames <= 0) {
+        LOG_ERR(&ctx, "voxtral_transcribe_mel_internal: empty mel");
+        return false;
+    }
+
+    // Run encoder (chunked for arbitrarily long audio)
+    auto t_encoder = std::chrono::steady_clock::now();
+    if (!run_encoder_chunked(&ctx, mel, n_frames)) {
+        return false;
+    }
+    LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
+
+    return run_adapter_and_decode_realtime(ctx, max_tokens, result);
+}
+
+// Realtime encoder-output -> text. Uploads a host-side, channel-major
+// [enc_dim, enc_frames] encoder output (exactly the tensor run_encoder_chunked
+// leaves in ctx.encoder_output) into the device buffer, trims to a multiple of
+// the downsample factor, and runs the shared adapter/decoder tail. The streaming
+// finish() uses this with the encoder output it accumulated incrementally during
+// feed, so it never re-runs the encoder over the full Mel.
+bool voxtral_transcribe_encoder_output_internal(
+    voxtral_context & ctx,
+    const float     * enc_output,
+    int32_t           enc_frames,
+    int32_t           max_tokens,
+    voxtral_result  & result)
+{
+    result.text.clear();
+    result.tokens.clear();
+    result.first_step_logits.clear();
+
+    if (ctx.model->hp.is_offline) {
+        LOG_ERR(&ctx, "voxtral_transcribe_encoder_output_internal: realtime-only path");
+        return false;
+    }
+    if (enc_output == nullptr || enc_frames <= 0) {
+        LOG_ERR(&ctx, "voxtral_transcribe_encoder_output_internal: empty encoder output");
+        return false;
+    }
+
+    // Trim to a multiple of the downsample factor (adapter groups of 4), matching
+    // run_encoder_chunked's final ctx.enc_seq_used = (n/4)*4.
+    const int32_t used = (enc_frames / ctx.model->hp.downsample_factor) * ctx.model->hp.downsample_factor;
+    if (used <= 0) {
+        LOG_ERR(&ctx, "voxtral_transcribe_encoder_output_internal: fewer than %d encoder frames (%d)",
+                ctx.model->hp.downsample_factor, enc_frames);
+        return false;
+    }
+
+    if (!alloc_encoder_output(&ctx, used)) {
+        LOG_ERR(&ctx, "voxtral_transcribe_encoder_output_internal: failed to allocate encoder output (%d)", used);
+        return false;
+    }
+    ggml_backend_tensor_set(ctx.encoder_output, enc_output, 0,
+                            (size_t) used * VOXTRAL_ENC_DIM * sizeof(float));
+    ctx.enc_seq_used     = used;
+    ctx.total_enc_tokens = used;
+
+    return run_adapter_and_decode_realtime(ctx, max_tokens, result);
+}
+
+// Encoder-only batch pass: runs run_encoder_chunked over an even-trimmed Mel and
+// copies the resulting ctx.encoder_output into a host, channel-major
+// [enc_dim, enc_seq_used] buffer. This is the canonical reference the streaming
+// incremental encoder is compared against (batch-vs-incremental tensor parity).
+bool voxtral_encode_mel_batch_internal(
+    voxtral_context & ctx,
+    const float     * mel,
+    int32_t           n_frames,
+    std::vector<float> & out_enc,
+    int32_t         & out_frames)
+{
+    out_enc.clear();
+    out_frames = 0;
+    if (ctx.model->hp.is_offline) {
+        LOG_ERR(&ctx, "voxtral_encode_mel_batch_internal: realtime-only path");
+        return false;
+    }
+    if (mel == nullptr || n_frames <= 0) {
+        return false;
+    }
+    if (!run_encoder_chunked(&ctx, mel, n_frames)) {
+        return false;
+    }
+    const int32_t frames = ctx.enc_seq_used;
+    if (frames <= 0) {
+        return false;
+    }
+    out_enc.resize((size_t) frames * VOXTRAL_ENC_DIM);
+    ggml_backend_tensor_get(ctx.encoder_output, out_enc.data(), 0,
+                            (size_t) frames * VOXTRAL_ENC_DIM * sizeof(float));
+    out_frames = frames;
     return true;
 }
 

@@ -17,6 +17,7 @@
 #include <deque>
 #include <exception>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -180,6 +181,12 @@ struct voxtral_stream {
     bool     left_pad_injected    = false;  // streaming left zero-pad injected once
     bool     full_pcm_buffered_at_finish = false;
 
+    // Incremental causal encoder (inference streams only; null otherwise). Consumes
+    // stable Mel frames during feed and accumulates the encoder output, so finish()
+    // never re-runs the encoder over the whole Mel.
+    voxtral_encoder_stream * enc = nullptr;
+    int64_t  enc_pushed_frames   = 0;  // stable Mel frames already handed to the encoder
+
     // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
     Sha256   pcm_sha;
 
@@ -322,6 +329,45 @@ voxtral_mel_metrics stream_mel_metrics(const voxtral_stream * s) {
     return (s && s->mel_fe) ? voxtral_mel_frontend_metrics(s->mel_fe) : voxtral_mel_metrics{};
 }
 
+voxtral_encoder_metrics stream_encoder_metrics(const voxtral_stream * s) {
+    return (s && s->enc) ? voxtral_encoder_stream_metrics(s->enc) : voxtral_encoder_metrics{};
+}
+
+// Lazily create the incremental causal encoder once the Mel frontend exists (which
+// implies a real execution context with frontend tables). Model-free ownership
+// tests use a sentinel context with no frontend, so mel_fe stays null and no
+// encoder is created. Returns false only on a genuine allocation failure.
+bool ensure_encoder(voxtral_stream * s) {
+    if (s->enc) return true;
+    if (!s->mel_fe || !s->owns_context || !s->ctx) return true;
+    s->enc = voxtral_encoder_stream_create(s->ctx);
+    if (!s->enc) {
+        set_error(s, voxtral_status::out_of_memory, "failed to create incremental encoder");
+        return false;
+    }
+    return true;
+}
+
+// Hand every newly-stable Mel frame from the frontend to the incremental encoder,
+// which runs any encoder chunks that became available. Called after each feed and
+// once more (with the finish-flushed frames) at finish().
+bool drain_mel_to_encoder(voxtral_stream * s) {
+    if (!s->enc || !s->mel_fe) return true;
+    const int64_t total = voxtral_mel_frontend_frame_count(s->mel_fe);
+    if (total <= s->enc_pushed_frames) return true;
+    const float * data = voxtral_mel_frontend_frames_data(s->mel_fe);
+    if (!data) return true;
+    const int64_t base = s->enc_pushed_frames;
+    const int32_t n    = (int32_t) (total - base);
+    const float * frames = data + (size_t) base * VOXTRAL_MEL_N_MEL;
+    if (!voxtral_encoder_stream_push_mel(s->enc, frames, base, n)) {
+        set_error(s, voxtral_status::backend_error, "incremental encoder rejected Mel frames");
+        return false;
+    }
+    s->enc_pushed_frames = total;
+    return true;
+}
+
 // Common core for both feed variants: guard reentrancy, validate state/args,
 // size guards, then append via the caller-provided converter. `convert(dst)`
 // must append exactly `count` floats to `dst`.
@@ -404,6 +450,16 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
             s->feed_scratch.clear();
             return voxtral_status::backend_error;
         }
+        // Drive the incremental causal encoder over the new stable Mel frames, so
+        // encoder output is produced during feed (not deferred to finish).
+        if (!ensure_encoder(s)) {
+            s->feed_scratch.clear();
+            return s->last_status;
+        }
+        if (!drain_mel_to_encoder(s)) {
+            s->feed_scratch.clear();
+            return voxtral_status::backend_error;
+        }
     } else {
         // Lifecycle-only stream (no context): retain the full canonical PCM as
         // before (used by model-free tests; never runs inference).
@@ -483,6 +539,9 @@ void voxtral_stream_destroy_internal(voxtral_stream * stream) {
     if (!stream) return;   // destroy(nullptr) is safe.
     // Owns only its own context (and mutable state); never frees the model. The
     // caller guarantees no operation is in flight (threading contract).
+    if (stream->enc) {
+        voxtral_encoder_stream_destroy(stream->enc);
+    }
     if (stream->mel_fe) {
         voxtral_mel_frontend_destroy(stream->mel_fe);
     }
@@ -579,11 +638,15 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
         return voxtral_status::backend_error;
     }
 
-    // Incremental frontend path: no full PCM was buffered. Push the streaming
-    // right zero-padding (equivalent to the batch pad_audio_streaming tail),
-    // flush the final Mel frames, then run the shared Mel -> text pipeline over
-    // the accumulated incremental Mel. Chunk boundaries do not affect the Mel (it
-    // is bit-for-bit the batch Mel of the same audio), so tokens are invariant.
+    // Incremental frontend + encoder path: no full PCM was buffered, and the
+    // causal encoder already produced most of its output DURING feed. Push the
+    // streaming right zero-padding (equivalent to the batch pad_audio_streaming
+    // tail), flush the final Mel frames, drain them into the encoder, finalize it
+    // (which runs at most the last one/two encoder chunks — never the whole Mel),
+    // then run the shared adapter/decoder over the accumulated encoder output.
+    // Chunk boundaries do not affect the Mel or the encoder output (both are
+    // bit-for-bit the batch result of the same audio), so tokens are invariant.
+    // The even-trimmed Mel is still assembled for the session-5 introspection.
     voxtral_result result;
     bool ok = false;
     try {
@@ -597,8 +660,27 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
         voxtral_mel_frontend_assemble_even(stream->mel_fe, stream->mel_even, stream->mel_even_frames);
         stream->full_pcm_buffered_at_finish = false;
 
-        ok = voxtral_transcribe_mel_internal(*stream->ctx, stream->mel_even.data(),
-                                             stream->mel_even_frames, stream->params.max_tokens, result);
+        if (!ensure_encoder(stream)) {
+            throw std::runtime_error(stream->last_error);
+        }
+        if (stream->enc) {
+            // Feed the finish-flushed Mel frames, then finalize the encoder.
+            if (!drain_mel_to_encoder(stream)) {
+                throw std::runtime_error(stream->last_error);
+            }
+            if (!voxtral_encoder_stream_finish(stream->enc)) {
+                throw std::runtime_error("incremental encoder finish failed");
+            }
+            const float * enc_out    = voxtral_encoder_stream_output(stream->enc);
+            const int32_t enc_frames = voxtral_encoder_stream_output_frames(stream->enc);
+            ok = voxtral_transcribe_encoder_output_internal(
+                *stream->ctx, enc_out, enc_frames, stream->params.max_tokens, result);
+        } else {
+            // Defensive fallback (should not happen for inference streams): run the
+            // shared Mel -> text path over the accumulated incremental Mel.
+            ok = voxtral_transcribe_mel_internal(*stream->ctx, stream->mel_even.data(),
+                                                 stream->mel_even_frames, stream->params.max_tokens, result);
+        }
         stream->inference_runs++;   // one execution per finish, success or failure
     } catch (const std::exception & e) {
         set_error(stream, voxtral_status::backend_error,
@@ -642,6 +724,10 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     if (stream->mel_fe) {
         voxtral_mel_frontend_reset(stream->mel_fe);   // clears rolling PCM, frames, counters
     }
+    if (stream->enc) {
+        voxtral_encoder_stream_reset(stream->enc);    // clears Mel window, accumulated output, counters
+    }
+    stream->enc_pushed_frames            = 0;
     stream->left_pad_injected            = false;
     stream->full_pcm_buffered_at_finish  = false;
     stream->pcm_sha.reset();
@@ -790,6 +876,50 @@ const float * voxtral_stream_mel_data(const voxtral_stream * s) {
 }
 int32_t voxtral_stream_mel_data_frames(const voxtral_stream * s) {
     return s ? s->mel_even_frames : 0;
+}
+
+// --- Incremental causal encoder introspection ------------------------------
+bool voxtral_stream_uses_incremental_encoder(const voxtral_stream * s) {
+    return s ? (s->enc != nullptr) : false;
+}
+int64_t voxtral_stream_encoder_frames(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderOutputFrames;
+}
+int64_t voxtral_stream_encoder_frames_before_finish(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderFramesBeforeFinish;
+}
+int64_t voxtral_stream_encoder_frames_flushed_at_finish(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderFramesFlushedAtFinish;
+}
+int64_t voxtral_stream_encoder_executions(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderExecutions;
+}
+int64_t voxtral_stream_encoder_input_frames_processed(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderInputFramesProcessed;
+}
+int64_t voxtral_stream_encoder_frames_recomputed(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderFramesRecomputed;
+}
+int64_t voxtral_stream_encoder_max_window_frames(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderMaxWindowFrames;
+}
+int64_t voxtral_stream_encoder_peak_context_frames(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderPeakContextFrames;
+}
+int64_t voxtral_stream_encoder_context_frames_retained(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderContextFramesRetained;
+}
+int64_t voxtral_stream_encoder_state_bytes(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderStateBytes;
+}
+int64_t voxtral_stream_encoder_output_accumulated_bytes(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderOutputAccumulatedBytes;
+}
+const float * voxtral_stream_encoder_output_data(const voxtral_stream * s) {
+    return (s && s->enc) ? voxtral_encoder_stream_output(s->enc) : nullptr;
+}
+int32_t voxtral_stream_encoder_output_frames_count(const voxtral_stream * s) {
+    return (s && s->enc) ? voxtral_encoder_stream_output_frames(s->enc) : 0;
 }
 
 // ============================================================================

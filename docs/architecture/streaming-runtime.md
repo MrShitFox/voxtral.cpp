@@ -934,10 +934,13 @@ PCM-SHA, transcript/tokens/events/error; owned-контекст, params и capac
   DFT count, токены, транскрипт; `melMaxAbsDeltaVsBatch ≤ 1e-5`; кадры до finish > 0;
   retained bounded; inference один раз; Vulkan/RX 6600.
 
-### 21.12 Ограничения
+### 21.12 Ограничения (на конец сессии 5 — обновлено в §22)
+
+> Статус ниже отражает конец сессии 5. Начиная с сессии 6 causal-энкодер стал
+> инкрементальным (encoder output создаётся во время feed); актуальный статус — §22.9.
 
     PCM/STFT/log-Mel is incremental.
-    Encoder, adapter and decoder still run only at finish.
+    Encoder, adapter and decoder still run only at finish.   (сессия 5; см. §22 — энкодер теперь инкрементальный)
     No token or partial transcript is emitted during feed.
     This is not complete real-time transcription yet.
 
@@ -955,6 +958,181 @@ PCM-SHA, transcript/tokens/events/error; owned-контекст, params и capac
 - **Retained encoder context:** conv0/conv1 left-context переносить в encoder-state;
   Mel-хвост frontend'а (<400 сэмплов) к encoder'у отношения не имеет — это чисто
   PCM→Mel граница.
+
+---
+
+## 22. Implementation status after incremental causal encoder (сессия 6)
+
+Причинный audio-энкодер теперь **инкрементальный**: во время `feed()` обрабатываются
+только новые стабильные Mel-кадры и ограниченный необходимый контекст, encoder output
+создаётся до `finish()`, и работа на chunk не растёт с полной длительностью записи.
+Adapter и decoder по-прежнему запускаются только на `finish()` — из **уже накопленного**
+encoder output, а не повторным полным прогоном энкодера. Численно результат **бит-в-бит**
+совпадает с батч-энкодером (`run_encoder_chunked`).
+
+### 22.1 Выбранная стратегия — bounded-window recomputation (вариант B) ✅ SRC
+
+Это **не** encoder KV-cache. Это **пересчёт ограниченного окна**, воспроизводящий точное
+расписание чанков батч-энкодера (`run_encoder_chunked`). Обоснование выбора (§7.3): батч
+уже сам является bounded-window recompute (окно 3000 mel, warmup 750), поэтому переигрывание
+его расписания даёт паритет **по построению**, минимальный риск для GGML-графа и прямой путь
+к последующей миграции на encoder KV. Реализация делит общий transformer-код с батчем
+(`run_encoder_chunk` / `build_encoder_graph`) — математика энкодера не дублируется.
+
+Модуль: `voxtral_encoder_stream` в `src/voxtral.cpp` (интерфейс — `src/voxtral-internal.h`),
+владелец — `voxtral_stream`. Разделение inference: `voxtral_transcribe_mel_internal`
+= `run_encoder_chunked` + `run_adapter_and_decode_realtime`; stream `finish()` =
+накопленный encoder output + `voxtral_transcribe_encoder_output_internal` (тот же
+adapter/decoder). Публичный `include/voxtral.h` не тронут.
+
+### 22.2 Точная семантика свёрток ✅ SRC
+
+| Слой | kernel | stride | padding | эффект | нужный left-контекст |
+| --- | --- | --- | --- | --- | --- |
+| conv0 | 3 | 1 | causal `pad_left=2`, `pad_right=0` | длину сохраняет, GELU-erf | 2 mel-кадра |
+| conv1 | 3 | 2 | causal `pad_left=1`, `pad_right∈{0,1}` | ×2 downsample, GELU-erf | 1 conv0-кадр |
+
+Right-lookahead **нет** (энкодер причинный): стабильный enc-кадр `e` зависит только от mel
+до кадра `2e+1`; будущее mel его не меняет. `pad_right` — только zero-pad хвоста, не будущие
+данные.
+
+**Ключевой инвариант `trunc == 0`:** realtime-паддинг делает число сэмплов кратным 1280 ⇒
+mel кратно 8 ⇒ conv1 = mel/2 кратно 4 ⇒ левый trunc (`conv1_len % downsample`) в
+`build_encoder_graph` **всегда 0**. Значит enc-кадр == глобальный conv1-индекс. Единственное
+место, где trunc может стать 2 — **последний неполный** чанк мультичанкового стрима при
+`(M − Lc) ≡ 4 (mod 8)` (нечётный индекс чанка, т.к. `Lc = c·1500` не кратно 8); он
+выполняется один раз на `finish()` в точности как батч.
+
+### 22.3 Attention window и позиции ✅ SRC
+
+Скользящее причинное окно `kv ∈ [max(0, q−749), q]`, `ENC_WINDOW = 750` enc-кадров
+(= 1500 mel = 15 с). RoPE (theta 1e6, mode 0) **инвариантен к глобальному сдвигу позиций**
+(внимание зависит только от относительной позиции, у V нет RoPE) ⇒ абсолютные позиции
+«бесплатны», важна лишь непрерывность внутри чанка; `rope_offset = cur_chunk·750` повторяет
+батч. Позиции не сбрасываются на chunk boundary; eviction окна не меняет абсолютные индексы.
+
+**Chunk-расписание (= батч):** `CHUNK_MEL=3000`, `mel_stride = 3000 − 2·750 = 1500`.
+Чанк `c` покрывает mel `[c·1500, c·1500+3000)`, `skip_c = (c==0?0:750)`, enc-позиция ==
+глобальный conv1-индекс.
+
+**Stable-output rule:**
+* чанк 0 эмитится **прогрессивно** во время feed (пробеги по кратным-8 префиксам mel,
+  троттлинг `max(EMIT_MEL=256, prefix/2)`, всегда trunc 0) — так короткие однчанковые стримы
+  выдают enc-кадры до finish;
+* чанки `c≥1` эмитятся **только при завершении** (`stable_mel ≥ Lc+3000`, полный trunc-0 чанк,
+  идентичный батчу);
+* последний неполный чанк выполняется один раз на `finish()` в точности как последняя
+  итерация `run_encoder_chunked` (его собственный trunc).
+
+Каждый выпущенный кадр приходит из пробега, идентичного чанку батча; prefix-stability
+(причинность внутри чанка) делает прогрессивные пробеги == полному чанку ⇒ паритет.
+
+### 22.4 Численный паритет (measured) 🧪 EXP
+
+Прямое сравнение **тензоров** `encoder_output`, incremental vs батч (`run_encoder_chunked`),
+по каждому кадру и каналу (`encoderMaxAbsDeltaVsBatch`):
+
+| Плоскость | Результат |
+| --- | --- |
+| C++ model-free (`voxtral_encoder_unit`) | 9200+ проверок: conv-арифметика, `trunc==0` для кратных-8, эквивалентность расписаний incremental==batch (totals `8…48000`, шаги feed `1…10^6`), покрытие без потерь/дублей, границы окна 0/1/749/750/751/1500/2250 |
+| GPU harness (RX 6600, Vulkan), планы full/80/160/320/480/1000/single-sample/seeded/zero-mixed | `encoderMaxAbsDeltaVsBatch = 0`, единый `encoderSha256` во всех планах |
+| GPU work-bound (5 с / 30 с / 2 мин silence) | `encoderMaxAbsDeltaVsBatch = 0` |
+
+`max_abs_delta = 0` (цель `≤1e-6`, hard-gate `≤1e-5`). Bit-exact **по построению** (тот же
+граф, RoPE-offset-инвариантность, prefix-stability). Транскрипт совпадает с батч-CLI и с
+эталоном (`WHAT ARE YOU DOING HERE HE ASKED`).
+
+### 22.5 Work-bound (measured, RX 6600) 🧪 EXP
+
+| Длит. | Mel | enc-кадры | executions | input frames | recomputed | peak ctx | ratio in/mel |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 5 с | 896 | 448 | 3 | 1896 | 1000 | 896 | 2.12× |
+| 30 с | 3392 | 1694 | 7 | 11140 | 7748 | 3055 | 3.28× |
+| 2 мин | 12392 | 6194 | 13 | 29140 | 16748 | 3055 | 2.35× |
+
+Marginal work `(29140−11140)/(12392−3392) = 2.0×` на mel-кадр — **константа**. executions
+растут линейно (3→7→13), ratio ограничен (< 8×) и **не растёт** с длительностью (пик на 30 с
+= один полностью-прогрессивный чанк 0, затем амортизируется вниз). Это ожидаемый линейный
+паттерн, **не** запрещённый квадратичный. `encoderInputFramesProcessed > melFramesReceived`
+(recompute) — bounded-window overhead, отношение ограничено.
+
+### 22.6 Memory-bound 🧪 EXP
+
+* **encoder context bounded:** peak Mel-окно = `CHUNK_MEL` + не более одного feed
+  новых стабильных кадров, что укладывается-затем-компактится (transient-then-compact, как у
+  Mel-фронтенда). Измерено: 3055 кадров и на 30 с, и на 2 мин — **не растёт** с длительностью.
+  На `finish()` окно освобождается (`encoderContextFramesRetained = 0`).
+* `encoderStateBytes ≈ 1.25 MB` (bounded).
+* **растёт линейно (допустимо, задокументировано):** накопленный encoder output
+  (`encoderOutputAccumulatedBytes`, host, `enc_dim·frames·4`) — санкционированное временное
+  ограничение (Этап 13), станет инкрементальным вместе с adapter.
+* **всё ещё удерживается полностью:** лог-Mel во фронтенде (`mel_frames`) — **только** для
+  session-5 mel-интроспекции/регрессии (`assemble_even`, melSha, melDelta). Энкодер держит
+  собственную ограниченную копию окна. Сжатие этого буфера требует переработки session-5
+  интроспекции и вынесено в следующий шаг (см. 22.9). Нет утечки Vulkan-буферов; на feed не
+  создаётся ни context, ни scheduler.
+
+### 22.7 Производительность (measured, RX 6600) 🧪 EXP
+
+Feed latency (data-feeds, sample clip):
+
+| chunk | feeds | mean | p50 | p95 | max | finish |
+| --- | --- | --- | --- | --- | --- | --- |
+| 80 мс | 45 | 4.79 | 0.99 | 1.04 | 94.6 | 1048 |
+| 160 мс | 23 | 9.98 | 1.80 | 82.1 | 101.9 | 1001 |
+| 480 мс | 8 | 29.7 | 5.41 | 106.0 | 110.5 | 1007 |
+
+(мс). Медиана feed ≈ 1 мс (только Mel). Периодический пересчёт encoder-чанка — видимый
+**спайк ~95 мс** (природа варианта B: recompute; спайки не скрываем — Этап 16). Средняя
+обработка feed < длительности чанка; на 80 мс единичный спайк (94.6 мс) слегка превышает
+бюджет одного чанка — это ожидаемо для recompute-стратегии и снимается будущим encoder KV.
+`finish` (~1000 мс) — почти целиком decode (1 токен/кадр, ~94 шага), не энкодер.
+
+### 22.8 Тесты и harness
+
+* **C++ model-free** `tests/cpp/test_encoder_incremental.cpp` (`voxtral_encoder_unit`, CTest):
+  расписание/индексация/work-bound (модель не нужна).
+* **Harness** `voxtral-stream-test`: JSON расширен полями `incrementalEncoder`,
+  `encoderStrategy`, `encoderFrames`, `encoderFramesBeforeFinish/FlushedAtFinish`,
+  `encoderExecutions`, `encoderInputFramesProcessed`, `encoderFramesRecomputed`,
+  `encoderMaxWindowFrames`, `encoderPeakContextFrames`, `encoderContextFramesRetained`,
+  `encoderStateBytes`, `encoderOutputAccumulatedBytes`, `encoderSha256`,
+  `encoderMaxAbsDeltaVsBatch`, `fullMelReencodedAtFinish`, feed-latency
+  (`feedLatency{Mean,P50,P95,Max}Ms`, `finishLatencyMs`). Паритет тензоров считается прямым
+  сравнением с `voxtral_encode_mel_batch_internal` на том же паддинг-Mel.
+* **Node.js GPU** `tests/node/baseline/incremental-encoder.test.js`
+  (`npm run acceptance:incremental-encoder` / `test:incremental-encoder:gpu`): паритет тензора
+  ≤ 1e-5, chunk-invariance (encoderSha256/tokens/text), кадры до finish > 0, bounded context,
+  `finish` не re-encode, work-per-second не растёт (5/30/120 с), Vulkan/RX 6600.
+* **Регрессии зелёные:** `acceptance:baseline`, `acceptance:stream-skeleton`,
+  `acceptance:incremental-mel` — mel-паритет, токены/транскрипт, A/B ownership без изменений.
+
+### 22.9 Ограничения
+
+    PCM/STFT/log-Mel is incremental.
+    The causal audio encoder is incremental.
+    Encoder work is bounded per chunk and does not grow with stream duration.
+    Adapter and decoder still run only at finish.
+    No token or partial transcript is emitted during feed.
+    This is not complete real-time transcription yet.
+
+Дополнительно: encoder-стратегия — **bounded-window recomputation** (не encoder KV);
+периодические encoder-спайки (~95 мс на sample clip; крупнее на завершении полного чанка)
+присущи recompute. Полный лог-Mel всё ещё удерживается фронтендом ради session-5 интроспекции.
+
+### 22.10 Точки интеграции для следующей сессии (incremental adapter / decoder)
+
+* **incremental adapter grouping:** вход — накопленный `voxtral_encoder_stream_output`
+  (host, channel-major `[enc_dim, frames]`), группы по `downsample=4` enc-кадра →
+  `dec_seq` аудио-эмбеддингов; хранить 0..3 «повисших» enc-кадра до следующей группы.
+* **incremental decoder step:** decoder причинный, `position == audio_pos`; по одному токену
+  на аудио-кадр (12.5 Гц). KV-cache decoder уже per-stream; нужен per-audio-position шаг.
+* **TOKEN events:** эмитить `voxtral_stream_event_type::token` по мере готовности decoder-шагов
+  (учесть встроенный лаг модели 6 delay-токенов).
+* **PARTIAL_TEXT events:** детокенизировать растущий префикс токенов; фильтровать trailing pads.
+* Первый шаг оптимизации памяти: bounded l-Mel во фронтенде (переработать session-5
+  mel-интроспекцию на rolling), затем инкрементальный adapter, затем encoder KV-cache вместо
+  recompute (убирает latency-спайки).
 
 ---
 

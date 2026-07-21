@@ -437,6 +437,10 @@ int64_t voxtral_mel_frontend_frame_count(const voxtral_mel_frontend * fe) {
     return fe ? fe->next_frame : 0;
 }
 
+const float * voxtral_mel_frontend_frames_data(const voxtral_mel_frontend * fe) {
+    return (fe && !fe->mel_frames.empty()) ? fe->mel_frames.data() : nullptr;
+}
+
 void voxtral_mel_frontend_assemble_raw(const voxtral_mel_frontend * fe,
                                        std::vector<float> & out, int32_t & out_n_frames) {
     out.clear();

@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -307,7 +308,68 @@ struct StreamRun {
     bool     fullPcmBufferedAtFinish = false;
     std::string melSha;
     double   melMaxAbsDeltaVsBatch   = 0.0;
+
+    // Incremental causal encoder evidence.
+    bool     incrementalEncoder      = false;
+    int64_t  encoderFrames           = 0;
+    int64_t  encoderFramesBeforeFinish   = 0;
+    int64_t  encoderFramesFlushedAtFinish= 0;
+    int64_t  encoderExecutions       = 0;
+    int64_t  encoderInputFramesProcessed = 0;
+    int64_t  encoderFramesRecomputed = 0;
+    int64_t  encoderMaxWindowFrames  = 0;
+    int64_t  encoderPeakContextFrames= 0;
+    int64_t  encoderContextFramesRetained = 0;
+    int64_t  encoderStateBytes       = 0;
+    int64_t  encoderOutputAccumulatedBytes = 0;
+    std::string encoderSha;
+    double   encoderMaxAbsDeltaVsBatch = 0.0;
+    bool     fullMelReencodedAtFinish  = false;
+
+    // Per-feed latency (data feeds only): incremental Mel + encoder work per feed.
+    int64_t  dataFeeds            = 0;
+    double   feedLatencyMeanMs    = 0.0;
+    double   feedLatencyP50Ms     = 0.0;
+    double   feedLatencyP95Ms     = 0.0;
+    double   feedLatencyMaxMs     = 0.0;
+    double   finishLatencyMs      = 0.0;
 };
+
+double percentile(std::vector<double> v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const double idx = p * (double) (v.size() - 1);
+    const size_t lo = (size_t) idx;
+    const size_t hi = std::min(lo + 1, v.size() - 1);
+    const double frac = idx - (double) lo;
+    return v[lo] + (v[hi] - v[lo]) * frac;
+}
+
+// Direct batch-vs-incremental encoder tensor parity: recompute the batch encoder
+// output over the SAME even-trimmed Mel the stream used (voxtral_stream_mel_data)
+// and return the max abs delta against the stream's accumulated incremental
+// encoder output, over the frames the adapter actually consumes (a multiple of
+// the downsample factor). -1 if unavailable.
+double encoder_delta_vs_batch(const voxtral_context * cctx,
+                              const float * mel, int32_t mel_frames,
+                              const float * inc_enc, int32_t inc_frames) {
+    if (!cctx || !mel || mel_frames <= 0 || !inc_enc || inc_frames <= 0) return -1.0;
+    voxtral_context * ctx = const_cast<voxtral_context *>(cctx);
+    std::vector<float> batch_enc;
+    int32_t batch_frames = 0;
+    if (!voxtral_encode_mel_batch_internal(*ctx, mel, mel_frames, batch_enc, batch_frames)) return -1.0;
+    if (batch_frames <= 0) return -1.0;
+    // The adapter consumes a multiple of 4 enc frames; compare that many.
+    const int32_t inc_used = (inc_frames / 4) * 4;
+    if (batch_frames != inc_used) return 1e9;   // frame-count mismatch surfaces loudly
+    double md = 0.0;
+    const int64_t n = (int64_t) batch_frames * VOXTRAL_ENC_DIM;
+    for (int64_t i = 0; i < n; ++i) {
+        const double d = std::fabs((double) batch_enc[(size_t) i] - (double) inc_enc[(size_t) i]);
+        if (d > md) md = d;
+    }
+    return md;
+}
 
 // Reconstruct the batch even-trimmed Mel of the fully padded audio (the exact
 // reference the incremental frontend must reproduce) so the harness can report a
@@ -363,11 +425,15 @@ StreamRun drive_stream(voxtral_stream * stream,
 
     size_t off = 0;
     uint64_t feed_calls = 0;
+    std::vector<double> feed_ms;
     voxtral_status fst = voxtral_status::ok;
     for (size_t c : counts) {
         const int16_t * ptr = (c == 0) ? nullptr : (pcm16.data() + off);
+        const auto tf0 = std::chrono::steady_clock::now();
         fst = voxtral_stream_feed_pcm16_internal(stream, ptr, c);
+        const auto tf1 = std::chrono::steady_clock::now();
         ++feed_calls;
+        if (c > 0) feed_ms.push_back(std::chrono::duration<double, std::milli>(tf1 - tf0).count());
         if (fst != voxtral_status::ok) {
             std::cerr << "feed failed: " << voxtral_stream_status_name(fst)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
@@ -378,11 +444,24 @@ StreamRun drive_stream(voxtral_stream * stream,
 
     voxtral_status finst = voxtral_status::internal_error;
     if (fst == voxtral_status::ok) {
+        const auto tfin0 = std::chrono::steady_clock::now();
         finst = voxtral_stream_finish_internal(stream);
+        const auto tfin1 = std::chrono::steady_clock::now();
+        r.finishLatencyMs = std::chrono::duration<double, std::milli>(tfin1 - tfin0).count();
         if (finst != voxtral_status::ok) {
             std::cerr << "finish failed: " << voxtral_stream_status_name(finst)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
         }
+    }
+
+    r.dataFeeds = (int64_t) feed_ms.size();
+    if (!feed_ms.empty()) {
+        double sum = 0.0;
+        for (double x : feed_ms) sum += x;
+        r.feedLatencyMeanMs = sum / (double) feed_ms.size();
+        r.feedLatencyP50Ms  = percentile(feed_ms, 0.50);
+        r.feedLatencyP95Ms  = percentile(feed_ms, 0.95);
+        r.feedLatencyMaxMs  = percentile(feed_ms, 1.00);
     }
 
     // Chunk-invariant SHA-256 of the full canonical PCM (maintained incrementally
@@ -417,6 +496,38 @@ StreamRun drive_stream(voxtral_stream * stream,
             static_cast<const voxtral_context *>(voxtral_stream_context_ptr(stream));
         const double d = mel_delta_vs_batch(ctx, pcm16, inc_mel, inc_frames);
         r.melMaxAbsDeltaVsBatch = (d < 0.0) ? 0.0 : d;
+    }
+
+    // Incremental causal encoder evidence.
+    r.incrementalEncoder            = voxtral_stream_uses_incremental_encoder(stream);
+    r.encoderFrames                 = voxtral_stream_encoder_frames(stream);
+    r.encoderFramesBeforeFinish     = voxtral_stream_encoder_frames_before_finish(stream);
+    r.encoderFramesFlushedAtFinish  = voxtral_stream_encoder_frames_flushed_at_finish(stream);
+    r.encoderExecutions             = voxtral_stream_encoder_executions(stream);
+    r.encoderInputFramesProcessed   = voxtral_stream_encoder_input_frames_processed(stream);
+    r.encoderFramesRecomputed       = voxtral_stream_encoder_frames_recomputed(stream);
+    r.encoderMaxWindowFrames        = voxtral_stream_encoder_max_window_frames(stream);
+    r.encoderPeakContextFrames      = voxtral_stream_encoder_peak_context_frames(stream);
+    r.encoderContextFramesRetained  = voxtral_stream_encoder_context_frames_retained(stream);
+    r.encoderStateBytes             = voxtral_stream_encoder_state_bytes(stream);
+    r.encoderOutputAccumulatedBytes = voxtral_stream_encoder_output_accumulated_bytes(stream);
+    r.fullMelReencodedAtFinish      = false;   // finish runs at most the last 1-2 encoder chunks
+
+    const float * inc_enc    = voxtral_stream_encoder_output_data(stream);
+    const int32_t inc_enc_frames = voxtral_stream_encoder_output_frames_count(stream);
+    {
+        Sha256 esha;
+        if (inc_enc && inc_enc_frames > 0) {
+            const int32_t used = (inc_enc_frames / 4) * 4;
+            esha.update(inc_enc, (size_t) used * VOXTRAL_ENC_DIM * sizeof(float));
+        }
+        r.encoderSha = esha.hex();
+    }
+    {
+        const voxtral_context * ctx =
+            static_cast<const voxtral_context *>(voxtral_stream_context_ptr(stream));
+        const double d = encoder_delta_vs_batch(ctx, inc_mel, inc_frames, inc_enc, inc_enc_frames);
+        r.encoderMaxAbsDeltaVsBatch = (d < 0.0) ? 0.0 : d;
     }
 
     // Drain events (order preserved).
@@ -458,6 +569,29 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"pcmPeakRetainedSamples\":" << r.pcmPeakRetainedSamples << ",";
     js << "\"pcmBaseSample\":" << r.pcmBaseSample << ",";
     js << "\"fullPcmBufferedAtFinish\":" << (r.fullPcmBufferedAtFinish ? "true" : "false") << ",";
+    // --- Incremental causal encoder ---
+    js << "\"incrementalEncoder\":" << (r.incrementalEncoder ? "true" : "false") << ",";
+    js << "\"encoderStrategy\":\"bounded-window-recompute\",";
+    js << "\"encoderFrames\":" << r.encoderFrames << ",";
+    js << "\"encoderFramesBeforeFinish\":" << r.encoderFramesBeforeFinish << ",";
+    js << "\"encoderFramesFlushedAtFinish\":" << r.encoderFramesFlushedAtFinish << ",";
+    js << "\"encoderExecutions\":" << r.encoderExecutions << ",";
+    js << "\"encoderInputFramesProcessed\":" << r.encoderInputFramesProcessed << ",";
+    js << "\"encoderFramesRecomputed\":" << r.encoderFramesRecomputed << ",";
+    js << "\"encoderMaxWindowFrames\":" << r.encoderMaxWindowFrames << ",";
+    js << "\"encoderPeakContextFrames\":" << r.encoderPeakContextFrames << ",";
+    js << "\"encoderContextFramesRetained\":" << r.encoderContextFramesRetained << ",";
+    js << "\"encoderStateBytes\":" << r.encoderStateBytes << ",";
+    js << "\"encoderOutputAccumulatedBytes\":" << r.encoderOutputAccumulatedBytes << ",";
+    js << "\"encoderSha256\":\"" << r.encoderSha << "\",";
+    js << "\"encoderMaxAbsDeltaVsBatch\":" << r.encoderMaxAbsDeltaVsBatch << ",";
+    js << "\"fullMelReencodedAtFinish\":" << (r.fullMelReencodedAtFinish ? "true" : "false") << ",";
+    js << "\"dataFeeds\":" << r.dataFeeds << ",";
+    js << "\"feedLatencyMeanMs\":" << r.feedLatencyMeanMs << ",";
+    js << "\"feedLatencyP50Ms\":" << r.feedLatencyP50Ms << ",";
+    js << "\"feedLatencyP95Ms\":" << r.feedLatencyP95Ms << ",";
+    js << "\"feedLatencyMaxMs\":" << r.feedLatencyMaxMs << ",";
+    js << "\"finishLatencyMs\":" << r.finishLatencyMs << ",";
     js << "\"contextOwnedByStream\":" << (r.contextOwned ? "true" : "false") << ",";
     js << "\"tokens\":[";
     for (size_t i = 0; i < r.tokens.size(); ++i) { if (i) js << ","; js << r.tokens[i]; }

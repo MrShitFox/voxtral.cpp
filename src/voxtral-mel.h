@@ -153,6 +153,13 @@ voxtral_mel_metrics voxtral_mel_frontend_metrics(const voxtral_mel_frontend * fe
 // Number of mel frames produced so far (== metrics.frames_total).
 int64_t voxtral_mel_frontend_frame_count(const voxtral_mel_frontend * fe);
 
+// Borrowed, frame-major view of the accumulated stable Mel frames: frame f (for
+// 0 <= f < voxtral_mel_frontend_frame_count()) occupies [f*n_mel, (f+1)*n_mel).
+// Used by the incremental encoder to drain newly-stable frames during feed. The
+// pointer is INVALIDATED by the next feed/finish/reset (the buffer may grow), so
+// consume it immediately. Returns nullptr when no frames exist yet.
+const float * voxtral_mel_frontend_frames_data(const voxtral_mel_frontend * fe);
+
 // Assemble the accumulated frames into a channel-major [n_mel, n_frames] matrix.
 //   *_raw   : all produced frames, no even trim (parity reference).
 //   *_even  : batch-equivalent output of compute_mel_even() — drops the first
