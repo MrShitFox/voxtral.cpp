@@ -3,7 +3,14 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "test:baseline": "vitest run baseline"
+    "test:unit": "vitest run unit",
+    "test:gpu": "VOXTRAL_TEST_GPU=1 vitest run baseline",
+    "test:environment": "VOXTRAL_TEST_REMOTE=1 vitest run acceptance/environment.test.js",
+    "test:baseline": "npm run test:gpu",
+    "acceptance:baseline": "node scripts/acceptance-baseline.js",
+    "build:local": "node scripts/build-local.js",
+    "sync:gpu": "node scripts/sync-gpu.js",
+    "build:gpu": "node scripts/build-gpu.js"
   },
   "devDependencies": {
     "vitest": "^3.2.4"

@@ -1,52 +1,38 @@
 import { describe, expect, test } from "vitest";
 
-import { gpuConfig, runRemote, shellQuote } from "../helpers/remote.js";
+import { loadEnvironment } from "../config/environment.js";
+import { buildRemoteVulkan } from "../helpers/build.js";
+import { runBatchInference } from "../helpers/inference.js";
+import { checkRemoteConnection, checkRemoteModel, checkRemoteVulkan } from "../helpers/remote.js";
 
-const binary = `${gpuConfig.repository}/build-vulkan/voxtral`;
-const audio = `${gpuConfig.repository}/samples/8297-275156-0000.wav`;
+const enabled = process.env.VOXTRAL_TEST_GPU === "1";
 
-describe.sequential("RX 6600 Vulkan baseline", () => {
-  test("GPU server is reachable and has the model and Vulkan build", async () => {
-    const command = [
-      "set -e",
-      `test -s ${shellQuote(gpuConfig.model)}`,
-      `test -x ${shellQuote(binary)}`,
-      "vulkaninfo --summary",
-    ].join("; ");
-    const result = await runRemote(command);
+describe.skipIf(!enabled).sequential("RX 6600 Vulkan baseline", () => {
+  const config = loadEnvironment();
 
-    expect(result.timedOut, result.diagnostics).toBe(false);
-    expect(result.status, result.diagnostics).toBe(0);
-    expect(result.stdout, result.diagnostics).toMatch(/AMD Radeon RX 6600|RADV NAVI23/i);
-  });
+  test("GPU server, model, Vulkan device and build are ready", async () => {
+    const connection = await checkRemoteConnection({ config });
+    const model = await checkRemoteModel({ config });
+    const vulkan = await checkRemoteVulkan({ config });
+    const build = await buildRemoteVulkan({ config });
 
-  test("short inference returns a transcript through the Vulkan backend", async () => {
-    const command = [
-      "set -e",
-      `cd ${shellQuote(gpuConfig.repository)}`,
-      [
-        shellQuote(binary),
-        "--model",
-        shellQuote(gpuConfig.model),
-        "--audio",
-        shellQuote(audio),
-        "--gpu vulkan",
-        "--log-level info",
-      ].join(" "),
-    ].join("; ");
-    const result = await runRemote(command);
-    const transcript = result.stdout
-      .split(/\r?\n/u)
-      .map((line) => line.trim())
-      .find((line) => line && !line.startsWith("[tokens]"));
+    expect(connection.stdout).toContain("voxtral-ssh-ok");
+    expect(Number(model.stdout.trim())).toBeGreaterThan(1_000_000_000);
+    expect(vulkan.stdout).toMatch(/AMD Radeon RX 6600|RADV NAVI23/iu);
+    expect(build.verification.stdout).toContain("GGML_VULKAN:BOOL=ON");
+    expect(build.binaryPath).toBe(config.remoteBinary);
+  }, 1_200_000);
 
-    expect(result.timedOut, result.diagnostics).toBe(false);
-    expect(result.status, result.diagnostics).toBe(0);
-    expect(transcript, result.diagnostics).toBeTruthy();
-    expect(transcript, result.diagnostics).not.toBe("[no-transcript]");
-    expect(result.stderr, result.diagnostics).toMatch(
-      /AMD Radeon RX 6600[\s\S]*backend: VULKAN[\s\S]*runtime_backends: Vulkan\(1 dev\)/i,
-    );
-    expect(result.stderr, result.diagnostics).not.toMatch(/no GPU backend available, using CPU/i);
-  });
+  test("short inference returns transcript and positive Vulkan/RX 6600 evidence", async () => {
+    const result = await runBatchInference({ config, testName: "baseline-gpu-smoke", timeoutMs: 240_000 });
+    expect(result.exitCode).toBe(0);
+    expect(result.transcript).toBeTruthy();
+    expect(result.transcript).not.toBe("[no-transcript]");
+    expect(result.backend).toBe("Vulkan");
+    expect(result.device).toBe("AMD Radeon RX 6600");
+    expect(result.evidence.vulkanEnabled).toBe(true);
+    expect(result.evidence.rx6600Detected).toBe(true);
+    expect(result.evidence.cpuOnlyFallbackDetected).toBe(false);
+    expect(result.artifact.directory).toContain(config.artifactDir);
+  }, 300_000);
 });

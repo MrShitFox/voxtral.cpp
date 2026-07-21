@@ -65,6 +65,7 @@ coverage.xml
 .hypothesis/
 .ipynb_checkpoints/
 node_modules/
+tests/node/.artifacts/
 
 # Models and Large Data
 models/*
