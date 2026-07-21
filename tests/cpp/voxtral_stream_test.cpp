@@ -1,0 +1,424 @@
+// ============================================================================
+// voxtral-stream-test — model-driven harness for the streaming skeleton.
+//
+// This is NOT a production CLI or server. It exists only to drive the internal
+// voxtral_stream compatibility path from a chunked PCM feed and emit a single
+// machine-readable JSON object on stdout (backend logs go to stderr), so the
+// Node.js acceptance suite can assert chunk invariance and batch parity.
+//
+// Usage:
+//   voxtral-stream-test --model M.gguf --wav in.wav [--gpu auto|vulkan|none]
+//                       [--plan-file plan.txt] [--mode MODE] [--max-tokens N]
+//
+//   --plan-file : text file, one integer per line = a feed's sample count
+//                 (0 = an explicit zero-length feed). Must sum to the WAV's
+//                 sample count. Takes precedence over --mode.
+//   --mode      : full | 80ms | 160ms | 320ms | 480ms | 1000ms |
+//                 single-sample | seeded-random:SEED   (default: full)
+// ============================================================================
+
+#include "voxtral-stream.h"
+#include "voxtral.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// ----------------------------------------------------------------------------
+// Minimal SHA-256 (public-domain style) over raw bytes.
+// ----------------------------------------------------------------------------
+namespace {
+
+struct Sha256 {
+    uint32_t h[8];
+    uint64_t len = 0;
+    uint8_t  buf[64];
+    size_t   buf_len = 0;
+
+    Sha256() {
+        static const uint32_t init[8] = {
+            0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+            0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+        std::memcpy(h, init, sizeof(init));
+    }
+
+    static uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+
+    void block(const uint8_t * p) {
+        static const uint32_t k[64] = {
+            0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+            0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+            0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+            0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+            0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+            0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+            0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+            0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u};
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (uint32_t(p[i * 4]) << 24) | (uint32_t(p[i * 4 + 1]) << 16) |
+                   (uint32_t(p[i * 4 + 2]) << 8) | uint32_t(p[i * 4 + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + k[i] + w[i];
+            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+
+    void update(const void * data, size_t n) {
+        const uint8_t * p = static_cast<const uint8_t *>(data);
+        len += n;
+        while (n > 0) {
+            size_t take = 64 - buf_len;
+            if (take > n) take = n;
+            std::memcpy(buf + buf_len, p, take);
+            buf_len += take; p += take; n -= take;
+            if (buf_len == 64) { block(buf); buf_len = 0; }
+        }
+    }
+
+    std::string hex() {
+        uint64_t bits = len * 8;
+        uint8_t pad = 0x80;
+        update(&pad, 1);
+        uint8_t zero = 0;
+        while (buf_len != 56) update(&zero, 1);
+        uint8_t lenbe[8];
+        for (int i = 0; i < 8; ++i) lenbe[i] = uint8_t(bits >> (56 - i * 8));
+        // update() bumps len, but the final block is emitted correctly regardless.
+        update(lenbe, 8);
+        static const char * hexd = "0123456789abcdef";
+        std::string out;
+        out.reserve(64);
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 3; j >= 0; --j) {
+                uint8_t byte = uint8_t(h[i] >> (j * 8));
+                out.push_back(hexd[byte >> 4]);
+                out.push_back(hexd[byte & 0xf]);
+            }
+        }
+        return out;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Tiny WAV reader: mono 16 kHz PCM16 only (the streaming contract).
+// ----------------------------------------------------------------------------
+bool read_wav_pcm16_mono16k(const std::string & path, std::vector<int16_t> & out, std::string & err) {
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) { err = "cannot open wav: " + path; return false; }
+
+    char riff[4]; fin.read(riff, 4);
+    if (std::memcmp(riff, "RIFF", 4) != 0) { err = "not RIFF"; return false; }
+    fin.seekg(4, std::ios::cur);
+    char wave[4]; fin.read(wave, 4);
+    if (std::memcmp(wave, "WAVE", 4) != 0) { err = "not WAVE"; return false; }
+
+    uint16_t fmt = 0, ch = 0, bits = 0;
+    uint32_t rate = 0, data_size = 0;
+    bool have_fmt = false, have_data = false;
+    while (fin.good() && !(have_fmt && have_data)) {
+        char id[4]; fin.read(id, 4);
+        uint32_t sz = 0; fin.read(reinterpret_cast<char *>(&sz), 4);
+        if (!fin.good()) break;
+        if (std::memcmp(id, "fmt ", 4) == 0) {
+            fin.read(reinterpret_cast<char *>(&fmt), 2);
+            fin.read(reinterpret_cast<char *>(&ch), 2);
+            fin.read(reinterpret_cast<char *>(&rate), 4);
+            fin.seekg(6, std::ios::cur);   // byte_rate(4) + block_align(2)
+            fin.read(reinterpret_cast<char *>(&bits), 2);
+            if (sz > 16) fin.seekg(sz - 16, std::ios::cur);
+            have_fmt = true;
+        } else if (std::memcmp(id, "data", 4) == 0) {
+            data_size = sz;
+            have_data = true;
+        } else {
+            fin.seekg(sz, std::ios::cur);
+        }
+    }
+    if (!have_fmt || !have_data) { err = "missing fmt/data chunk"; return false; }
+    if (fmt != 1 || bits != 16 || ch != 1 || rate != 16000) {
+        std::ostringstream os;
+        os << "unsupported wav (need mono 16kHz PCM16): fmt=" << fmt << " ch=" << ch
+           << " rate=" << rate << " bits=" << bits;
+        err = os.str();
+        return false;
+    }
+    const size_t n = data_size / 2;
+    out.resize(n);
+    fin.read(reinterpret_cast<char *>(out.data()), std::streamsize(n * 2));
+    if (size_t(fin.gcount()) != n * 2) { err = "short read on data chunk"; return false; }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Chunk plan generation for the built-in --mode (createChunkPlan-style).
+// ----------------------------------------------------------------------------
+uint32_t seeded_next(uint32_t & state) {
+    // Mirrors tests/node/helpers/chunks.js seededGenerator for reproducibility.
+    state += 0x6d2b79f5u;
+    uint32_t v = state;
+    v = (v ^ (v >> 15)) * (v | 1u);
+    v ^= v + (v ^ (v >> 7)) * (v | 61u);
+    return v ^ (v >> 14);
+}
+
+std::vector<size_t> plan_from_mode(const std::string & mode, size_t total) {
+    std::vector<size_t> counts;
+    auto fixed = [&](size_t k) {
+        for (size_t off = 0; off < total; off += k) counts.push_back(std::min(k, total - off));
+    };
+    if (mode == "full" || mode.empty()) {
+        if (total > 0) counts.push_back(total);
+    } else if (mode == "80ms")   fixed(1280);
+    else if (mode == "160ms")    fixed(2560);
+    else if (mode == "320ms")    fixed(5120);
+    else if (mode == "480ms")    fixed(7680);
+    else if (mode == "1000ms")   fixed(16000);
+    else if (mode == "single-sample") { for (size_t i = 0; i < total; ++i) counts.push_back(1); }
+    else if (mode.rfind("seeded-random:", 0) == 0) {
+        uint32_t seed = uint32_t(std::strtoul(mode.c_str() + 14, nullptr, 10));
+        uint32_t state = seed;
+        const size_t lo = 1, hi = 16000;
+        size_t off = 0;
+        while (off < total) {
+            size_t want = lo + size_t(double(seeded_next(state)) / 4294967296.0 * double(hi - lo + 1));
+            size_t take = std::min(want, total - off);
+            counts.push_back(take);
+            off += take;
+        }
+    } else {
+        // Unknown mode -> full.
+        if (total > 0) counts.push_back(total);
+    }
+    return counts;
+}
+
+bool plan_from_file(const std::string & path, std::vector<size_t> & counts, std::string & err) {
+    std::ifstream fin(path);
+    if (!fin) { err = "cannot open plan file: " + path; return false; }
+    std::string line;
+    while (std::getline(fin, line)) {
+        // Trim.
+        size_t a = line.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) continue;
+        size_t b = line.find_last_not_of(" \t\r\n");
+        std::string tok = line.substr(a, b - a + 1);
+        char * end = nullptr;
+        long v = std::strtol(tok.c_str(), &end, 10);
+        if (!end || *end != '\0' || v < 0) { err = "invalid plan entry: " + tok; return false; }
+        counts.push_back(size_t(v));
+    }
+    return true;
+}
+
+std::string json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += char(c);   // pass raw UTF-8 through
+                }
+        }
+    }
+    return out;
+}
+
+void log_stderr(voxtral_log_level lvl, const std::string & msg) {
+    const char * tag = "I";
+    if (lvl == voxtral_log_level::error) tag = "E";
+    else if (lvl == voxtral_log_level::warn) tag = "W";
+    else if (lvl == voxtral_log_level::debug) tag = "D";
+    std::cerr << "voxtral_" << tag << ": " << msg << "\n";
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    std::string model_path, wav_path, plan_file, mode = "full";
+    voxtral_gpu_backend gpu = voxtral_gpu_backend::auto_detect;
+    int32_t max_tokens = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto val = [&](const char * name) -> const char * {
+            if (i + 1 >= argc) { std::cerr << "missing value for " << name << "\n"; return nullptr; }
+            return argv[++i];
+        };
+        if (a == "--model")            { const char * v = val("--model"); if (!v) return 2; model_path = v; }
+        else if (a == "--wav")         { const char * v = val("--wav"); if (!v) return 2; wav_path = v; }
+        else if (a == "--plan-file")   { const char * v = val("--plan-file"); if (!v) return 2; plan_file = v; }
+        else if (a == "--mode")        { const char * v = val("--mode"); if (!v) return 2; mode = v; }
+        else if (a == "--max-tokens")  { const char * v = val("--max-tokens"); if (!v) return 2; max_tokens = int32_t(std::strtol(v, nullptr, 10)); }
+        else if (a == "--gpu") {
+            const char * v = val("--gpu"); if (!v) return 2;
+            std::string g = v;
+            if (g == "none") gpu = voxtral_gpu_backend::none;
+            else if (g == "auto") gpu = voxtral_gpu_backend::auto_detect;
+            else if (g == "cuda") gpu = voxtral_gpu_backend::cuda;
+            else if (g == "metal") gpu = voxtral_gpu_backend::metal;
+            else if (g == "vulkan") gpu = voxtral_gpu_backend::vulkan;
+            else { std::cerr << "invalid --gpu\n"; return 2; }
+        } else { std::cerr << "unknown option: " << a << "\n"; return 2; }
+    }
+
+    if (model_path.empty() || wav_path.empty()) {
+        std::cerr << "usage: voxtral-stream-test --model M.gguf --wav in.wav "
+                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n]\n";
+        return 2;
+    }
+
+    // Read audio.
+    std::vector<int16_t> pcm16;
+    std::string err;
+    if (!read_wav_pcm16_mono16k(wav_path, pcm16, err)) {
+        std::cerr << "wav error: " << err << "\n";
+        return 3;
+    }
+    const size_t total = pcm16.size();
+
+    // Build the feed plan.
+    std::vector<size_t> counts;
+    if (!plan_file.empty()) {
+        if (!plan_from_file(plan_file, counts, err)) { std::cerr << err << "\n"; return 4; }
+        size_t sum = 0; for (size_t c : counts) sum += c;
+        if (sum != total) {
+            std::cerr << "plan sample sum " << sum << " != wav samples " << total << "\n";
+            return 4;
+        }
+    } else {
+        counts = plan_from_mode(mode, total);
+    }
+
+    // Load model + context (weights shared; context is the per-stream engine).
+    voxtral_log_callback logger = log_stderr;
+    voxtral_model * model = voxtral_model_load_from_file(model_path, logger, gpu);
+    if (!model) { std::cerr << "failed to load model\n"; return 5; }
+
+    voxtral_context_params cp;
+    cp.log_level = voxtral_log_level::info;
+    cp.logger    = logger;
+    cp.gpu       = gpu;
+    voxtral_context * ctx = voxtral_init_from_model(model, cp);
+    if (!ctx) { std::cerr << "failed to init context\n"; voxtral_model_free(model); return 6; }
+
+    // Drive the stream.
+    voxtral_stream_params sp;
+    sp.max_tokens = max_tokens;
+    voxtral_stream * stream = voxtral_stream_create_internal(ctx, sp);
+    if (!stream) { std::cerr << "failed to create stream\n"; voxtral_free(ctx); voxtral_model_free(model); return 7; }
+
+    size_t off = 0;
+    uint64_t feed_calls = 0;
+    voxtral_status fst = voxtral_status::ok;
+    for (size_t c : counts) {
+        const int16_t * ptr = (c == 0) ? nullptr : (pcm16.data() + off);
+        fst = voxtral_stream_feed_pcm16_internal(stream, ptr, c);
+        ++feed_calls;
+        if (fst != voxtral_status::ok) {
+            std::cerr << "feed failed: " << voxtral_stream_status_name(fst)
+                      << " (" << voxtral_stream_last_error(stream) << ")\n";
+            break;
+        }
+        off += c;
+    }
+
+    voxtral_status finst = voxtral_status::internal_error;
+    if (fst == voxtral_status::ok) {
+        finst = voxtral_stream_finish_internal(stream);
+        if (finst != voxtral_status::ok) {
+            std::cerr << "finish failed: " << voxtral_stream_status_name(finst)
+                      << " (" << voxtral_stream_last_error(stream) << ")\n";
+        }
+    }
+
+    // Hash the canonical float32 PCM.
+    Sha256 sha;
+    if (voxtral_stream_pcm_size(stream) > 0) {
+        sha.update(voxtral_stream_pcm_data(stream),
+                   voxtral_stream_pcm_size(stream) * sizeof(float));
+    }
+    const std::string pcm_sha = sha.hex();
+
+    // Drain events (order preserved).
+    std::vector<voxtral_stream_event> evs;
+    voxtral_stream_event ev;
+    while (voxtral_stream_poll_event(stream, ev)) evs.push_back(ev);
+
+    // Emit JSON to stdout.
+    std::ostringstream js;
+    js << "{";
+    js << "\"state\":\"" << voxtral_stream_state_name(voxtral_stream_get_state(stream)) << "\",";
+    js << "\"finishStatus\":\"" << voxtral_stream_status_name(finst) << "\",";
+    js << "\"sampleRate\":" << sp.sample_rate << ",";
+    js << "\"channels\":" << sp.channels << ",";
+    js << "\"wavSamples\":" << total << ",";
+    js << "\"samplesReceived\":" << voxtral_stream_samples_received(stream) << ",";
+    js << "\"samplesConsumed\":" << voxtral_stream_samples_consumed(stream) << ",";
+    js << "\"feedCalls\":" << feed_calls << ",";
+    js << "\"inferenceRuns\":" << voxtral_stream_inference_runs(stream) << ",";
+    js << "\"pcmFloats\":" << voxtral_stream_pcm_size(stream) << ",";
+    js << "\"pcmSha256\":\"" << pcm_sha << "\",";
+
+    js << "\"tokens\":[";
+    {
+        const std::vector<int32_t> & toks = voxtral_stream_tokens(stream);
+        for (size_t i = 0; i < toks.size(); ++i) { if (i) js << ","; js << toks[i]; }
+    }
+    js << "],";
+
+    js << "\"text\":\"" << json_escape(voxtral_stream_transcript(stream)) << "\",";
+
+    js << "\"events\":[";
+    for (size_t i = 0; i < evs.size(); ++i) {
+        if (i) js << ",";
+        js << "{\"type\":\"" << voxtral_stream_event_name(evs[i].type) << "\"";
+        if (evs[i].type == voxtral_stream_event_type::error) {
+            js << ",\"code\":" << evs[i].error_code;
+        }
+        js << "}";
+    }
+    js << "]";
+    js << "}";
+
+    std::cout << js.str() << "\n";
+
+    voxtral_stream_destroy_internal(stream);
+    voxtral_free(ctx);
+    voxtral_model_free(model);
+
+    return (finst == voxtral_status::ok) ? 0 : 1;
+}

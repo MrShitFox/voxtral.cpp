@@ -10,6 +10,13 @@ export function parseInferenceOutput(result) {
     .split(/\r?\n/u)
     .map((line) => line.trim())
     .find((line) => line && !line.startsWith("[tokens]") && line !== "[no-transcript]") ?? "";
+  const tokenLine = result.stdout
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("[tokens]"));
+  const tokens = tokenLine
+    ? tokenLine.slice("[tokens]".length).trim().split(/\s+/u).filter(Boolean).map(Number)
+    : [];
   const timingMatches = [...result.stderr.matchAll(/(?:^|\n)(?:voxtral_[A-Z]: )?([^\n:]+):[^\n]*?([0-9]+(?:\.[0-9]+)?) ms/gmu)];
   const timings = Object.fromEntries(timingMatches.map((match) => [match[1].trim(), Number(match[2])]));
   const vulkanEnabled = /backend:\s*VULKAN|GGML_USE_VULKAN=ON|runtime_backends:\s*[^\n]*Vulkan\([1-9]/iu.test(combined);
@@ -18,6 +25,7 @@ export function parseInferenceOutput(result) {
   return {
     exitCode: result.exitCode,
     transcript,
+    tokens,
     backend: vulkanEnabled ? "Vulkan" : cpuOnlyFallbackDetected ? "CPU" : "unknown",
     device: rx6600Detected ? "AMD Radeon RX 6600" : "unknown",
     wallMs: result.wallMs,

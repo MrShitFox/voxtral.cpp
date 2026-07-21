@@ -16,6 +16,7 @@ describe("batch inference output parser", () => {
       ].join("\n"),
     });
     expect(parsed.transcript).toBe("What are you doing here? He asked.");
+    expect(parsed.tokens).toEqual([1, 2]);
     expect(parsed.backend).toBe("Vulkan");
     expect(parsed.evidence).toEqual({ vulkanEnabled: true, rx6600Detected: true, cpuOnlyFallbackDetected: false });
   });

@@ -13,6 +13,10 @@ option(VOXTRAL_NATIVE_OPT "Enable native CPU tuning flags" ON)
 # via FetchContent (no vendored submodule). Backends are discovered at runtime via
 # the ggml registry, so no backend flags are needed here.
 option(VOXTRAL_USE_SYSTEM_GGML "Link a system ggml instead of building it from source" OFF)
+# Internal C++ tests + the streaming skeleton harness. ON by default so the
+# existing local/remote build+ctest workflow picks them up without extra flags.
+# Neither target is installed (see install() below).
+option(VOXTRAL_BUILD_TESTS "Build internal C++ test targets" ON)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -42,7 +46,8 @@ else()
 endif()
 
 add_library(voxtral_lib
-    src/voxtral.cpp)
+    src/voxtral.cpp
+    src/voxtral-stream.cpp)
 
 # On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
 # import library (voxtral_lib.lib) is generated for dependents like `voxtral`.
@@ -135,6 +140,22 @@ if(Python3_Interpreter_FOUND)
     add_test(
         NAME voxtral_python_reference
         COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_voxtral_reference.py)
+endif()
+
+# ----------------------------------------------------------------------------
+# Internal streaming-skeleton test targets. The internal header lives in src/.
+# ----------------------------------------------------------------------------
+if(VOXTRAL_BUILD_TESTS)
+    # Model-free unit tests for the stream lifecycle / state machine / PCM path.
+    add_executable(voxtral_stream_unit tests/cpp/test_stream_state.cpp)
+    target_link_libraries(voxtral_stream_unit PRIVATE voxtral_lib)
+    target_include_directories(voxtral_stream_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME voxtral_stream_unit COMMAND voxtral_stream_unit)
+
+    # Model-driven harness used by the Node.js acceptance suite. Not a CLI/server.
+    add_executable(voxtral-stream-test tests/cpp/voxtral_stream_test.cpp)
+    target_link_libraries(voxtral-stream-test PRIVATE voxtral_lib)
+    target_include_directories(voxtral-stream-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 
 #add_subdirectory(examples/stream)

@@ -4,10 +4,12 @@
   "scripts": {
     "test": "vitest run",
     "test:unit": "vitest run unit",
-    "test:gpu": "VOXTRAL_TEST_GPU=1 vitest run baseline",
+    "test:gpu": "VOXTRAL_TEST_GPU=1 vitest run baseline/gpu-smoke.test.js",
+    "test:stream-skeleton:gpu": "VOXTRAL_TEST_GPU=1 VOXTRAL_TEST_STREAM=1 vitest run baseline/stream-skeleton.test.js",
     "test:environment": "VOXTRAL_TEST_REMOTE=1 vitest run acceptance/environment.test.js",
     "test:baseline": "npm run test:gpu",
     "acceptance:baseline": "node scripts/acceptance-baseline.js",
+    "acceptance:stream-skeleton": "node scripts/acceptance-stream-skeleton.js",
     "build:local": "node scripts/build-local.js",
     "sync:gpu": "node scripts/sync-gpu.js",
     "build:gpu": "node scripts/build-gpu.js"
