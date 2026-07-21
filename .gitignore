@@ -42,6 +42,7 @@ _deps/
 
 # Build directories
 [Bb]uild/
+build*/
 [Oo]ut/
 [Bb]in/
 
@@ -63,6 +64,7 @@ coverage.xml
 *.log
 .hypothesis/
 .ipynb_checkpoints/
+node_modules/
 
 # Models and Large Data
 models/*
@@ -95,3 +97,5 @@ vllm/
 # Temporary files
 .tmp/
 tmp/
+core
+core.*

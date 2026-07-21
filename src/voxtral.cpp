@@ -1220,17 +1220,12 @@ void voxtral_free(voxtral_context * ctx) {
 // ============================================================================
 
 static void clear_kv_cache(voxtral_context * ctx) {
-    if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) {
+    if (!ctx || !ctx->buf_persistent || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-    void * k_data = ggml_get_data(ctx->kv_self_k);
-    void * v_data = ggml_get_data(ctx->kv_self_v);
-    if (k_data) {
-        memset(k_data, 0, ggml_nbytes(ctx->kv_self_k));
-    }
-    if (v_data) {
-        memset(v_data, 0, ggml_nbytes(ctx->kv_self_v));
-    }
+    // Persistent tensors may live in device memory. Clearing their backend
+    // buffer is valid for both CPU and GPU allocations; host memset is not.
+    ggml_backend_buffer_clear(ctx->buf_persistent, 0);
     ctx->kv_used = 0;
 }
 
