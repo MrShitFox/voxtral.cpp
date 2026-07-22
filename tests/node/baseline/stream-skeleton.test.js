@@ -51,7 +51,9 @@ describe.skipIf(!enabled).sequential("RX 6600 streaming skeleton acceptance", ()
       const plan = createChunkPlan(prepared.pcm, spec.options);
       const counts = planCounts(plan);
       expect(counts.reduce((a, b) => a + b, 0)).toBe(totalSamples);
-      const result = await runStreamSession({ config, planName: spec.name, counts });
+      // Session 7.1: the batch-baseline skeleton asserts the finish-only event
+      // stream ([final_text, completed]); run the reference decoder explicitly.
+      const result = await runStreamSession({ config, planName: spec.name, counts, env: { VOXTRAL_STREAM_DECODER: "reference" } });
       runs.push({ spec: spec.name, dataFeeds: counts.filter((c) => c > 0).length, result });
     }
 
@@ -145,7 +147,7 @@ describe.skipIf(!enabled).sequential("RX 6600 streaming skeleton acceptance", ()
 
     // Single harness process: load model once, create stream A then stream B,
     // each with its own execution context, run the same plan through both.
-    const result = await runStreamSession({ config, planName: "ab", counts, ab: true });
+    const result = await runStreamSession({ config, planName: "ab", counts, ab: true, env: { VOXTRAL_STREAM_DECODER: "reference" } });
 
     // --- Ownership contract ---
     expect(result.mode).toBe("ab");

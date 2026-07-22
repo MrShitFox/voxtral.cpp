@@ -17,7 +17,8 @@ console.log(`fixture: ${fixture.durationMs.toFixed(0)}ms, ${fixture.sampleCount}
 async function run(label, incremental, opts) {
   return runStreamSession({
     config, planName: `${label}`, audioPath: fixture.wavPath, maxTokens: 0, skipParity: true,
-    env: incremental ? { ...base, VOXTRAL_STREAM_DECODER: "incremental" } : base,
+    // Session 7.1: incremental is the default; the oracle must ask for reference.
+    env: { ...base, VOXTRAL_STREAM_DECODER: incremental ? "incremental" : "reference" },
     timeoutMs: 420_000, ...opts,
   });
 }

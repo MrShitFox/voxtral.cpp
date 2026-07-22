@@ -479,20 +479,25 @@ void test_finishing_reentrancy_guard() {
 // --- event queue is a true hard bound --------------------------------------
 void test_event_queue_hard_bound() {
     voxtral_stream * s = make_stream();
-    voxtral_stream_test_set_max_events(s, 1);   // shrink the bound for the test
+    voxtral_stream_test_set_max_events(s, 1);   // tiny bound
 
-    // Empty finish tries to emit final_text (fits) then completed (overflows).
+    // Session 7.1: mandatory terminal events (FINAL_TEXT + COMPLETED) are NEVER
+    // dropped. finish() delivers them through the bounded terminal flush, which is
+    // permitted to exceed the streaming bound by the small finish tail. So an empty
+    // finish with a bound of 1 still delivers BOTH events, records NO overflow, and
+    // drops nothing (events_dropped is a hard gate == 0). This supersedes the old
+    // behaviour where COMPLETED could be dropped when the queue was full.
     CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
     CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::completed);
-    // The queue never exceeds the bound.
-    CHECK(voxtral_stream_pending_events(s) == 1);
-    // Overflow is recorded loudly rather than silently growing/dropping.
-    CHECK(voxtral_stream_test_events_overflowed(s));
+    CHECK(voxtral_stream_pending_events(s) == 2);          // final_text + completed
+    CHECK(!voxtral_stream_test_events_overflowed(s));      // no mandatory drop
+    CHECK(voxtral_stream_events_dropped(s) == 0);          // hard gate
 
-    // The retained event is the first-queued final_text; completed was dropped.
     voxtral_stream_event ev;
     CHECK(voxtral_stream_poll_event(s, ev));
     CHECK(ev.type == voxtral_stream_event_type::final_text);
+    CHECK(voxtral_stream_poll_event(s, ev));
+    CHECK(ev.type == voxtral_stream_event_type::completed);
     CHECK(!voxtral_stream_poll_event(s, ev));
 
     // reset() clears the overflow flag for reuse.

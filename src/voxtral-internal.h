@@ -109,7 +109,8 @@ struct voxtral_encoder_metrics {
     int64_t encoderFramesFlushedAtFinish = 0;  // enc frames emitted by finish()
     int64_t encoderOutputFrames          = 0;  // total enc frames accumulated
     int64_t encoderStateBytes            = 0;  // bounded per-stream host state (Mel tail + scratch)
-    int64_t encoderOutputAccumulatedBytes= 0;  // linear accumulated encoder output
+    int64_t encoderOutputAccumulatedBytes= 0;  // linear accumulated encoder output (host)
+    int64_t encoderOutputD2hBytes        = 0;  // actual encoder-output device->host bytes (0 in incremental)
     int32_t curChunk                     = 0;
     bool    finalized                    = false;
 
@@ -282,6 +283,10 @@ bool voxtral_encoder_stream_finish(voxtral_encoder_stream * es);
 const float * voxtral_encoder_stream_output       (const voxtral_encoder_stream * es);
 int32_t       voxtral_encoder_stream_output_frames(const voxtral_encoder_stream * es);
 voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_stream * es);
+// True iff this encoder uses the per-layer KV path (which mirrors output into the
+// device ring). The incremental adapter/decoder requires it; the reference
+// (bounded-window recompute) encoder does not feed the ring.
+bool voxtral_encoder_stream_uses_kv(const voxtral_encoder_stream * es);
 
 // Borrowed views of the context's CPU-side frontend tables (stable for the
 // context's lifetime). Used by the streaming Mel frontend and test harnesses so

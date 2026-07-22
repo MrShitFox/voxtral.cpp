@@ -55,7 +55,10 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental Mel acceptance", () =>
       const plan = createChunkPlan(prepared.pcm, spec.options);
       const counts = planCounts(plan);
       expect(counts.reduce((a, b) => a + b, 0)).toBe(totalSamples);
-      const result = await runStreamSession({ config, planName: spec.name, counts });
+      // Session 7.1: this Session-6 frontend test asserts the finish-only event
+      // stream and batch Mel parity, so it runs the reference decoder (the
+      // incremental Mel frontend + KV encoder are unchanged by the decoder mode).
+      const result = await runStreamSession({ config, planName: spec.name, counts, env: { VOXTRAL_STREAM_DECODER: "reference" } });
       runs.push({ spec: spec.name, dataFeeds: counts.filter((c) => c > 0).length, result });
     }
 

@@ -48,6 +48,10 @@ export async function runStreamSession({
   skipParity = false,
   manualOracle = false,
   monitorMemory = false,
+  maxEvents = 0,
+  backpressure = false,
+  syntheticSeconds = 0,
+  maxTotalSamples = 0,
   timeoutMs = 300_000,
 } = {}) {
   const binary = remoteStreamBinary(config);
@@ -75,6 +79,18 @@ export async function runStreamSession({
   }
   if (manualOracle) {
     args.push("--manual-oracle");
+  }
+  if (maxEvents > 0) {
+    args.push("--max-events", String(maxEvents));
+  }
+  if (backpressure) {
+    args.push("--backpressure");
+  }
+  if (syntheticSeconds > 0) {
+    args.push("--synthetic-seconds", String(syntheticSeconds));
+  }
+  if (maxTotalSamples > 0) {
+    args.push("--max-total-samples", String(maxTotalSamples));
   }
 
   let planFile = null;

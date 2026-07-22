@@ -430,7 +430,22 @@ struct StreamRun {
     int64_t  adapterOutputD2hBytes = 0;
     int64_t  logitsD2hBytes = 0;
     int64_t  tokenIdD2hBytes = 0;
+    int64_t  encoderOutputD2hBytes = 0;
     uint64_t partialTextRevision = 0;
+
+    // Session 7.1: decoder mode + event-queue telemetry + backpressure evidence.
+    std::string decoderMode = "incremental";
+    uint64_t eventsEmitted = 0;
+    uint64_t tokenEventsCount = 0;
+    uint64_t partialEventsCount = 0;
+    uint64_t partialEventsCoalesced = 0;
+    uint64_t eventQueueHighWatermark = 0;
+    uint64_t eventQueueOverflowAttempts = 0;
+    uint64_t eventsDropped = 0;
+    int64_t  maxEventsBound = 0;          // queue bound applied to this run (0 = default)
+    int64_t  feedQueueFullReturns = 0;    // feeds that returned queue_full (backpressure)
+    bool     backpressureObserved = false;
+    std::string lastFeedStatus = "ok";
 };
 
 struct DriveOptions {
@@ -438,6 +453,12 @@ struct DriveOptions {
     int32_t pace_chunk_ms = 0;
     bool check_parity = true;
     bool check_manual_oracle = false;
+    // Session 7.1 backpressure exercise: shrink the event queue to `max_events`
+    // and, when `backpressure` is set, DELIBERATELY stop draining until feed
+    // reports queue_full — then drain and continue. Proves mandatory events are
+    // never dropped and the transcript is identical to the always-drain run.
+    int32_t max_events = 0;      // 0 = leave the default bound
+    bool    backpressure = false;
 };
 
 double percentile(std::vector<double> v, double p) {
@@ -615,6 +636,10 @@ StreamRun drive_stream(voxtral_stream * stream,
                        const DriveOptions & options = {}) {
     StreamRun r;
     r.parityChecked = options.check_parity;
+    if (options.max_events > 0) {
+        voxtral_stream_test_set_max_events(stream, (size_t) options.max_events);
+        r.maxEventsBound = options.max_events;
+    }
 
     const auto wall_start = std::chrono::steady_clock::now();
     if (options.paced) {
@@ -666,6 +691,19 @@ StreamRun drive_stream(voxtral_stream * stream,
             backlog_ms.push_back(std::max(0.0, late - cadence_ms));
             backlog_audio_s.push_back((double) (audio_cursor + c) / VOXTRAL_SAMPLE_RATE);
         }
+        if (fst == voxtral_status::limit_exceeded) {
+            // Explicit backpressure (queue_full), NOT a failure: the audio was
+            // accepted; the decoder has output pending because the event queue is
+            // full. Record it, drain, and continue — the next feed / finish resumes
+            // the decoder. Mandatory events are never dropped (events_dropped == 0).
+            r.backpressureObserved = true;
+            r.feedQueueFullReturns++;
+            { voxtral_stream_event dev; while (voxtral_stream_poll_event(stream, dev)) r.events.push_back(dev); }
+            off += c;
+            audio_cursor += c;
+            fst = voxtral_status::ok;   // resumed for the next iteration / finish
+            continue;
+        }
         if (fst != voxtral_status::ok) {
             std::cerr << "feed failed: " << voxtral_stream_status_name(fst)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
@@ -673,9 +711,12 @@ StreamRun drive_stream(voxtral_stream * stream,
         }
         off += c;
         audio_cursor += c;
-        // Drain events during feed (realistic consumer), so the bounded event queue
-        // never overflows on a long incremental stream and no TOKEN is lost.
-        { voxtral_stream_event dev; while (voxtral_stream_poll_event(stream, dev)) r.events.push_back(dev); }
+        // A realistic consumer drains during feed so the bounded event queue never
+        // overflows. The backpressure exercise deliberately withholds draining until
+        // feed reports queue_full (above), to prove the mandatory-event contract.
+        if (!options.backpressure) {
+            voxtral_stream_event dev; while (voxtral_stream_poll_event(stream, dev)) r.events.push_back(dev);
+        }
     }
 
     voxtral_status finst = voxtral_status::internal_error;
@@ -885,7 +926,25 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.adapterOutputD2hBytes   = voxtral_stream_adapter_output_d2h_bytes(stream);
     r.logitsD2hBytes          = voxtral_stream_logits_d2h_bytes(stream);
     r.tokenIdD2hBytes         = voxtral_stream_token_id_d2h_bytes(stream);
+    r.encoderOutputD2hBytes   = voxtral_stream_encoder_output_d2h_bytes(stream);
     r.partialTextRevision     = voxtral_stream_partial_text_revision(stream);
+
+    // Session 7.1: decoder mode + event-queue telemetry.
+    r.decoderMode                = voxtral_stream_decoder_mode(stream);
+    r.eventsEmitted              = voxtral_stream_events_emitted(stream);
+    r.tokenEventsCount           = voxtral_stream_token_events(stream);
+    r.partialEventsCount         = voxtral_stream_partial_events(stream);
+    r.partialEventsCoalesced     = voxtral_stream_partial_events_coalesced(stream);
+    r.eventQueueHighWatermark    = voxtral_stream_event_queue_high_watermark(stream);
+    r.eventQueueOverflowAttempts = voxtral_stream_event_queue_overflow_attempts(stream);
+    r.eventsDropped              = voxtral_stream_events_dropped(stream);
+    switch (voxtral_stream_last_feed_status(stream)) {
+        case voxtral_stream_feed_status::ok:          r.lastFeedStatus = "ok"; break;
+        case voxtral_stream_feed_status::would_block: r.lastFeedStatus = "would_block"; break;
+        case voxtral_stream_feed_status::queue_full:  r.lastFeedStatus = "queue_full"; break;
+        case voxtral_stream_feed_status::cancelled:   r.lastFeedStatus = "cancelled"; break;
+        case voxtral_stream_feed_status::failed:      r.lastFeedStatus = "failed"; break;
+    }
     return r;
 }
 
@@ -1051,7 +1110,21 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"adapterOutputD2hBytes\":" << r.adapterOutputD2hBytes << ",";
     js << "\"logitsD2hBytes\":" << r.logitsD2hBytes << ",";
     js << "\"tokenIdD2hBytes\":" << r.tokenIdD2hBytes << ",";
+    js << "\"encoderOutputD2hBytes\":" << r.encoderOutputD2hBytes << ",";
     js << "\"partialTextRevision\":" << r.partialTextRevision << ",";
+    // Session 7.1: decoder mode + event-queue telemetry + backpressure evidence.
+    js << "\"decoderMode\":\"" << r.decoderMode << "\",";
+    js << "\"eventsEmitted\":" << r.eventsEmitted << ",";
+    js << "\"tokenEvents\":" << r.tokenEventsCount << ",";
+    js << "\"partialEvents\":" << r.partialEventsCount << ",";
+    js << "\"partialEventsCoalesced\":" << r.partialEventsCoalesced << ",";
+    js << "\"eventQueueHighWatermark\":" << r.eventQueueHighWatermark << ",";
+    js << "\"eventQueueOverflowAttempts\":" << r.eventQueueOverflowAttempts << ",";
+    js << "\"eventsDropped\":" << r.eventsDropped << ",";
+    js << "\"maxEventsBound\":" << r.maxEventsBound << ",";
+    js << "\"feedQueueFullReturns\":" << r.feedQueueFullReturns << ",";
+    js << "\"backpressureObserved\":" << (r.backpressureObserved ? "true" : "false") << ",";
+    js << "\"lastFeedStatus\":\"" << r.lastFeedStatus << "\",";
     js << "\"tokens\":[";
     for (size_t i = 0; i < r.tokens.size(); ++i) { if (i) js << ","; js << r.tokens[i]; }
     js << "],";
@@ -1090,6 +1163,10 @@ int main(int argc, char ** argv) {
     bool skip_parity = false;
     bool manual_oracle = false;
     bool ab = false;
+    int32_t max_events = 0;
+    bool backpressure = false;
+    int32_t synthetic_seconds = 0;    // >0: generate synthetic audio instead of reading --wav
+    uint64_t max_total_samples = 0;   // >0: override the stream's full-buffer sample cap
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1106,6 +1183,10 @@ int main(int argc, char ** argv) {
         else if (a == "--skip-parity") { skip_parity = true; }
         else if (a == "--manual-oracle") { manual_oracle = true; }
         else if (a == "--ab")          { ab = true; }
+        else if (a == "--max-events")  { const char * v = val("--max-events"); if (!v) return 2; max_events = int32_t(std::strtol(v, nullptr, 10)); }
+        else if (a == "--backpressure") { backpressure = true; }
+        else if (a == "--synthetic-seconds") { const char * v = val("--synthetic-seconds"); if (!v) return 2; synthetic_seconds = int32_t(std::strtol(v, nullptr, 10)); }
+        else if (a == "--max-total-samples") { const char * v = val("--max-total-samples"); if (!v) return 2; max_total_samples = std::strtoull(v, nullptr, 10); }
         else if (a == "--gpu") {
             const char * v = val("--gpu"); if (!v) return 2;
             std::string g = v;
@@ -1118,16 +1199,31 @@ int main(int argc, char ** argv) {
         } else { std::cerr << "unknown option: " << a << "\n"; return 2; }
     }
 
-    if (model_path.empty() || wav_path.empty()) {
+    if (model_path.empty() || (wav_path.empty() && synthetic_seconds <= 0)) {
         std::cerr << "usage: voxtral-stream-test --model M.gguf --wav in.wav "
-                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n] [--realtime-ms n] [--ab]\n";
+                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n] [--realtime-ms n] [--ab]\n"
+                     "       [--max-events n] [--backpressure] [--synthetic-seconds n] [--max-total-samples n]\n";
         return 2;
     }
+    if (synthetic_seconds > 0) skip_parity = true;   // no batch reference for a 10-min soak
 
-    // Read audio.
+    // Read audio, or synthesize a long deterministic clip for the soak (avoids
+    // transferring a ~19 MB WAV). Low-amplitude mixed tones keep the encoder doing
+    // real work without depending on a fixture.
     std::vector<int16_t> pcm16;
     std::string err;
-    if (!read_wav_pcm16_mono16k(wav_path, pcm16, err)) {
+    if (synthetic_seconds > 0) {
+        const size_t n = (size_t) synthetic_seconds * VOXTRAL_SAMPLE_RATE;
+        pcm16.resize(n);
+        uint32_t st = 0x1234567u;
+        for (size_t i = 0; i < n; ++i) {
+            const double t = (double) i / VOXTRAL_SAMPLE_RATE;
+            const double s = 0.06 * std::sin(2.0 * 3.14159265 * 180.0 * t)
+                           + 0.04 * std::sin(2.0 * 3.14159265 * 320.0 * t);
+            const double noise = ((double) (seeded_next(st) & 0xffff) / 65535.0 - 0.5) * 0.01;
+            pcm16[i] = (int16_t) std::lround(std::max(-1.0, std::min(1.0, s + noise)) * 32000.0);
+        }
+    } else if (!read_wav_pcm16_mono16k(wav_path, pcm16, err)) {
         std::cerr << "wav error: " << err << "\n";
         return 3;
     }
@@ -1160,6 +1256,8 @@ int main(int argc, char ** argv) {
     drive_options.pace_chunk_ms = plan_file.empty() ? realtime_ms : 0;
     drive_options.check_parity = !skip_parity;
     drive_options.check_manual_oracle = manual_oracle;
+    drive_options.max_events = max_events;
+    drive_options.backpressure = backpressure;
 
     // Load the model ONCE (shared, immutable). Each stream will create and own
     // its own execution context from it via voxtral_stream_create_internal.
@@ -1176,6 +1274,7 @@ int main(int argc, char ** argv) {
     voxtral_stream_params sp;
     sp.max_tokens = max_tokens;
     sp.retain_mel_history = !skip_parity || manual_oracle;
+    if (max_total_samples > 0) sp.max_total_samples = max_total_samples;
 
     int exit_code = 0;
     std::ostringstream js;

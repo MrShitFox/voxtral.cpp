@@ -70,7 +70,7 @@ describe.skipIf(!enabled).sequential("realtime encoder long-form gates", () => {
       const result = await runStreamSession({
         config, planName: "encoder-realtime-soak", realtimeMs: 80,
         audioPath: remotePath, maxTokens: 1, skipParity: true,
-        env: realtimeEnv, timeoutMs: 300_000,
+        env: { ...realtimeEnv, VOXTRAL_STREAM_DECODER: "reference" }, timeoutMs: 300_000,
       });
       assertRealtime(result);
       await writeArtifactBundle({
@@ -96,7 +96,7 @@ describe.skipIf(!enabled).sequential("realtime encoder long-form gates", () => {
       const result = await runStreamSession({
         config, planName: "encoder-realtime-spoken-long", realtimeMs: 80,
         audioPath: fixture.wavPath, maxTokens: 1, skipParity: true,
-        env: realtimeEnv, timeoutMs: 300_000,
+        env: { ...realtimeEnv, VOXTRAL_STREAM_DECODER: "reference" }, timeoutMs: 300_000,
       });
       assertRealtime(result);
       await writeArtifactBundle({

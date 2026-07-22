@@ -2685,6 +2685,11 @@ struct voxtral_encoder_kv_state {
     int64_t peak_logical         = 0;
     int64_t peak_mel_tail        = 0;
     int64_t peak_output          = 0;
+    // Actual encoder-output host round-trip performed by this stream. In the
+    // incremental production path the adapter reads encoder output from the
+    // device ring, so this MUST stay 0 (the enc_accum D2H below is skipped);
+    // the reference finish-only path keeps the host accumulation and counts it.
+    int64_t enc_out_d2h_bytes    = 0;
     int64_t logical_frames_submitted = 0;
     int64_t physical_rows_evaluated = 0;
     int64_t padding_rows_evaluated = 0;
@@ -3035,12 +3040,19 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
     ggml_free(gctx);
 
     // Append the newly-emitted enc frames [emit_col, N) (channel-major) to the accum.
+    // Session 7.1: the incremental production path (want_enc_out_ring) reads encoder
+    // output from the device ring below and never needs the host accumulation, so the
+    // D2H is skipped entirely (encoder_output_d2h_bytes stays 0 — the hard gate). The
+    // reference finish-only mode keeps the accumulation and counts the real D2H bytes.
     const int32_t emit_n = N - emit_col;
-    const size_t old = kv->enc_accum.size();
-    kv->enc_accum.resize(old + (size_t) emit_n * VOXTRAL_ENC_DIM);
-    ggml_backend_tensor_get(ctx->encoder_chunk_output, kv->enc_accum.data() + old,
-                            (size_t) emit_col * VOXTRAL_ENC_DIM * sizeof(float),
-                            (size_t) emit_n * VOXTRAL_ENC_DIM * sizeof(float));
+    if (!ctx->want_enc_out_ring) {
+        const size_t old = kv->enc_accum.size();
+        kv->enc_accum.resize(old + (size_t) emit_n * VOXTRAL_ENC_DIM);
+        ggml_backend_tensor_get(ctx->encoder_chunk_output, kv->enc_accum.data() + old,
+                                (size_t) emit_col * VOXTRAL_ENC_DIM * sizeof(float),
+                                (size_t) emit_n * VOXTRAL_ENC_DIM * sizeof(float));
+        kv->enc_out_d2h_bytes += (int64_t) emit_n * VOXTRAL_ENC_DIM * (int64_t) sizeof(float);
+    }
     // Session 7: mirror the same N frames into the device-resident encoder-output
     // ring (device->device from encoder_chunk_output; emit_col is always 0).
     if (!copy_chunk_to_enc_out_ring(ctx, plan.q_start, N)) {
@@ -3440,6 +3452,7 @@ static void encoder_kv_reset(voxtral_encoder_kv_state * kv) {
     kv->peak_logical = 0;
     kv->peak_mel_tail = 0;
     kv->peak_output = 0;
+    kv->enc_out_d2h_bytes = 0;
     kv->logical_frames_submitted = 0;
     kv->physical_rows_evaluated = 0;
     kv->padding_rows_evaluated = 0;
@@ -3574,6 +3587,10 @@ int32_t voxtral_encoder_stream_output_frames(const voxtral_encoder_stream * es) 
     return (int32_t) (es->kv ? es->kv->emitted : es->emitted);
 }
 
+bool voxtral_encoder_stream_uses_kv(const voxtral_encoder_stream * es) {
+    return es && es->kv != nullptr;
+}
+
 voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_stream * es) {
     voxtral_encoder_metrics m{};
     if (!es) return m;
@@ -3593,6 +3610,7 @@ voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_str
                                                     kv->conv_cm.capacity() * sizeof(float) +
                                                     kv->mask_buf.capacity() * sizeof(float));
         m.encoderOutputAccumulatedBytes= (int64_t) (kv->enc_accum.size() * sizeof(float));
+        m.encoderOutputD2hBytes        = kv->enc_out_d2h_bytes;
         m.finalized                    = kv->finalized;
         // Ideal work: each unique enc frame runs the transformer exactly once.
         m.encoderUniqueFrames             = kv->emitted;
@@ -3667,6 +3685,8 @@ voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_str
     m.encoderStateBytes           = (int64_t) (es->mel_window.capacity() * sizeof(float) +
                                                es->chunk_mel_cm.capacity() * sizeof(float));
     m.encoderOutputAccumulatedBytes = (int64_t) (es->enc_accum.size() * sizeof(float));
+    // The reference/chunked path always D2Hs its output into the host accumulation.
+    m.encoderOutputD2hBytes       = (int64_t) (es->enc_accum.size() * sizeof(float));
     m.curChunk                    = es->cur_chunk;
     m.finalized                   = es->finalized;
     m.encoderUniqueFrames             = es->emitted;

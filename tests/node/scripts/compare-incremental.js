@@ -14,7 +14,8 @@ async function run(mode, incremental) {
     planName: `${incremental ? "incr" : "finish"}-${mode}`,
     mode,
     maxTokens: 0,
-    env: incremental ? { ...base, VOXTRAL_STREAM_DECODER: "incremental" } : base,
+    // Session 7.1: incremental is the default; the oracle must ask for reference.
+    env: { ...base, VOXTRAL_STREAM_DECODER: incremental ? "incremental" : "reference" },
     timeoutMs: 300_000,
   });
 }

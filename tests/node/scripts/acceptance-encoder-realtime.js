@@ -34,6 +34,10 @@ const envFor = (logical, physical) => ({
   VOXTRAL_ENC_KV_LOGICAL_BATCH: String(logical),
   VOXTRAL_ENC_KV_PHYSICAL_ROWS: String(physical),
   VOXTRAL_ENCODER_TELEMETRY: "1",
+  // Session 7.1: this encoder-scheduling acceptance measures the encoder in
+  // isolation and checks encoder tensor parity via the host buffer, which the
+  // reference decoder retains. The KV encoder itself is unchanged by the decoder.
+  VOXTRAL_STREAM_DECODER: "reference",
 });
 
 function gate(condition, message) {

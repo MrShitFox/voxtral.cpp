@@ -214,6 +214,20 @@ struct voxtral_stream {
     double   first_visible_text_ms   = 0.0;   // first non-empty partial text
     int64_t  token_id_d2h_bytes      = 0;      // 4 bytes per decoder step (argmax readback)
 
+    // ---- Session 7.1: explicit backpressure --------------------------------
+    // A decoder step that already ran (KV advanced) but whose mandatory TOKEN
+    // event did not fit the bounded event queue is held here so the token is
+    // never dropped and the step is never re-run. pump flushes it before doing
+    // any new work; feed refuses new audio while it is set (atomic backpressure).
+    struct pending_token {
+        bool    valid    = false;
+        int32_t token    = 0;
+        int64_t position = 0;
+        bool    special  = false;
+    } pending;
+    bool     decoder_backpressured   = false;  // event queue full; caller must drain
+    bool     finalizing_flush        = false;  // finish(): terminal events bypass the bound
+
     // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
     Sha256   pcm_sha;
 
@@ -241,6 +255,15 @@ struct voxtral_stream {
     std::deque<voxtral_stream_event> events;
     size_t max_events        = kMaxEvents;   // hard bound; test-overridable
     bool   events_overflowed = false;
+
+    // ---- Session 7.1: event telemetry (all hard-gate: events_dropped == 0) --
+    uint64_t events_emitted             = 0;  // total events successfully enqueued
+    uint64_t token_events               = 0;
+    uint64_t partial_events             = 0;  // partials that were enqueued as new entries
+    uint64_t partial_events_coalesced   = 0;  // partials that replaced/were dropped when full
+    uint64_t event_queue_high_watermark = 0;  // peak queue depth observed
+    uint64_t event_queue_overflow_attempts = 0;  // mandatory pushes that hit the bound (→ backpressure)
+    uint64_t events_dropped             = 0;  // mandatory events actually lost — MUST stay 0
 
     // Test seam: invoked once inside finish() while state == finishing.
     voxtral_stream_finishing_hook_fn finishing_hook = nullptr;
@@ -290,18 +313,33 @@ struct op_guard {
     ~op_guard() { if (engaged) s->in_operation = false; }
 };
 
-// Strictly bounded push. Returns false without enqueuing (and records the
-// overflow loudly: overflow flag + last_error) when the queue is at its bound.
-// Never grows past max_events; never silently drops.
+// Bookkeeping after a successful enqueue: aggregate + per-type counters and the
+// running queue-depth high-watermark.
+void note_enqueued(voxtral_stream * s, voxtral_stream_event_type type) {
+    s->events_emitted++;
+    if (type == voxtral_stream_event_type::token) s->token_events++;
+    else if (type == voxtral_stream_event_type::partial_text) s->partial_events++;
+    if (s->events.size() > s->event_queue_high_watermark)
+        s->event_queue_high_watermark = s->events.size();
+}
+
+// Bounded push for mandatory events. Returns false WITHOUT enqueuing when the
+// queue is at its bound — the caller turns that into explicit backpressure
+// (feed → queue_full) and never drops the event. During finish()'s terminal
+// flush (finalizing_flush) the small bounded finish tail is always delivered, so
+// FINAL_TEXT / COMPLETED / ERROR can never be lost.
 bool push_event(voxtral_stream * s, voxtral_stream_event ev) {
-    if (s->events.size() >= s->max_events) {
+    if (!s->finalizing_flush && s->events.size() >= s->max_events) {
         s->events_overflowed = true;
+        s->event_queue_overflow_attempts++;
         set_error(s, voxtral_status::limit_exceeded,
                   std::string("event queue full (bound ") + std::to_string(s->max_events) +
-                  "): dropped " + voxtral_stream_event_name(ev.type) + " event");
+                  "): backpressure on " + voxtral_stream_event_name(ev.type) + " event");
         return false;
     }
+    const auto type = ev.type;
     s->events.push_back(std::move(ev));
+    note_enqueued(s, type);
     return true;
 }
 
@@ -390,6 +428,16 @@ bool ensure_encoder(voxtral_stream * s) {
     // Incremental path: mirror encoder output into the device ring from the first
     // batch on, so the adapter can read complete groups on-device. The finish-only
     // reference leaves the ring copy off (no extra per-batch work).
+    //
+    // The incremental adapter/decoder reads encoder output from that device ring,
+    // which ONLY the per-layer KV encoder fills. If the reference (bounded-window
+    // recompute) encoder is selected (VOXTRAL_ENCODER_STRATEGY=reference), couple
+    // the decoder to the coherent reference finish-only path rather than feed the
+    // adapter an empty ring. This is a deterministic configuration coupling, not a
+    // runtime error fallback.
+    if (s->incremental && !voxtral_encoder_stream_uses_kv(s->enc)) {
+        s->incremental = false;
+    }
     if (s->incremental) voxtral_ctx_set_enc_out_ring_active(s->ctx, true);
     return true;
 }
@@ -471,34 +519,48 @@ int64_t audio_end_sample_for(int64_t position) {
 }
 
 // Push an event, coalescing PARTIAL_TEXT: a full queue keeps only the newest
-// revision (partials are a replaceable snapshot). Mandatory events (token / final /
-// error / completed) never coalesce and take the loud bounded-overflow path.
+// revision (partials are a replaceable snapshot, so coalescing/dropping one is
+// allowed and is NOT a mandatory-event drop). Mandatory events (token / final /
+// error / completed) never coalesce: a full queue returns false so the caller
+// can raise explicit backpressure instead of losing the event. The finish()
+// terminal flush (finalizing_flush) bypasses the bound entirely.
 bool push_event_coalesced(voxtral_stream * s, voxtral_stream_event ev) {
-    if (s->events.size() < s->max_events) {
+    if (s->finalizing_flush || s->events.size() < s->max_events) {
+        const auto type = ev.type;
         s->events.push_back(std::move(ev));
+        note_enqueued(s, type);
         return true;
     }
     if (ev.type == voxtral_stream_event_type::partial_text) {
         for (auto it = s->events.rbegin(); it != s->events.rend(); ++it) {
-            if (it->type == voxtral_stream_event_type::partial_text) { *it = std::move(ev); return true; }
+            if (it->type == voxtral_stream_event_type::partial_text) {
+                *it = std::move(ev);                 // keep only the newest revision
+                s->partial_events_coalesced++;
+                return true;
+            }
         }
-        return false;   // no prior partial to replace; drop (partials are lossy)
+        s->partial_events_coalesced++;
+        return false;   // no prior partial to replace; drop newest (partials are lossy)
     }
-    return push_event(s, std::move(ev));   // mandatory: records overflow loudly
+    return push_event(s, std::move(ev));   // mandatory: caller raises backpressure
 }
 
-void emit_token_event(voxtral_stream * s, int32_t token, int64_t position, bool special) {
+// Returns false when the mandatory TOKEN event did not fit the bounded queue; the
+// caller must NOT advance the decoder past it (the token is stashed and retried).
+// The sequence id is committed only on a successful enqueue, so no gaps appear.
+bool emit_token_event(voxtral_stream * s, int32_t token, int64_t position, bool special) {
     voxtral_stream_event ev;
     ev.type                    = voxtral_stream_event_type::token;
     ev.token                   = token;
     ev.special                 = special;
-    ev.sequence                = ++s->token_sequence;
+    ev.sequence                = s->token_sequence + 1;   // tentative
     ev.decoder_position        = position;
     ev.audio_end_sample        = audio_end_sample_for(position);
     ev.emitted_at_monotonic_ns = stream_now_ns();
     ev.t_audio_ms              = (double) ev.audio_end_sample * 1000.0 / (double) s->params.sample_rate;
-    push_event_coalesced(s, std::move(ev));
-    s->token_id_d2h_bytes += (int64_t) sizeof(int32_t);   // 4-byte argmax readback
+    if (!push_event_coalesced(s, std::move(ev))) return false;   // queue full → backpressure
+    ++s->token_sequence;                                          // commit only on success
+    return true;
 }
 
 void emit_partial_text_event(voxtral_stream * s, int64_t position) {
@@ -565,6 +627,44 @@ voxtral_status pump_incremental(voxtral_stream * s) {
         s->decoder_prev_token   = s->prompt_ids[L - 1];
     }
 
+    // Deliver a token that a decoder step already produced (its KV is committed)
+    // and advance the bookkeeping. Returns false when the mandatory TOKEN event
+    // does not fit the bounded queue: the token stays stashed, the position does
+    // not advance, and the step is never re-run — that is the backpressure point.
+    auto commit_pending = [&]() -> bool {
+        if (!s->pending.valid) return true;
+        if (!emit_token_event(s, s->pending.token, s->pending.position, s->pending.special)) {
+            s->decoder_backpressured = true;
+            return false;
+        }
+        const int32_t tok      = s->pending.token;
+        const int64_t position = s->pending.position;
+        const bool is_special  = s->pending.special;
+        s->pending.valid = false;
+        if (tok == VOXTRAL_TOKEN_EOS) {          // terminal: matches finish-path trailing-EOS drop
+            s->decoder_eos = true;
+            return true;
+        }
+        // Token history (drives FINAL_TEXT) + incremental transcript.
+        s->tokens.push_back(tok);
+        append_token_to_partial(s, tok);
+        emit_partial_text_event(s, position);    // lossy snapshot; never backpressures
+        s->decoder_tokens_emitted++;
+        if (!is_special && s->first_token_ms == 0.0)  s->first_token_ms = stream_elapsed_ms(s);
+        if (!s->partial_text.empty() && s->first_visible_text_ms == 0.0)
+            s->first_visible_text_ms = stream_elapsed_ms(s);
+        s->decoder_prev_token = tok;
+        s->decoder_position++;
+        return true;
+    };
+
+    // Resume: flush a token stashed by a previous backpressured pass before doing
+    // any new work. Still full → remain backpressured (caller drains and retries).
+    if (s->decoder_prefill_done) {
+        if (!commit_pending()) return voxtral_status::limit_exceeded;
+        s->decoder_backpressured = false;
+    }
+
     if (s->decoder_prefill_done && !s->decoder_eos) {
         const int64_t last_pos = s->adapter_groups_committed - 1;   // last committed audio pos
         const bool unlimited   = (s->params.max_tokens <= 0);
@@ -577,27 +677,15 @@ voxtral_status pump_incremental(voxtral_stream * s) {
                 return voxtral_status::backend_error;
             }
             s->decoder_steps++;
+            s->token_id_d2h_bytes += (int64_t) sizeof(int32_t);   // 4-byte argmax readback
             if (s->first_decoder_step_ms == 0.0) s->first_decoder_step_ms = stream_elapsed_ms(s);
 
-            const bool is_special = (tok == VOXTRAL_TOKEN_EOS || tok == VOXTRAL_TOKEN_BOS ||
-                                     tok == VOXTRAL_TOKEN_STREAMING_PAD);
-            emit_token_event(s, tok, s->decoder_position, is_special);
-
-            if (tok == VOXTRAL_TOKEN_EOS) {          // terminal: matches finish-path trailing-EOS drop
-                s->decoder_eos = true;
-                break;
-            }
-            // Token history (drives FINAL_TEXT) + incremental transcript.
-            s->tokens.push_back(tok);
-            append_token_to_partial(s, tok);
-            emit_partial_text_event(s, s->decoder_position);
-            s->decoder_tokens_emitted++;
-            if (!is_special && s->first_token_ms == 0.0)  s->first_token_ms = stream_elapsed_ms(s);
-            if (!s->partial_text.empty() && s->first_visible_text_ms == 0.0)
-                s->first_visible_text_ms = stream_elapsed_ms(s);
-
-            s->decoder_prev_token = tok;
-            s->decoder_position++;
+            s->pending.valid    = true;
+            s->pending.token    = tok;
+            s->pending.position = s->decoder_position;
+            s->pending.special  = (tok == VOXTRAL_TOKEN_EOS || tok == VOXTRAL_TOKEN_BOS ||
+                                   tok == VOXTRAL_TOKEN_STREAMING_PAD);
+            if (!commit_pending()) return voxtral_status::limit_exceeded;
         }
     }
     return voxtral_status::ok;
@@ -621,6 +709,24 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
         set_error(s, voxtral_status::invalid_state,
                   std::string("feed not allowed in state ") + voxtral_stream_state_name(s->state));
         return voxtral_status::invalid_state;
+    }
+
+    // Session 7.1 backpressure resume: a prior feed stalled the decoder because the
+    // event queue filled. Flush the stashed token + drain pending steps before
+    // accepting anything new. If the queue is still full, reject this feed WITHOUT
+    // consuming its audio (atomic; samples_received unchanged) so the caller drains
+    // and retries the same buffer. A zero-length feed thus doubles as a drain pump.
+    if (s->incremental && s->decoder_backpressured) {
+        const voxtral_status rp = pump_incremental(s);
+        if (rp == voxtral_status::limit_exceeded) {
+            s->feed_calls++;
+            return voxtral_status::limit_exceeded;   // still backpressured; drain + retry
+        }
+        if (rp != voxtral_status::ok) {
+            return rp;
+        }
+        // Resumed with room; fall through (the zero-length early return or the
+        // normal audio path below counts this feed call exactly once).
     }
 
     if (ptr == nullptr && count != 0) {
@@ -682,6 +788,7 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
     // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
     s->pcm_sha.update(s->feed_scratch.data(), s->feed_scratch.size() * sizeof(float));
 
+    bool backpressured = false;   // event queue filled during this feed's decoder pump
     if (s->mel_fe) {
         // Inference stream: stream samples through the incremental Mel frontend.
         // No full PCM is retained — only the frontend's bounded rolling tail.
@@ -720,9 +827,16 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
             // Session 7: advance the device-resident adapter + decoder during feed,
             // draining every slice so the encoder-output / audio-embedding rings stay
             // bounded. TOKEN and PARTIAL_TEXT are emitted here, not at finish.
-            if (s->incremental) {
+            if (s->incremental && !backpressured) {
                 const voxtral_status ps = pump_incremental(s);
-                if (ps != voxtral_status::ok) {
+                if (ps == voxtral_status::limit_exceeded) {
+                    // Event queue full: the decoder is stalled with a stashed token.
+                    // Keep consuming this feed's audio into the (bounded) Mel/encoder
+                    // so nothing is lost, but stop advancing the decoder until the
+                    // caller drains. feed returns queue_full below. For realtime
+                    // (single-slice) feeds this is the whole feed → fully atomic.
+                    backpressured = true;
+                } else if (ps != voxtral_status::ok) {
                     s->feed_scratch.clear();
                     return ps;
                 }
@@ -745,6 +859,13 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
     s->feed_calls++;
     if (s->state == voxtral_stream_state::created) {
         s->state = voxtral_stream_state::running;
+    }
+    if (backpressured) {
+        // Audio was accepted (Mel/encoder consumed it); the decoder has output
+        // pending because the event queue is full. Surface explicit backpressure —
+        // the caller drains the event queue and feeds again (a zero-length feed
+        // suffices) to resume. last_error carries the reason; do not clear it.
+        return voxtral_status::limit_exceeded;
     }
     clear_error(s);
     return voxtral_status::ok;
@@ -789,11 +910,18 @@ voxtral_stream * voxtral_stream_create_internal(
     s->params = params;
     s->model  = model;
 
-    // Session 7: opt into the device-resident incremental adapter + decoder path.
-    // Default is the finish-only reference path so existing acceptance is unchanged
-    // until the incremental gates pass and the default is flipped.
+    // Session 7.1: the device-resident incremental adapter + decoder is the
+    // production default. Only the explicit reference oracle disables it; any
+    // other value (including the legacy explicit "incremental") keeps the
+    // incremental path. No silent incremental→reference fallback: a reference run
+    // must be asked for. (ensure_encoder additionally couples the decoder to the
+    // encoder strategy — the incremental decoder needs the KV encoder ring.)
+    s->incremental = true;
     if (const char * mode = std::getenv("VOXTRAL_STREAM_DECODER")) {
-        s->incremental = (std::string(mode) == "incremental");
+        const std::string m = mode;
+        if (m == "reference" || m == "finish-only" || m == "finish_only" || m == "oracle") {
+            s->incremental = false;
+        }
     }
 
     if (model != nullptr) {
@@ -895,6 +1023,11 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
     }
 
     stream->state = voxtral_stream_state::finishing;
+    // finish() delivers a bounded tail (remaining audio positions + EOS) plus the
+    // terminal FINAL_TEXT/COMPLETED (or ERROR). These mandatory events must never
+    // be dropped, so the terminal flush bypasses the streaming event-queue bound;
+    // the queue can exceed it only by this small, bounded finish tail.
+    stream->finalizing_flush = true;
 
     // Test seam: observe the transient `finishing` state / probe reentrancy.
     // Any reentrant stream call from here returns `busy` (the guard is engaged).
@@ -1067,6 +1200,9 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     stream->first_token_ms           = 0.0;
     stream->first_visible_text_ms    = 0.0;
     stream->token_id_d2h_bytes       = 0;
+    stream->pending                  = {};      // no token in flight
+    stream->decoder_backpressured    = false;
+    stream->finalizing_flush         = false;
     stream->pcm_sha.reset();
     stream->mel_even.clear();
     stream->mel_even_frames        = 0;
@@ -1083,6 +1219,13 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     stream->transcript.clear();
     stream->events.clear();
     stream->events_overflowed = false;
+    stream->events_emitted             = 0;
+    stream->token_events               = 0;
+    stream->partial_events             = 0;
+    stream->partial_events_coalesced   = 0;
+    stream->event_queue_high_watermark = 0;
+    stream->event_queue_overflow_attempts = 0;
+    stream->events_dropped             = 0;
     stream->cancel_requested  = false;
     stream->cancelled_emitted = false;
     stream->state = voxtral_stream_state::created;
@@ -1339,6 +1482,55 @@ int64_t voxtral_stream_token_id_d2h_bytes(const voxtral_stream * s) {
 }
 uint64_t voxtral_stream_partial_text_revision(const voxtral_stream * s) {
     return s ? s->partial_revision : 0;
+}
+
+// Session 7.1: active decoder path. "incremental" is the production default;
+// "reference" is the finish-only oracle (env override, or the coupled fallback
+// when the reference encoder is selected). Meaningful once the encoder is created
+// (first feed); reflects the env choice before then.
+const char * voxtral_stream_decoder_mode(const voxtral_stream * s) {
+    return (s && s->incremental) ? "incremental" : "reference";
+}
+// Actual encoder-output device->host bytes performed by this stream. Hard gate:
+// 0 in the incremental production path (the adapter reads the device ring).
+int64_t voxtral_stream_encoder_output_d2h_bytes(const voxtral_stream * s) {
+    return stream_encoder_metrics(s).encoderOutputD2hBytes;
+}
+
+// ---- Event-queue telemetry (events_dropped is a hard gate == 0) ------------
+uint64_t voxtral_stream_events_emitted(const voxtral_stream * s) {
+    return s ? s->events_emitted : 0;
+}
+uint64_t voxtral_stream_token_events(const voxtral_stream * s) {
+    return s ? s->token_events : 0;
+}
+uint64_t voxtral_stream_partial_events(const voxtral_stream * s) {
+    return s ? s->partial_events : 0;
+}
+uint64_t voxtral_stream_partial_events_coalesced(const voxtral_stream * s) {
+    return s ? s->partial_events_coalesced : 0;
+}
+uint64_t voxtral_stream_event_queue_high_watermark(const voxtral_stream * s) {
+    return s ? s->event_queue_high_watermark : 0;
+}
+uint64_t voxtral_stream_event_queue_overflow_attempts(const voxtral_stream * s) {
+    return s ? s->event_queue_overflow_attempts : 0;
+}
+uint64_t voxtral_stream_events_dropped(const voxtral_stream * s) {
+    return s ? s->events_dropped : 0;
+}
+
+// Explicit backpressure state (maps the most recent operation's status onto the
+// documented feed contract: queue_full = drain events and retry).
+voxtral_stream_feed_status voxtral_stream_last_feed_status(const voxtral_stream * s) {
+    if (!s) return voxtral_stream_feed_status::failed;
+    switch (s->last_status) {
+        case voxtral_status::ok:             return voxtral_stream_feed_status::ok;
+        case voxtral_status::limit_exceeded: return voxtral_stream_feed_status::queue_full;
+        case voxtral_status::busy:           return voxtral_stream_feed_status::would_block;
+        case voxtral_status::cancelled:      return voxtral_stream_feed_status::cancelled;
+        default:                             return voxtral_stream_feed_status::failed;
+    }
 }
 
 // ============================================================================

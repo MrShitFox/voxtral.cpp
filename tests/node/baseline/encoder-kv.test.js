@@ -57,7 +57,9 @@ describe.skipIf(!enabled).sequential("RX 6600 per-layer encoder KV-cache accepta
     // --- Single-chunk: every feed plan is bit-identical to the global batch ------
     const short = [];
     for (const mode of plans) {
-      const r = await runStreamSession({ config, planName: `short-${mode}`, mode, audioPath: audio, maxTokens: 0 });
+      // Session 7.1: encoder tensor parity (delta/SHA) reads the host encoder
+      // buffer, retained only by the reference decoder. The KV encoder is identical.
+      const r = await runStreamSession({ config, planName: `short-${mode}`, mode, audioPath: audio, maxTokens: 0, env: { VOXTRAL_STREAM_DECODER: "reference" } });
       short.push({ mode, r });
       expect.soft(r.state, `${mode}: state`).toBe("completed");
       expect.soft(r.encoderStrategy, `${mode}: strategy`).toBe("per-layer-kv");
@@ -80,8 +82,8 @@ describe.skipIf(!enabled).sequential("RX 6600 per-layer encoder KV-cache accepta
 
     // --- Long clip: rollover, bit-exact across plans, bounded, latency ----------
     const longWav = await putWav(config, "40s", silenceWav(40 * 16_000));  // ~2000 enc frames > CAP (wraps) and > 3000 Mel (multi-chunk batch)
-    const longFull = await runStreamSession({ config, planName: "long-full", mode: "full", audioPath: longWav, maxTokens: 2, timeoutMs: 600_000 });
-    const long80 = await runStreamSession({ config, planName: "long-80ms", realtimeMs: 80, audioPath: longWav, maxTokens: 2, timeoutMs: 600_000 });
+    const longFull = await runStreamSession({ config, planName: "long-full", mode: "full", audioPath: longWav, maxTokens: 2, timeoutMs: 600_000, env: { VOXTRAL_STREAM_DECODER: "reference" } });
+    const long80 = await runStreamSession({ config, planName: "long-80ms", realtimeMs: 80, audioPath: longWav, maxTokens: 2, timeoutMs: 600_000, env: { VOXTRAL_STREAM_DECODER: "reference" } });
 
     for (const [name, r] of [["long-full", longFull], ["long-80ms", long80]]) {
       expect.soft(r.encoderMaxAbsDeltaVsBatch, `${name}: KV==global batch (rollover)`).toBeLessThanOrEqual(ENC_DELTA_GATE);

@@ -377,15 +377,49 @@ int64_t voxtral_stream_adapter_input_d2h_bytes      (const voxtral_stream * stre
 int64_t voxtral_stream_adapter_output_d2h_bytes     (const voxtral_stream * stream);
 int64_t voxtral_stream_logits_d2h_bytes             (const voxtral_stream * stream);
 int64_t voxtral_stream_token_id_d2h_bytes           (const voxtral_stream * stream);
+// Actual encoder-output device->host bytes. Hard gate: 0 in the incremental
+// production path (the adapter reads the on-device encoder-output ring); non-zero
+// only for the reference finish-only path.
+int64_t voxtral_stream_encoder_output_d2h_bytes     (const voxtral_stream * stream);
 // The accumulated final transcript's stable partial-text revision count.
 uint64_t voxtral_stream_partial_text_revision       (const voxtral_stream * stream);
+// Active decoder path: "incremental" (production default) or "reference"
+// (finish-only oracle). Reflects the coupled reality after the first feed.
+const char * voxtral_stream_decoder_mode            (const voxtral_stream * stream);
+
+// ----------------------------------------------------------------------------
+// Session 7.1: event-queue telemetry. events_dropped is a hard gate (== 0):
+// mandatory events (token / final_text / completed / error) are never dropped —
+// a full queue is surfaced as explicit feed backpressure (queue_full) instead,
+// and partials coalesce to the newest revision.
+// ----------------------------------------------------------------------------
+uint64_t voxtral_stream_events_emitted              (const voxtral_stream * stream);
+uint64_t voxtral_stream_token_events                (const voxtral_stream * stream);
+uint64_t voxtral_stream_partial_events              (const voxtral_stream * stream);
+uint64_t voxtral_stream_partial_events_coalesced    (const voxtral_stream * stream);
+uint64_t voxtral_stream_event_queue_high_watermark  (const voxtral_stream * stream);
+uint64_t voxtral_stream_event_queue_overflow_attempts(const voxtral_stream * stream);
+uint64_t voxtral_stream_events_dropped              (const voxtral_stream * stream);
+
+// ----------------------------------------------------------------------------
+// Explicit backpressure state. feed()/finish() still return voxtral_status; this
+// projects the most recent operation's status onto the documented feed contract:
+//   ok          -> proceed
+//   queue_full  -> event queue full; drain events (poll) and feed again (a
+//                  zero-length feed suffices) to resume. Audio was NOT lost.
+//   would_block -> a concurrent/reentrant call; retry once serialized
+//   cancelled / failed -> terminal
+// ----------------------------------------------------------------------------
+enum class voxtral_stream_feed_status { ok, would_block, queue_full, cancelled, failed };
+voxtral_stream_feed_status voxtral_stream_last_feed_status(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
 // Events. poll copies and removes the front event, returning false when empty.
 // Repeated polling after drain is safe. reset() clears the queue. The queue is
-// strictly bounded (see voxtral_stream_test_set_max_events for the default); a
-// push into a full queue is dropped and recorded (last_error + overflow flag),
-// never grown past the bound and never silently lost.
+// strictly bounded (see voxtral_stream_test_set_max_events for the default). A
+// mandatory event that does not fit is NOT dropped: the stream raises explicit
+// backpressure (feed -> queue_full) so the caller drains and retries; partials
+// coalesce to the newest revision. The bounded finish() tail is always delivered.
 //
 // poll_event is part of the externally-serialized contract: do not call it
 // concurrently with (or reentrantly from) another stream method.

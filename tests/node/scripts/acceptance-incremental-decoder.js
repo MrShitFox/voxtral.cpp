@@ -52,6 +52,11 @@ function checkDeviceResident(r, label) {
   gate(r.adapterInputD2hBytes === 0, `${label}: adapter input D2H ${r.adapterInputD2hBytes} != 0`);
   gate(r.adapterOutputD2hBytes === 0, `${label}: adapter output D2H ${r.adapterOutputD2hBytes} != 0`);
   gate(r.logitsD2hBytes === 0, `${label}: full-logits D2H ${r.logitsD2hBytes} != 0`);
+  // Session 7.1 hard gates: no encoder-output host round-trip, no host accumulation,
+  // and no mandatory event ever dropped.
+  gate(r.encoderOutputD2hBytes === 0, `${label}: encoder-output D2H ${r.encoderOutputD2hBytes} != 0`);
+  gate(r.encoderOutputAccumulatedBytes === 0, `${label}: host encoder accumulation ${r.encoderOutputAccumulatedBytes} != 0`);
+  gate(r.eventsDropped === 0, `${label}: events dropped ${r.eventsDropped} != 0`);
   gate(r.tokenIdD2hBytes === 4 * r.decoderSteps, `${label}: token-id D2H ${r.tokenIdD2hBytes} != 4*${r.decoderSteps}`);
   // Each decoder position advances exactly once (no replay): steps == tokens + terminal EOS(0/1).
   const eos = r.decoderTokensEmitted < r.decoderSteps ? 1 : 0;
@@ -71,9 +76,14 @@ async function main() {
   const refs = [], incs = [];
   for (const mode of plans) {
     const planName = mode.replaceAll(":", "-");
-    const ref = await runStreamSession({ config, planName: `ref-${planName}`, mode, maxTokens: 0, env: base, timeoutMs: 300_000 });
+    // Session 7.1: incremental is the default. The oracle side must explicitly ask
+    // for the finish-only reference; the incremental side is the default (asking for
+    // it explicitly also documents backward-compat of the legacy value).
+    const ref = await runStreamSession({ config, planName: `ref-${planName}`, mode, maxTokens: 0, env: { ...base, VOXTRAL_STREAM_DECODER: "reference" }, timeoutMs: 300_000 });
     const inc = await runStreamSession({ config, planName: `inc-${planName}`, mode, maxTokens: 0, env: { ...base, VOXTRAL_STREAM_DECODER: "incremental" }, timeoutMs: 300_000 });
     gate(ref.state === "completed" && inc.state === "completed", `${mode}: not completed (ref=${ref.state} inc=${inc.state})`);
+    gate(ref.decoderMode === "reference", `${mode}: ref not in reference mode (got ${ref.decoderMode})`);
+    gate(inc.decoderMode === "incremental", `${mode}: inc not in incremental mode (got ${inc.decoderMode})`);
     gate(JSON.stringify(ref.tokens) === JSON.stringify(inc.tokens), `${mode}: token divergence vs finish-only reference`);
     gate(ref.text === inc.text, `${mode}: transcript divergence vs finish-only reference`);
     checkDeviceResident(inc, mode);

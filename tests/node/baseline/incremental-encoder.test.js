@@ -80,7 +80,10 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental causal encoder accepta
       const plan = createChunkPlan(prepared.pcm, spec.options);
       const counts = planCounts(plan);
       expect(counts.reduce((a, b) => a + b, 0)).toBe(totalSamples);
-      const result = await runStreamSession({ config, planName: `enc-${spec.name}`, counts });
+      // Session 7.1: encoder tensor parity reads the host encoder buffer, retained
+      // only by the reference decoder (production incremental keeps encoder output
+      // on-device). The KV encoder itself is unchanged by the decoder mode.
+      const result = await runStreamSession({ config, planName: `enc-${spec.name}`, counts, env: { VOXTRAL_STREAM_DECODER: "reference" } });
       runs.push({ spec: spec.name, dataFeeds: counts.filter((c) => c > 0).length, result });
     }
 
@@ -197,6 +200,7 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental causal encoder accepta
         mode: "1000ms",
         audioPath: remotePath,
         maxTokens: 1,
+        env: { VOXTRAL_STREAM_DECODER: "reference" },   // encoder tensor parity needs the host buffer
         timeoutMs: 600_000,
       });
       await runRemote(`rm -f ${shellQuote(remotePath)}`, { config, timeoutMs: 30_000 });
