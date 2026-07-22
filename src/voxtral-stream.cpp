@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -155,6 +156,7 @@ struct voxtral_stream {
     // Execution engine. Owned by this stream iff `owns_context` (created from a
     // model). May be null for lifecycle-only streams (model == nullptr).
     voxtral_context     * ctx          = nullptr;
+    voxtral_model       * model        = nullptr;  // shared, immutable; for detokenization
     bool                  owns_context = false;
     voxtral_stream_params params;
 
@@ -187,6 +189,30 @@ struct voxtral_stream {
     // never re-runs the encoder over the whole Mel.
     voxtral_encoder_stream * enc = nullptr;
     int64_t  enc_pushed_frames   = 0;  // stable Mel frames already handed to the encoder
+
+    // ---- Session 7: device-resident incremental adapter + decoder ----------
+    // Selected once at create from VOXTRAL_STREAM_DECODER=incremental (default is
+    // the finish-only reference path, which keeps the existing acceptance green).
+    bool     incremental          = false;
+    std::vector<int32_t> prompt_ids;          // BOS + left-pad + delay STREAMING_PADs
+    int64_t  adapter_groups_committed = 0;    // audio embeddings written == next group
+    int64_t  adapter_commit_calls = 0;
+    bool     decoder_prefill_done = false;
+    int32_t  decoder_prev_token   = 0;
+    int64_t  decoder_position     = 0;        // next decoder position (== audio_pos)
+    int64_t  decoder_steps        = 0;
+    int64_t  decoder_tokens_emitted = 0;
+    int64_t  tokens_before_finish = 0;        // tokens emitted during feed()
+    bool     decoder_eos          = false;
+    uint64_t token_sequence       = 0;        // strictly monotonic TOKEN sequence
+    uint64_t partial_revision     = 0;        // monotonic PARTIAL_TEXT revision
+    std::string partial_text;                 // incremental detokenized snapshot
+    size_t   partial_stable_bytes = 0;        // UTF-8-safe stable prefix length
+    double   first_adapter_commit_ms = 0.0;
+    double   first_decoder_step_ms   = 0.0;
+    double   first_token_ms          = 0.0;   // first non-special token
+    double   first_visible_text_ms   = 0.0;   // first non-empty partial text
+    int64_t  token_id_d2h_bytes      = 0;      // 4 bytes per decoder step (argmax readback)
 
     // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
     Sha256   pcm_sha;
@@ -361,6 +387,10 @@ bool ensure_encoder(voxtral_stream * s) {
         set_error(s, voxtral_status::out_of_memory, "failed to create incremental encoder");
         return false;
     }
+    // Incremental path: mirror encoder output into the device ring from the first
+    // batch on, so the adapter can read complete groups on-device. The finish-only
+    // reference leaves the ring copy off (no extra per-batch work).
+    if (s->incremental) voxtral_ctx_set_enc_out_ring_active(s->ctx, true);
     return true;
 }
 
@@ -398,6 +428,179 @@ bool drain_mel_to_encoder(voxtral_stream * s) {
         voxtral_mel_frontend_discard_before(s->mel_fe, base);
     }
     return true;
+}
+
+// ============================================================================
+// Session 7: device-resident incremental adapter + decoder scheduling (feed()).
+// ============================================================================
+
+// Prompt for the realtime decoder: [BOS] + STREAMING_PAD * (left-pad + delay).
+// Exactly the tokens run_adapter_and_decode_realtime prefills, so the incremental
+// decoder produces a byte-identical token stream.
+void build_prompt_ids(voxtral_stream * s) {
+    if (!s->prompt_ids.empty()) return;
+    s->prompt_ids.push_back(VOXTRAL_TOKEN_BOS);
+    for (int32_t i = 0; i < VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS; ++i) {
+        s->prompt_ids.push_back(VOXTRAL_TOKEN_STREAMING_PAD);
+    }
+}
+
+// Length of the longest prefix of `text` that ends on a UTF-8 code-point boundary
+// (i.e. excludes a trailing incomplete multi-byte sequence). Detokenization is
+// append-only, so everything up to this point is permanently stable.
+size_t utf8_stable_prefix(const std::string & text) {
+    size_t i = text.size();
+    while (i > 0 && (static_cast<unsigned char>(text[i - 1]) & 0xC0) == 0x80) --i; // skip continuations
+    if (i == 0) return text.size();
+    const unsigned char lead = static_cast<unsigned char>(text[i - 1]);
+    size_t need;
+    if      ((lead & 0x80) == 0x00) need = 1;
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    else                            need = 1;   // stray continuation / invalid lead
+    // The final code point starts at i-1; it is complete iff all its bytes are present.
+    return (i - 1) + need <= text.size() ? text.size() : (i - 1);
+}
+
+// Real-audio end sample for an audio position, derived from the 80 ms cadence and
+// the injected left pad. Clamped to 0 for positions inside the left-pad region.
+int64_t audio_end_sample_for(int64_t position) {
+    const int64_t s = (position + 1) * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK - kStreamLeftPad;
+    return s > 0 ? s : 0;
+}
+
+// Push an event, coalescing PARTIAL_TEXT: a full queue keeps only the newest
+// revision (partials are a replaceable snapshot). Mandatory events (token / final /
+// error / completed) never coalesce and take the loud bounded-overflow path.
+bool push_event_coalesced(voxtral_stream * s, voxtral_stream_event ev) {
+    if (s->events.size() < s->max_events) {
+        s->events.push_back(std::move(ev));
+        return true;
+    }
+    if (ev.type == voxtral_stream_event_type::partial_text) {
+        for (auto it = s->events.rbegin(); it != s->events.rend(); ++it) {
+            if (it->type == voxtral_stream_event_type::partial_text) { *it = std::move(ev); return true; }
+        }
+        return false;   // no prior partial to replace; drop (partials are lossy)
+    }
+    return push_event(s, std::move(ev));   // mandatory: records overflow loudly
+}
+
+void emit_token_event(voxtral_stream * s, int32_t token, int64_t position, bool special) {
+    voxtral_stream_event ev;
+    ev.type                    = voxtral_stream_event_type::token;
+    ev.token                   = token;
+    ev.special                 = special;
+    ev.sequence                = ++s->token_sequence;
+    ev.decoder_position        = position;
+    ev.audio_end_sample        = audio_end_sample_for(position);
+    ev.emitted_at_monotonic_ns = stream_now_ns();
+    ev.t_audio_ms              = (double) ev.audio_end_sample * 1000.0 / (double) s->params.sample_rate;
+    push_event_coalesced(s, std::move(ev));
+    s->token_id_d2h_bytes += (int64_t) sizeof(int32_t);   // 4-byte argmax readback
+}
+
+void emit_partial_text_event(voxtral_stream * s, int64_t position) {
+    voxtral_stream_event ev;
+    ev.type               = voxtral_stream_event_type::partial_text;
+    ev.text               = s->partial_text;   // full snapshot
+    ev.revision           = ++s->partial_revision;
+    ev.stable_prefix_bytes= s->partial_stable_bytes;
+    ev.audio_end_sample   = audio_end_sample_for(position);
+    ev.t_audio_ms         = (double) ev.audio_end_sample * 1000.0 / (double) s->params.sample_rate;
+    push_event_coalesced(s, std::move(ev));
+}
+
+// Append one non-special token's bytes to the incremental transcript and refresh
+// the UTF-8-safe stable prefix. Byte-identical to decode_tokens() by construction.
+void append_token_to_partial(voxtral_stream * s, int32_t token) {
+    const std::string & piece = voxtral_token_piece_internal(s->model, token);
+    if (!piece.empty()) s->partial_text.append(piece);
+    s->partial_stable_bytes = utf8_stable_prefix(s->partial_text);
+}
+
+double stream_elapsed_ms(const voxtral_stream * s) {
+    return s->timeline_start_ns > 0
+        ? (double) (stream_now_ns() - s->timeline_start_ns) / 1e6 : 0.0;
+}
+
+// One scheduler pass: commit every ready adapter group, then run every ready
+// decoder step, emitting TOKEN + PARTIAL_TEXT. Called after each feed slice and at
+// finish. All three stages stay bounded because they are drained here every slice.
+voxtral_status pump_incremental(voxtral_stream * s) {
+    if (!s->incremental || !s->enc || !s->ctx) return voxtral_status::ok;
+    build_prompt_ids(s);
+
+    const int32_t aemb_cap    = voxtral_ctx_aemb_ring_frames(s->ctx);
+    const int64_t enc_frames  = voxtral_encoder_stream_output_frames(s->enc);
+    const int64_t avail_groups = enc_frames / VOXTRAL_DOWNSAMPLE_FACTOR;
+
+    // 1. Adapter: commit newly-complete groups, throttled so the audio-embedding
+    //    ring never overwrites an embedding the decoder has not consumed yet.
+    const int64_t consumed_floor = s->decoder_prefill_done ? s->decoder_position : 0;
+    const int64_t committable    = std::min<int64_t>(avail_groups, consumed_floor + aemb_cap);
+    if (committable > s->adapter_groups_committed) {
+        const int32_t n = (int32_t) (committable - s->adapter_groups_committed);
+        if (voxtral_ctx_adapter_commit(s->ctx, s->adapter_groups_committed, n) < 0) {
+            set_error(s, voxtral_status::backend_error, "incremental adapter commit failed");
+            return voxtral_status::backend_error;
+        }
+        if (s->first_adapter_commit_ms == 0.0) s->first_adapter_commit_ms = stream_elapsed_ms(s);
+        s->adapter_groups_committed = committable;
+        s->adapter_commit_calls++;
+    }
+
+    // 2. Decoder: prefill once over the prompt (needs positions [0, L-1)), then step
+    //    one token per available audio position (audio_pos == position).
+    const int32_t L = (int32_t) s->prompt_ids.size();   // 39
+    if (!s->decoder_prefill_done && s->adapter_groups_committed >= (L - 1)) {
+        voxtral_ctx_decoder_begin_incremental(s->ctx);
+        if (!voxtral_ctx_decoder_prefill_incremental(s->ctx, s->prompt_ids.data(), L - 1)) {
+            set_error(s, voxtral_status::backend_error, "incremental decoder prefill failed");
+            return voxtral_status::backend_error;
+        }
+        s->decoder_prefill_done = true;
+        s->decoder_position     = L - 1;                // first step is at position L-1
+        s->decoder_prev_token   = s->prompt_ids[L - 1];
+    }
+
+    if (s->decoder_prefill_done && !s->decoder_eos) {
+        const int64_t last_pos = s->adapter_groups_committed - 1;   // last committed audio pos
+        const bool unlimited   = (s->params.max_tokens <= 0);
+        while (s->decoder_position <= last_pos && !s->decoder_eos &&
+               (unlimited || s->decoder_tokens_emitted < (int64_t) s->params.max_tokens)) {
+            int32_t tok = 0;
+            if (!voxtral_ctx_decoder_step_incremental(
+                    s->ctx, s->decoder_prev_token, (int32_t) s->decoder_position, &tok)) {
+                set_error(s, voxtral_status::backend_error, "incremental decoder step failed");
+                return voxtral_status::backend_error;
+            }
+            s->decoder_steps++;
+            if (s->first_decoder_step_ms == 0.0) s->first_decoder_step_ms = stream_elapsed_ms(s);
+
+            const bool is_special = (tok == VOXTRAL_TOKEN_EOS || tok == VOXTRAL_TOKEN_BOS ||
+                                     tok == VOXTRAL_TOKEN_STREAMING_PAD);
+            emit_token_event(s, tok, s->decoder_position, is_special);
+
+            if (tok == VOXTRAL_TOKEN_EOS) {          // terminal: matches finish-path trailing-EOS drop
+                s->decoder_eos = true;
+                break;
+            }
+            // Token history (drives FINAL_TEXT) + incremental transcript.
+            s->tokens.push_back(tok);
+            append_token_to_partial(s, tok);
+            emit_partial_text_event(s, s->decoder_position);
+            s->decoder_tokens_emitted++;
+            if (!is_special && s->first_token_ms == 0.0)  s->first_token_ms = stream_elapsed_ms(s);
+            if (!s->partial_text.empty() && s->first_visible_text_ms == 0.0)
+                s->first_visible_text_ms = stream_elapsed_ms(s);
+
+            s->decoder_prev_token = tok;
+            s->decoder_position++;
+        }
+    }
+    return voxtral_status::ok;
 }
 
 // Common core for both feed variants: guard reentrancy, validate state/args,
@@ -514,6 +717,16 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
                 s->feed_scratch.clear();
                 return voxtral_status::backend_error;
             }
+            // Session 7: advance the device-resident adapter + decoder during feed,
+            // draining every slice so the encoder-output / audio-embedding rings stay
+            // bounded. TOKEN and PARTIAL_TEXT are emitted here, not at finish.
+            if (s->incremental) {
+                const voxtral_status ps = pump_incremental(s);
+                if (ps != voxtral_status::ok) {
+                    s->feed_scratch.clear();
+                    return ps;
+                }
+            }
         }
     } else {
         // Lifecycle-only stream (no context): retain the full canonical PCM as
@@ -574,6 +787,14 @@ voxtral_stream * voxtral_stream_create_internal(
     auto * s = new (std::nothrow) voxtral_stream();
     if (!s) return nullptr;
     s->params = params;
+    s->model  = model;
+
+    // Session 7: opt into the device-resident incremental adapter + decoder path.
+    // Default is the finish-only reference path so existing acceptance is unchanged
+    // until the incremental gates pass and the default is flipped.
+    if (const char * mode = std::getenv("VOXTRAL_STREAM_DECODER")) {
+        s->incremental = (std::string(mode) == "incremental");
+    }
 
     if (model != nullptr) {
         // Preferred path: the stream creates and owns its own mutable execution
@@ -745,11 +966,21 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
                 throw std::runtime_error("incremental encoder finish failed");
             }
             stream->finish_encoder_ms = (double) (stream_now_ns() - finish_encoder_start_ns) / 1e6;
-            const float * enc_out    = voxtral_encoder_stream_output(stream->enc);
-            const int32_t enc_frames = voxtral_encoder_stream_output_frames(stream->enc);
             const int64_t finish_decoder_start_ns = stream_now_ns();
-            ok = voxtral_transcribe_encoder_output_internal(
-                *stream->ctx, enc_out, enc_frames, stream->params.max_tokens, result);
+            if (stream->incremental) {
+                // Device-resident path: the adapter and decoder already ran during
+                // feed(). Only the flushed tail remains — commit its groups and run
+                // its decoder steps. No whole-utterance adapter or decoder replay.
+                stream->tokens_before_finish = stream->decoder_tokens_emitted;
+                const voxtral_status ps = pump_incremental(stream);
+                ok = (ps == voxtral_status::ok);
+                if (!ok) throw std::runtime_error(stream->last_error);
+            } else {
+                const float * enc_out    = voxtral_encoder_stream_output(stream->enc);
+                const int32_t enc_frames = voxtral_encoder_stream_output_frames(stream->enc);
+                ok = voxtral_transcribe_encoder_output_internal(
+                    *stream->ctx, enc_out, enc_frames, stream->params.max_tokens, result);
+            }
             stream->finish_decoder_ms = (double) (stream_now_ns() - finish_decoder_start_ns) / 1e6;
         } else {
             // Defensive fallback (should not happen for inference streams): run the
@@ -775,8 +1006,14 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
         return voxtral_status::backend_error;
     }
 
-    stream->transcript             = std::move(result.text);
-    stream->tokens                 = std::move(result.tokens);
+    if (stream->incremental) {
+        // Built incrementally during feed/finish; byte-identical to decode_tokens
+        // over stream->tokens (which already excludes the terminal EOS).
+        stream->transcript = stream->partial_text;
+    } else {
+        stream->transcript = std::move(result.text);
+        stream->tokens     = std::move(result.tokens);
+    }
     stream->total_samples_consumed = stream->total_samples_received;
     emit_final_and_completed(stream);
     stream->state = voxtral_stream_state::completed;
@@ -808,6 +1045,28 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     stream->enc_pushed_frames            = 0;
     stream->left_pad_injected            = false;
     stream->full_pcm_buffered_at_finish  = false;
+    // Session 7 incremental adapter/decoder state. The device rings are append-only
+    // and only ever read at written positions, so resetting the counters is enough;
+    // detach the shared decoder from this stream's audio ring and clear its KV.
+    if (stream->ctx) voxtral_ctx_decoder_reset_incremental(stream->ctx);
+    stream->adapter_groups_committed = 0;
+    stream->adapter_commit_calls     = 0;
+    stream->decoder_prefill_done     = false;
+    stream->decoder_prev_token       = 0;
+    stream->decoder_position         = 0;
+    stream->decoder_steps            = 0;
+    stream->decoder_tokens_emitted   = 0;
+    stream->tokens_before_finish     = 0;
+    stream->decoder_eos              = false;
+    stream->token_sequence           = 0;
+    stream->partial_revision         = 0;
+    stream->partial_text.clear();
+    stream->partial_stable_bytes     = 0;
+    stream->first_adapter_commit_ms  = 0.0;
+    stream->first_decoder_step_ms    = 0.0;
+    stream->first_token_ms           = 0.0;
+    stream->first_visible_text_ms    = 0.0;
+    stream->token_id_d2h_bytes       = 0;
     stream->pcm_sha.reset();
     stream->mel_even.clear();
     stream->mel_even_frames        = 0;
@@ -1024,6 +1283,62 @@ const float * voxtral_stream_encoder_output_data(const voxtral_stream * s) {
 }
 int32_t voxtral_stream_encoder_output_frames_count(const voxtral_stream * s) {
     return (s && s->enc) ? voxtral_encoder_stream_output_frames(s->enc) : 0;
+}
+
+// --- Session 7: incremental adapter + decoder introspection ----------------
+bool voxtral_stream_uses_incremental_decode(const voxtral_stream * s) {
+    return s ? s->incremental : false;
+}
+int64_t voxtral_stream_adapter_groups_committed(const voxtral_stream * s) {
+    return s ? s->adapter_groups_committed : 0;
+}
+int64_t voxtral_stream_adapter_commit_calls(const voxtral_stream * s) {
+    return s ? s->adapter_commit_calls : 0;
+}
+int64_t voxtral_stream_decoder_steps(const voxtral_stream * s) {
+    return s ? s->decoder_steps : 0;
+}
+int64_t voxtral_stream_decoder_tokens_emitted(const voxtral_stream * s) {
+    return s ? s->decoder_tokens_emitted : 0;
+}
+int64_t voxtral_stream_decoder_position(const voxtral_stream * s) {
+    return s ? s->decoder_position : 0;
+}
+bool voxtral_stream_decoder_prefill_complete(const voxtral_stream * s) {
+    return s ? s->decoder_prefill_done : false;
+}
+int64_t voxtral_stream_tokens_before_finish(const voxtral_stream * s) {
+    return s ? s->tokens_before_finish : 0;
+}
+int64_t voxtral_stream_tokens_flushed_at_finish(const voxtral_stream * s) {
+    return s ? (s->decoder_tokens_emitted - s->tokens_before_finish) : 0;
+}
+double voxtral_stream_first_adapter_commit_ms(const voxtral_stream * s) {
+    return s ? s->first_adapter_commit_ms : 0.0;
+}
+double voxtral_stream_first_decoder_step_ms(const voxtral_stream * s) {
+    return s ? s->first_decoder_step_ms : 0.0;
+}
+double voxtral_stream_first_token_ms(const voxtral_stream * s) {
+    return s ? s->first_token_ms : 0.0;
+}
+double voxtral_stream_first_visible_text_ms(const voxtral_stream * s) {
+    return s ? s->first_visible_text_ms : 0.0;
+}
+int64_t voxtral_stream_adapter_input_d2h_bytes(const voxtral_stream * s) {
+    (void) s; return 0;   // adapter reads the encoder-output ring on-device
+}
+int64_t voxtral_stream_adapter_output_d2h_bytes(const voxtral_stream * s) {
+    (void) s; return 0;   // adapter writes the audio-embedding ring on-device
+}
+int64_t voxtral_stream_logits_d2h_bytes(const voxtral_stream * s) {
+    (void) s; return 0;   // steps read back only the argmax token; prefill logits skipped
+}
+int64_t voxtral_stream_token_id_d2h_bytes(const voxtral_stream * s) {
+    return s ? s->token_id_d2h_bytes : 0;
+}
+uint64_t voxtral_stream_partial_text_revision(const voxtral_stream * s) {
+    return s ? s->partial_revision : 0;
 }
 
 // ============================================================================

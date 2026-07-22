@@ -411,6 +411,26 @@ struct StreamRun {
     int64_t afterFinishVramBytes = 0;
     int64_t afterDestroyVramBytes = 0;
     bool parityChecked = true;
+
+    // Session 7: device-resident incremental adapter + decoder.
+    bool     usesIncrementalDecode = false;
+    int64_t  adapterGroupsCommitted = 0;
+    int64_t  adapterCommitCalls = 0;
+    int64_t  decoderSteps = 0;
+    int64_t  decoderTokensEmitted = 0;
+    int64_t  decoderPosition = 0;
+    bool     decoderPrefillComplete = false;
+    int64_t  tokensBeforeFinish = 0;
+    int64_t  tokensFlushedAtFinish = 0;
+    double   firstAdapterCommitMs = 0.0;
+    double   firstDecoderStepMs = 0.0;
+    double   firstTokenMs = 0.0;
+    double   firstVisibleTextMs = 0.0;
+    int64_t  adapterInputD2hBytes = 0;
+    int64_t  adapterOutputD2hBytes = 0;
+    int64_t  logitsD2hBytes = 0;
+    int64_t  tokenIdD2hBytes = 0;
+    uint64_t partialTextRevision = 0;
 };
 
 struct DriveOptions {
@@ -653,6 +673,9 @@ StreamRun drive_stream(voxtral_stream * stream,
         }
         off += c;
         audio_cursor += c;
+        // Drain events during feed (realistic consumer), so the bounded event queue
+        // never overflows on a long incremental stream and no TOKEN is lost.
+        { voxtral_stream_event dev; while (voxtral_stream_poll_event(stream, dev)) r.events.push_back(dev); }
     }
 
     voxtral_status finst = voxtral_status::internal_error;
@@ -843,6 +866,26 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.text            = voxtral_stream_transcript(stream);
     r.contextOwned    = voxtral_stream_owns_context(stream);
     r.ok              = (finst == voxtral_status::ok);
+
+    // Session 7 incremental adapter/decoder telemetry.
+    r.usesIncrementalDecode   = voxtral_stream_uses_incremental_decode(stream);
+    r.adapterGroupsCommitted  = voxtral_stream_adapter_groups_committed(stream);
+    r.adapterCommitCalls      = voxtral_stream_adapter_commit_calls(stream);
+    r.decoderSteps            = voxtral_stream_decoder_steps(stream);
+    r.decoderTokensEmitted    = voxtral_stream_decoder_tokens_emitted(stream);
+    r.decoderPosition         = voxtral_stream_decoder_position(stream);
+    r.decoderPrefillComplete  = voxtral_stream_decoder_prefill_complete(stream);
+    r.tokensBeforeFinish      = voxtral_stream_tokens_before_finish(stream);
+    r.tokensFlushedAtFinish   = voxtral_stream_tokens_flushed_at_finish(stream);
+    r.firstAdapterCommitMs    = voxtral_stream_first_adapter_commit_ms(stream);
+    r.firstDecoderStepMs      = voxtral_stream_first_decoder_step_ms(stream);
+    r.firstTokenMs            = voxtral_stream_first_token_ms(stream);
+    r.firstVisibleTextMs      = voxtral_stream_first_visible_text_ms(stream);
+    r.adapterInputD2hBytes    = voxtral_stream_adapter_input_d2h_bytes(stream);
+    r.adapterOutputD2hBytes   = voxtral_stream_adapter_output_d2h_bytes(stream);
+    r.logitsD2hBytes          = voxtral_stream_logits_d2h_bytes(stream);
+    r.tokenIdD2hBytes         = voxtral_stream_token_id_d2h_bytes(stream);
+    r.partialTextRevision     = voxtral_stream_partial_text_revision(stream);
     return r;
 }
 
@@ -990,6 +1033,25 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"finalBacklogMs\":" << r.finalBacklogMs << ",";
     js << "\"backlogGrowthSlopeMsPerSec\":" << r.backlogGrowthSlopeMsPerSec << ",";
     js << "\"contextOwnedByStream\":" << (r.contextOwned ? "true" : "false") << ",";
+    // --- Session 7 incremental adapter + decoder ---
+    js << "\"usesIncrementalDecode\":" << (r.usesIncrementalDecode ? "true" : "false") << ",";
+    js << "\"adapterGroupsCommitted\":" << r.adapterGroupsCommitted << ",";
+    js << "\"adapterCommitCalls\":" << r.adapterCommitCalls << ",";
+    js << "\"decoderSteps\":" << r.decoderSteps << ",";
+    js << "\"decoderTokensEmitted\":" << r.decoderTokensEmitted << ",";
+    js << "\"decoderPosition\":" << r.decoderPosition << ",";
+    js << "\"decoderPrefillComplete\":" << (r.decoderPrefillComplete ? "true" : "false") << ",";
+    js << "\"tokensBeforeFinish\":" << r.tokensBeforeFinish << ",";
+    js << "\"tokensFlushedAtFinish\":" << r.tokensFlushedAtFinish << ",";
+    js << "\"firstAdapterCommitMs\":" << r.firstAdapterCommitMs << ",";
+    js << "\"firstDecoderStepMs\":" << r.firstDecoderStepMs << ",";
+    js << "\"firstTokenMs\":" << r.firstTokenMs << ",";
+    js << "\"firstVisibleTextMs\":" << r.firstVisibleTextMs << ",";
+    js << "\"adapterInputD2hBytes\":" << r.adapterInputD2hBytes << ",";
+    js << "\"adapterOutputD2hBytes\":" << r.adapterOutputD2hBytes << ",";
+    js << "\"logitsD2hBytes\":" << r.logitsD2hBytes << ",";
+    js << "\"tokenIdD2hBytes\":" << r.tokenIdD2hBytes << ",";
+    js << "\"partialTextRevision\":" << r.partialTextRevision << ",";
     js << "\"tokens\":[";
     for (size_t i = 0; i < r.tokens.size(); ++i) { if (i) js << ","; js << r.tokens[i]; }
     js << "],";
@@ -997,9 +1059,21 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"events\":[";
     for (size_t i = 0; i < r.events.size(); ++i) {
         if (i) js << ",";
-        js << "{\"type\":\"" << voxtral_stream_event_name(r.events[i].type) << "\"";
-        if (r.events[i].type == voxtral_stream_event_type::error) {
-            js << ",\"code\":" << r.events[i].error_code;
+        const voxtral_stream_event & e = r.events[i];
+        js << "{\"type\":\"" << voxtral_stream_event_name(e.type) << "\"";
+        if (e.type == voxtral_stream_event_type::error) {
+            js << ",\"code\":" << e.error_code;
+        } else if (e.type == voxtral_stream_event_type::token) {
+            js << ",\"sequence\":" << e.sequence
+               << ",\"token\":" << e.token
+               << ",\"decoderPosition\":" << e.decoder_position
+               << ",\"audioEndSample\":" << e.audio_end_sample
+               << ",\"special\":" << (e.special ? "true" : "false");
+        } else if (e.type == voxtral_stream_event_type::partial_text) {
+            js << ",\"revision\":" << e.revision
+               << ",\"stablePrefixBytes\":" << e.stable_prefix_bytes
+               << ",\"audioEndSample\":" << e.audio_end_sample
+               << ",\"utf8Bytes\":" << e.text.size();
         }
         js << "}";
     }

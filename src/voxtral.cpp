@@ -37,6 +37,21 @@ static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens pe
 // physical block's K/V write never clobbers a still-live window frame. K/V are F32.
 static constexpr int32_t VOXTRAL_ENC_KV_MAX_NEW = 128;
 static constexpr int32_t VOXTRAL_ENC_KV_CAP     = VOXTRAL_ENC_WINDOW + VOXTRAL_ENC_KV_MAX_NEW; // 878
+
+// Session 7 device-resident incremental adapter/decoder rings. Both are fixed,
+// persistent, device-resident, and drained every feed slice so they never grow
+// with the utterance. ENC_OUT_RING holds encoder output frames until the adapter
+// consumes them in groups of DOWNSAMPLE_FACTOR; its capacity must exceed the
+// 128-frame startup burst plus one drain slice's worth, and MUST be a multiple of
+// DOWNSAMPLE_FACTOR so a 4-frame adapter group never straddles the ring wrap.
+// AEMB_RING holds one audio embedding per group until the frame-synchronous
+// decoder consumes it 1:1.
+static constexpr int32_t VOXTRAL_ENC_OUT_RING_CAP = 256;   // enc frames; %4 == 0
+static constexpr int32_t VOXTRAL_AEMB_RING_CAP    = 256;   // audio embeddings
+static_assert(VOXTRAL_ENC_OUT_RING_CAP % VOXTRAL_DOWNSAMPLE_FACTOR == 0,
+              "enc-output ring capacity must be a multiple of the adapter group size");
+static_assert(VOXTRAL_ENC_OUT_RING_CAP >= VOXTRAL_ENC_KV_MAX_NEW + 64,
+              "enc-output ring must absorb the startup burst plus a drain slice");
 // Logical scheduling and physical graph shape are deliberately independent.
 // The realtime default is adapter-aligned 4/32; 128/128 remains the explicit
 // throughput/reference mode. Physical rows are capped by the ring headroom.
@@ -275,10 +290,29 @@ struct voxtral_context {
     ggml_tensor        * encoder_output = nullptr;  // [enc_dim, total_enc_tokens]
     int32_t total_enc_tokens = 0;
 
-    // Dynamic decoder memory (allocated per utterance ON DEVICE)
+    // Dynamic decoder memory (allocated per utterance ON DEVICE). Used by the
+    // batch/offline/finish-only paths, which materialize the whole utterance.
     ggml_context       * ctx_dec_mem = nullptr;
     ggml_backend_buffer_t buf_dec_mem = nullptr;
     ggml_tensor        * decoder_memory = nullptr;  // [dec_dim, dec_seq]
+
+    // Session 7: device-resident incremental adapter/decoder rings (persistent,
+    // fixed capacity). enc_out_ring accumulates encoder output frames on device so
+    // the incremental adapter reads complete groups without any D2H; audio_emb_ring
+    // holds the adapter's audio embeddings until the incremental decoder consumes
+    // them. The realtime decoder graphs read audio embeddings from dec_audio_src:
+    // when dec_audio_cap>0 it is audio_emb_ring and positions index modulo capacity;
+    // when null/0 they fall back to the linear decoder_memory (batch/finish path).
+    // Kept in their OWN device buffer (NOT buf_persistent): clear_kv_cache() clears
+    // the whole persistent buffer, which must not wipe live encoder output / audio
+    // embeddings when the incremental decoder resets its KV.
+    ggml_context       * ctx_rings      = nullptr;
+    ggml_backend_buffer_t buf_rings     = nullptr;
+    ggml_tensor        * enc_out_ring   = nullptr;  // [enc_dim, ENC_OUT_RING_CAP]
+    ggml_tensor        * audio_emb_ring = nullptr;  // [dec_dim, AEMB_RING_CAP]
+    ggml_tensor        * dec_audio_src  = nullptr;  // audio-embedding source for realtime decoder graphs
+    int32_t              dec_audio_cap  = 0;        // >0 => ring modulo indexing
+    bool                 want_enc_out_ring = false; // incremental stream mirrors enc output into the ring
 
     // Actual sizes (set per utterance)
     int32_t enc_seq_len  = 0;  // after conv, before left-trunc
@@ -411,6 +445,16 @@ static std::string decode_tokens(const voxtral_model & model, const std::vector<
     }
 
     return out;
+}
+
+// Session 7: one token's raw UTF-8 byte piece for the incremental detokenizer.
+// token_bytes_for_id already returns an empty string for special / out-of-range
+// ids, so appending this for every emitted token reproduces decode_tokens()
+// byte-for-byte (which likewise contributes nothing for those ids).
+const std::string & voxtral_token_piece_internal(const voxtral_model * model, int32_t token_id) {
+    static const std::string empty;
+    if (!model || model->tokenizer_vocab_b64.empty()) return empty;
+    return token_bytes_for_id(*model, token_id);
 }
 
 // ============================================================================
@@ -1006,6 +1050,27 @@ voxtral_context * voxtral_init_from_model(
         ggml_backend_buffer_clear(ctx->buf_persistent, 0);
     }
 
+    // Session 7: device-resident incremental adapter/decoder rings, in their OWN
+    // buffer so clear_kv_cache()'s whole-buffer clear never wipes live encoder
+    // output or audio embeddings.
+    {
+        ggml_init_params p = { ggml_tensor_overhead() * 2, nullptr, /*.no_alloc=*/ true };
+        ctx->ctx_rings = ggml_init(p);
+        ctx->enc_out_ring = ggml_new_tensor_2d(ctx->ctx_rings, GGML_TYPE_F32,
+            VOXTRAL_ENC_DIM, VOXTRAL_ENC_OUT_RING_CAP);
+        ggml_set_name(ctx->enc_out_ring, "enc_out_ring");
+        ctx->audio_emb_ring = ggml_new_tensor_2d(ctx->ctx_rings, GGML_TYPE_F32,
+            ctx->model->hp.dec_dim, VOXTRAL_AEMB_RING_CAP);
+        ggml_set_name(ctx->audio_emb_ring, "audio_emb_ring");
+        ctx->buf_rings = ggml_backend_alloc_ctx_tensors(ctx->ctx_rings, ctx->backend);
+        if (!ctx->buf_rings) {
+            fprintf(stderr, "voxtral: failed to allocate incremental ring buffer\n");
+            voxtral_free(ctx);
+            return nullptr;
+        }
+        ggml_backend_buffer_clear(ctx->buf_rings, 0);
+    }
+
     {
         const double chunk_mb = (double) ggml_nbytes(ctx->encoder_chunk_output) / 1e6;
         const double kv_mb  = (double) (ggml_nbytes(ctx->kv_self_k) + ggml_nbytes(ctx->kv_self_v)) / 1e6;
@@ -1076,6 +1141,8 @@ void voxtral_free(voxtral_context * ctx) {
     if (ctx->ctx_dec_mem)    ggml_free(ctx->ctx_dec_mem);
     if (ctx->buf_persistent) ggml_backend_buffer_free(ctx->buf_persistent);
     if (ctx->ctx_persistent) ggml_free(ctx->ctx_persistent);
+    if (ctx->buf_rings)      ggml_backend_buffer_free(ctx->buf_rings);
+    if (ctx->ctx_rings)      ggml_free(ctx->ctx_rings);
     if (ctx->blas_backend)   ggml_backend_free(ctx->blas_backend);
     if (ctx->backend_cpu)    ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)        ggml_backend_free(ctx->backend);
@@ -1748,6 +1815,11 @@ static ggml_cgraph * build_encoder_kv_graph(
     ggml_tensor * real_x = ggml_view_2d(gctx, x, hp.enc_dim, N, x->nb[1],
                                         (size_t) q_offset * x->nb[1]);
     ggml_build_forward_expand(gf, ggml_cpy(gctx, real_x, out_view));
+    // The device-resident encoder-output ring is populated by a separate
+    // device->device copy from encoder_chunk_output after this graph completes
+    // (see copy_chunk_to_enc_out_ring). Folding a second cpy from `x` into this
+    // graph is unsafe: ggml_backend_sched can reuse x's buffer after the first
+    // consumer, corrupting the ring copy.
     return gf;
 }
 
@@ -1790,6 +1862,40 @@ static ggml_cgraph * build_adapter_graph(
 
     ctx->dec_seq_len = dec_seq;
 
+    return gf;
+}
+
+// Session 7: device-resident incremental adapter over a contiguous run of
+// `n_groups` complete encoder-output groups (DOWNSAMPLE_FACTOR frames each) that are
+// resident in enc_out_ring starting at ring column `enc_col`, writing the resulting
+// audio embeddings into audio_emb_ring starting at column `aemb_col`. The caller
+// splits any run that would wrap either ring, so both views here are contiguous and
+// the frame layout is byte-identical to the batch adapter's [enc_dim, enc_seq] ->
+// [enc_dim*4, dec_seq] reshape. No host copy of encoder output or audio embeddings.
+static ggml_cgraph * build_adapter_ring_graph(voxtral_context * ctx, ggml_context * gctx,
+                                              int32_t enc_col, int32_t aemb_col, int32_t n_groups) {
+    voxtral_model * model = ctx->model;
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+
+    // enc_out_ring[:, enc_col : enc_col + 4*n_groups] — contiguous (no wrap here).
+    // Materialize to a fresh contiguous tensor before the reshape: unlike the batch
+    // adapter (which reshapes an offset-0 view of encoder_output), this view starts
+    // at an arbitrary ring column, and reshaping a non-zero-offset view directly
+    // into mul_mat is not reliable across backends.
+    ggml_tensor * enc_out = ggml_cont(gctx, ggml_view_2d(gctx, ctx->enc_out_ring,
+        VOXTRAL_ENC_DIM, n_groups * VOXTRAL_DOWNSAMPLE_FACTOR,
+        ctx->enc_out_ring->nb[1], (size_t) enc_col * ctx->enc_out_ring->nb[1]));
+    ggml_tensor * x = ggml_reshape_2d(gctx, enc_out,
+        VOXTRAL_ENC_DIM * VOXTRAL_DOWNSAMPLE_FACTOR, n_groups); // [enc_dim*4, n_groups]
+
+    x = ggml_mul_mat(gctx, model->adapter_0_weight, x); // [dec_dim, n_groups]
+    x = ggml_gelu_erf(gctx, x);
+    x = ggml_mul_mat(gctx, model->adapter_2_weight, x); // [dec_dim, n_groups]
+
+    ggml_tensor * dst = ggml_view_2d(gctx, ctx->audio_emb_ring,
+        model->hp.dec_dim, n_groups,
+        ctx->audio_emb_ring->nb[1], (size_t) aemb_col * ctx->audio_emb_ring->nb[1]);
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, x, dst));
     return gf;
 }
 
@@ -1962,10 +2068,14 @@ static ggml_cgraph * build_decoder_prefill_graph(
     // Token embeddings: [dec_dim, n_tokens]
     ggml_tensor * tok_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, token_ids); // [dec_dim, n_tokens]
 
-    // Audio embeddings from decoder_memory: [dec_dim, n_tokens]
-    ggml_tensor * audio_emb = ggml_view_2d(gctx, ctx->decoder_memory,
+    // Audio embeddings: linear decoder_memory (batch/finish path) or, for the
+    // incremental decoder, the device-resident audio_emb_ring. Prefill only ever
+    // runs once at the very start of a stream (positions [0, n_tokens)), before the
+    // ring has wrapped, so a contiguous view at column 0 is valid for both.
+    ggml_tensor * audio_src = ctx->dec_audio_src ? ctx->dec_audio_src : ctx->decoder_memory;
+    ggml_tensor * audio_emb = ggml_view_2d(gctx, audio_src,
         VOXTRAL_DEC_DIM, n_tokens,
-        ctx->decoder_memory->nb[1], 0); // [dec_dim, n_tokens]
+        audio_src->nb[1], 0); // [dec_dim, n_tokens]
 
     // Combined input: tok_emb + audio_emb
     ggml_tensor * x = ggml_add(gctx, tok_emb, audio_emb); // [dec_dim, n_tokens]
@@ -2042,11 +2152,14 @@ static ggml_cgraph * build_decoder_step_graph(
     // Token embedding: [dec_dim, 1]
     ggml_tensor * tok_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, token_id); // [dec_dim, 1]
 
-    // Audio embedding from decoder_memory at audio_pos
-    ggml_tensor * audio_emb = ggml_view_2d(gctx, ctx->decoder_memory,
+    // Audio embedding at audio_pos: linear decoder_memory (batch/finish path) or
+    // the device-resident audio_emb_ring with modulo indexing (incremental decoder).
+    ggml_tensor * audio_src = ctx->dec_audio_src ? ctx->dec_audio_src : ctx->decoder_memory;
+    const int32_t audio_col = ctx->dec_audio_cap > 0 ? (audio_pos % ctx->dec_audio_cap) : audio_pos;
+    ggml_tensor * audio_emb = ggml_view_2d(gctx, audio_src,
         VOXTRAL_DEC_DIM, 1,
-        ctx->decoder_memory->nb[1],
-        (size_t)audio_pos * ctx->decoder_memory->nb[1]); // [dec_dim, 1]
+        audio_src->nb[1],
+        (size_t)audio_col * audio_src->nb[1]); // [dec_dim, 1]
 
     ggml_tensor * x = ggml_add(gctx, tok_emb, audio_emb); // [dec_dim, 1]
 
@@ -2808,6 +2921,35 @@ static void encoder_kv_free_ring(voxtral_encoder_kv_state * kv) {
 // Mel tail to cover [conv_mel_start, conv_mel_end). emit_col > 0 is the finish-tail
 // backward extension: frames [q_start, q_start+emit_col) were already emitted (their
 // K/V are re-written identically), so only the newer frames are appended.
+// Session 7: append the N newest encoder frames — already resident on device in
+// encoder_chunk_output[0, N) after the encoder graph — to the persistent
+// encoder-output ring at absolute columns [q_start, q_start+N) modulo capacity
+// (monotonic circular append; wraps into <=2 segments). A standalone device->device
+// copy graph: no D2H/H2D, and the delicate attention graph is left untouched. (The
+// ring lives in its own buffer, so clear_kv_cache never wipes it.)
+static bool copy_chunk_to_enc_out_ring(voxtral_context * ctx, int64_t q_start, int32_t N) {
+    if (!ctx->want_enc_out_ring || !ctx->enc_out_ring || N <= 0) return true;
+    const int32_t cap  = (int32_t) ctx->enc_out_ring->ne[1];
+    const size_t  scol = ctx->encoder_chunk_output->nb[1];
+    const size_t  dcol = ctx->enc_out_ring->nb[1];
+
+    static thread_local std::vector<uint8_t> meta_buf;
+    ggml_context * gctx = init_graph_ctx(meta_buf, 2);
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+    int32_t done = 0;
+    while (done < N) {
+        const int32_t slot = (int32_t) ((q_start + done) % cap);
+        const int32_t seg  = std::min(N - done, cap - slot);
+        ggml_tensor * src = ggml_view_2d(gctx, ctx->encoder_chunk_output, VOXTRAL_ENC_DIM, seg,
+                                         scol, (size_t) done * scol);
+        ggml_tensor * dst = ggml_view_2d(gctx, ctx->enc_out_ring, VOXTRAL_ENC_DIM, seg,
+                                         dcol, (size_t) slot * dcol);
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, src, dst));
+        done += seg;
+    }
+    return run_graph(ctx, ctx->sched_encoder, gctx, gf, [](ggml_cgraph *){}, "enc-out ring copy");
+}
+
 static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_enc_kv_plan_t & plan,
                                  int32_t emit_col = 0,
                                  int32_t physical_override = 0) {
@@ -2899,6 +3041,12 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
     ggml_backend_tensor_get(ctx->encoder_chunk_output, kv->enc_accum.data() + old,
                             (size_t) emit_col * VOXTRAL_ENC_DIM * sizeof(float),
                             (size_t) emit_n * VOXTRAL_ENC_DIM * sizeof(float));
+    // Session 7: mirror the same N frames into the device-resident encoder-output
+    // ring (device->device from encoder_chunk_output; emit_col is always 0).
+    if (!copy_chunk_to_enc_out_ring(ctx, plan.q_start, N)) {
+        LOG_ERR(ctx, "encoder KV: enc-out ring copy failed");
+        return false;
+    }
     const int64_t ready_ns = encoder_now_ns();
     if (kv->telemetry) {
         kv->compute_ms.push_back((double) (ready_ns - compute_start_ns) / 1e6);
@@ -3610,7 +3758,9 @@ static bool run_decoder_prefill(
         return false;
     }
 
-    ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    if (logits_out) {
+        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    }
     ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
 
     LOG_INFO(ctx, "decoder prefill done");
@@ -3656,6 +3806,82 @@ static bool run_decoder_step(
 
     ctx->kv_used += 1;
     return true;
+}
+
+// ============================================================================
+// Session 7: device-resident incremental adapter + decoder entry points.
+// These drive the SAME graphs as the batch/finish path (build_adapter_ring_graph,
+// build_decoder_prefill_graph, build_decoder_step_graph) but over the persistent
+// device rings, so during feed() the adapter and decoder advance without ever
+// copying encoder output or audio embeddings across the device boundary. Only a
+// 4-byte token id is read back per decoder step.
+// ============================================================================
+
+int32_t voxtral_ctx_adapter_commit(voxtral_context * ctx, int64_t group_start, int32_t n_groups) {
+    if (!ctx || !ctx->enc_out_ring || !ctx->audio_emb_ring || n_groups <= 0) return -1;
+    const int32_t enc_gcap = (int32_t) ctx->enc_out_ring->ne[1] / VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int32_t aemb_cap = (int32_t) ctx->audio_emb_ring->ne[1];
+    int32_t done = 0;
+    while (done < n_groups) {
+        const int64_t g      = group_start + done;
+        const int32_t enc_gs = (int32_t) (g % enc_gcap);   // group slot in the enc-output ring
+        const int32_t aemb_s = (int32_t) (g % aemb_cap);   // slot in the audio-embedding ring
+        // Longest run that wraps neither ring, so both graph views are contiguous.
+        const int32_t run = std::min(n_groups - done, std::min(enc_gcap - enc_gs, aemb_cap - aemb_s));
+
+        static thread_local std::vector<uint8_t> meta_buf;
+        ggml_context * gctx = init_graph_ctx(meta_buf, 2);
+        ggml_cgraph * gf = build_adapter_ring_graph(ctx, gctx,
+            enc_gs * VOXTRAL_DOWNSAMPLE_FACTOR, aemb_s, run);
+        if (!run_graph(ctx, ctx->sched_adapter, gctx, gf, [](ggml_cgraph *){}, "adapter commit")) {
+            return -1;
+        }
+        done += run;
+    }
+    return n_groups;
+}
+
+// Prepare the persistent decoder for an incremental stream: clear its KV cache and
+// route the realtime decoder graphs to read audio embeddings from audio_emb_ring.
+void voxtral_ctx_decoder_begin_incremental(voxtral_context * ctx) {
+    if (!ctx) return;
+    clear_kv_cache(ctx);
+    ctx->dec_audio_src = ctx->audio_emb_ring;
+    ctx->dec_audio_cap = VOXTRAL_AEMB_RING_CAP;
+}
+
+// One incremental decoder prefill over the prompt tokens (positions [0, n_tokens)).
+// Runs exactly once per stream; logits are not read back.
+bool voxtral_ctx_decoder_prefill_incremental(voxtral_context * ctx, const int32_t * token_ids, int32_t n_tokens) {
+    if (!ctx || n_tokens <= 0) return false;
+    return run_decoder_prefill(ctx, token_ids, n_tokens, /*logits_out=*/nullptr);
+}
+
+// One incremental decoder step at absolute `position`, reading the audio embedding
+// at audio_pos == position from audio_emb_ring. Returns the greedy argmax token in
+// *token_out via a 4-byte device readback; no full-logits copy.
+bool voxtral_ctx_decoder_step_incremental(voxtral_context * ctx, int32_t token_id, int32_t position, int32_t * token_out) {
+    if (!ctx) return false;
+    return run_decoder_step(ctx, token_id, position, /*audio_pos=*/position, /*logits_out=*/nullptr, token_out);
+}
+
+// Detach the incremental audio source (restores batch/finish behavior) and reset KV.
+void voxtral_ctx_decoder_reset_incremental(voxtral_context * ctx) {
+    if (!ctx) return;
+    ctx->dec_audio_src = nullptr;
+    ctx->dec_audio_cap = 0;
+    clear_kv_cache(ctx);
+}
+
+void voxtral_ctx_set_enc_out_ring_active(voxtral_context * ctx, bool active) {
+    if (ctx) ctx->want_enc_out_ring = active;
+}
+
+int32_t voxtral_ctx_enc_out_ring_frames(const voxtral_context * ctx) {
+    return (ctx && ctx->enc_out_ring) ? (int32_t) ctx->enc_out_ring->ne[1] : 0;
+}
+int32_t voxtral_ctx_aemb_ring_frames(const voxtral_context * ctx) {
+    return (ctx && ctx->audio_emb_ring) ? (int32_t) ctx->audio_emb_ring->ne[1] : 0;
 }
 
 // Offline prefill: prefix tokens + audio embeddings + suffix tokens in one graph.

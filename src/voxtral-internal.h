@@ -49,6 +49,45 @@ bool voxtral_encode_mel_batch_internal(
 int64_t voxtral_context_decoder_kv_bytes_internal(const voxtral_context * ctx);
 
 // ============================================================================
+// Session 7: device-resident incremental adapter + decoder. The encoder writes
+// its output into a persistent device ring (see voxtral.cpp); these entry points
+// let the streaming layer advance the adapter and decoder during feed() without
+// copying encoder output or audio embeddings across the device boundary. Only a
+// 4-byte token id is read back per decoder step. Not public.
+// ----------------------------------------------------------------------------
+
+// Run the adapter on-device over the complete groups [group_start, group_start+
+// n_groups) currently resident in the encoder-output ring, writing their audio
+// embeddings into the audio-embedding ring (splitting internally at ring wraps).
+// Returns n_groups on success, -1 on a backend failure. group == audio position.
+int32_t voxtral_ctx_adapter_commit(voxtral_context * ctx, int64_t group_start, int32_t n_groups);
+
+// Route the realtime decoder graphs to the audio-embedding ring and clear KV.
+void voxtral_ctx_decoder_begin_incremental(voxtral_context * ctx);
+// Prefill the prompt tokens once (positions [0, n_tokens)); no logits readback.
+bool voxtral_ctx_decoder_prefill_incremental(voxtral_context * ctx, const int32_t * token_ids, int32_t n_tokens);
+// One decoder step at absolute `position` (audio_pos == position). *token_out gets
+// the on-device greedy argmax token via a 4-byte readback.
+bool voxtral_ctx_decoder_step_incremental(voxtral_context * ctx, int32_t token_id, int32_t position, int32_t * token_out);
+// Detach the incremental audio source and reset KV (safe between streams).
+void voxtral_ctx_decoder_reset_incremental(voxtral_context * ctx);
+
+// Capacities (frames) of the device-resident rings, for the streaming scheduler's
+// backpressure math. Zero if the context has no rings.
+int32_t voxtral_ctx_enc_out_ring_frames(const voxtral_context * ctx);  // ENC_OUT_RING_CAP
+int32_t voxtral_ctx_aemb_ring_frames(const voxtral_context * ctx);     // AEMB_RING_CAP
+
+// Enable the per-batch encoder-output ring copy. Off by default so the finish-only
+// reference path does no extra work; the incremental stream turns it on before its
+// first feed so the adapter can read groups from the device ring.
+void voxtral_ctx_set_enc_out_ring_active(voxtral_context * ctx, bool active);
+
+// Read one token's raw UTF-8 byte piece (empty for specials / out-of-range), so the
+// streaming layer can build partial text incrementally with the same bytes the batch
+// detokenizer (decode_tokens) uses. Borrowed, valid for the model's lifetime.
+const std::string & voxtral_token_piece_internal(const voxtral_model * model, int32_t token_id);
+
+// ============================================================================
 // Incremental causal audio encoder (streaming). Production uses a per-layer
 // bounded KV ring and static logical/physical microbatch scheduling; the legacy
 // bounded-window recomputation strategy remains an explicit reference mode.

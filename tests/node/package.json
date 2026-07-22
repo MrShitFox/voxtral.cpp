@@ -19,6 +19,7 @@
     "acceptance:incremental-encoder": "node scripts/acceptance-incremental-encoder.js",
     "acceptance:encoder-kv": "node scripts/acceptance-encoder-kv.js",
     "acceptance:encoder-realtime": "node scripts/acceptance-encoder-realtime.js",
+    "acceptance:incremental-decoder": "node scripts/acceptance-incremental-decoder.js",
     "benchmark:encoder-scheduler": "node scripts/benchmark-encoder-scheduler.js",
     "test:encoder-kv-manual": "node scripts/test-encoder-kv-manual.js",
     "build:local": "node scripts/build-local.js",

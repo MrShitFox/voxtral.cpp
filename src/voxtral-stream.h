@@ -151,10 +151,19 @@ enum class voxtral_stream_event_type {
 
 struct voxtral_stream_event {
     voxtral_stream_event_type type   = voxtral_stream_event_type::final_text;
-    int32_t                   token  = 0;      // valid for token events (unused in v1)
-    std::string               text;            // owned copy
+    int32_t                   token  = 0;      // token id (token events)
+    std::string               text;            // owned copy (partial/final text)
     double                    t_audio_ms = 0.0;// audio position, derived from 64-bit count
     int32_t                   error_code = 0;  // voxtral_status value for error events
+
+    // Session 7 incremental streaming payload.
+    uint64_t sequence               = 0;   // token events: strictly monotonic id
+    int64_t  decoder_position       = 0;   // token events: absolute decoder position
+    int64_t  audio_end_sample       = 0;   // token/partial: real-audio end sample (>=0)
+    int64_t  emitted_at_monotonic_ns= 0;   // token events: steady_clock at emission
+    bool     special                = false;// token events: special/filtered token
+    uint64_t revision               = 0;   // partial_text events: monotonic revision
+    size_t   stable_prefix_bytes    = 0;   // partial_text events: never splits a UTF-8 codepoint
 };
 
 // ----------------------------------------------------------------------------
@@ -342,6 +351,34 @@ double voxtral_stream_first_mel_absolute_ms(const voxtral_stream * stream);
 // parity against voxtral_encode_mel_batch_internal.
 const float * voxtral_stream_encoder_output_data        (const voxtral_stream * stream);
 int32_t       voxtral_stream_encoder_output_frames_count (const voxtral_stream * stream);
+
+// ----------------------------------------------------------------------------
+// Session 7: device-resident incremental adapter + decoder introspection. For a
+// finish-only stream (VOXTRAL_STREAM_DECODER != "incremental") these are all zero
+// / false. `uses_incremental_decode` reports the active path. Adapter groups and
+// decoder positions each advance exactly once; the counters below prove no replay.
+// ----------------------------------------------------------------------------
+bool    voxtral_stream_uses_incremental_decode      (const voxtral_stream * stream);
+int64_t voxtral_stream_adapter_groups_committed     (const voxtral_stream * stream);
+int64_t voxtral_stream_adapter_commit_calls         (const voxtral_stream * stream);
+int64_t voxtral_stream_decoder_steps                (const voxtral_stream * stream);
+int64_t voxtral_stream_decoder_tokens_emitted       (const voxtral_stream * stream);
+int64_t voxtral_stream_decoder_position             (const voxtral_stream * stream);
+bool    voxtral_stream_decoder_prefill_complete      (const voxtral_stream * stream);
+int64_t voxtral_stream_tokens_before_finish         (const voxtral_stream * stream);
+int64_t voxtral_stream_tokens_flushed_at_finish     (const voxtral_stream * stream);
+// Latency markers relative to the stream timeline (ms; 0 until reached).
+double  voxtral_stream_first_adapter_commit_ms      (const voxtral_stream * stream);
+double  voxtral_stream_first_decoder_step_ms        (const voxtral_stream * stream);
+double  voxtral_stream_first_token_ms               (const voxtral_stream * stream);
+double  voxtral_stream_first_visible_text_ms        (const voxtral_stream * stream);
+// Device-traffic accounting for the adapter/decoder path (steady-state gates).
+int64_t voxtral_stream_adapter_input_d2h_bytes      (const voxtral_stream * stream);
+int64_t voxtral_stream_adapter_output_d2h_bytes     (const voxtral_stream * stream);
+int64_t voxtral_stream_logits_d2h_bytes             (const voxtral_stream * stream);
+int64_t voxtral_stream_token_id_d2h_bytes           (const voxtral_stream * stream);
+// The accumulated final transcript's stable partial-text revision count.
+uint64_t voxtral_stream_partial_text_revision       (const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
 // Events. poll copies and removes the front event, returning false when empty.
