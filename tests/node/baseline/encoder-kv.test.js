@@ -8,7 +8,8 @@
 //   * work ratio == 1 (no bounded-window replay); finish does no encoder replay;
 //   * ring rollover exercised (KvWraps > 0), KV window + Mel tail bounded;
 //   * bounded, duration-independent KV device memory;
-//   * per-feed latency (p95, warmup-excluded max);
+//   * encoder compute/residence latency and paced backlog (feed p95 alone is
+//     not a realtime signal once the low-latency graph runs inside feed());
 //   * the legacy chunked strategy is retained (VOXTRAL_ENCODER_STRATEGY=reference)
 //     and its long-stream divergence from the global result is measured (expected).
 //
@@ -80,7 +81,7 @@ describe.skipIf(!enabled).sequential("RX 6600 per-layer encoder KV-cache accepta
     // --- Long clip: rollover, bit-exact across plans, bounded, latency ----------
     const longWav = await putWav(config, "40s", silenceWav(40 * 16_000));  // ~2000 enc frames > CAP (wraps) and > 3000 Mel (multi-chunk batch)
     const longFull = await runStreamSession({ config, planName: "long-full", mode: "full", audioPath: longWav, maxTokens: 2, timeoutMs: 600_000 });
-    const long80 = await runStreamSession({ config, planName: "long-80ms", mode: "80ms", audioPath: longWav, maxTokens: 2, timeoutMs: 600_000 });
+    const long80 = await runStreamSession({ config, planName: "long-80ms", realtimeMs: 80, audioPath: longWav, maxTokens: 2, timeoutMs: 600_000 });
 
     for (const [name, r] of [["long-full", longFull], ["long-80ms", long80]]) {
       expect.soft(r.encoderMaxAbsDeltaVsBatch, `${name}: KV==global batch (rollover)`).toBeLessThanOrEqual(ENC_DELTA_GATE);
@@ -100,9 +101,14 @@ describe.skipIf(!enabled).sequential("RX 6600 per-layer encoder KV-cache accepta
     // Real streaming (80 ms) keeps only a bounded Mel tail, not the full history.
     expect.soft(long80.encoderMelPeakRetainedFrames, "Mel tail bounded (streaming)").toBeLessThan(300);
 
-    // Latency on the streaming (80 ms) plan.
-    expect.soft(long80.feedLatencyP95Ms, "p95 feed latency < 20 ms").toBeLessThan(20);
-    expect.soft(long80.feedLatencyWarmMaxMs, "warmup-excluded max feed latency < 80 ms").toBeLessThan(80);
+    // Realtime latency gates. The graph executes during feed by design, so
+    // feed() duration is reported diagnostically but is not the acceptance
+    // criterion; residence and warm graph compute are the relevant signals.
+    expect.soft(long80.encoderResidenceP95Ms, "encoder residence p95 < 160 ms").toBeLessThan(160);
+    expect.soft(long80.adapterGroupResidenceP95Ms, "adapter residence p95 < 160 ms").toBeLessThan(160);
+    expect.soft(long80.encoderComputeP95Ms, "encoder compute p95 < 80 ms").toBeLessThan(80);
+    expect.soft(long80.encoderComputeWarmMaxMs, "warmup-excluded compute max < 80 ms").toBeLessThan(80);
+    expect.soft(long80.finalBacklogMs, "final realtime backlog < 20 ms").toBeLessThan(20);
 
     // --- Legacy chunked strategy retained; its long divergence is measured ------
     const legacyShort = await runStreamSession({ config, planName: "legacy-short", mode: "80ms", audioPath: audio, maxTokens: 0, env: { VOXTRAL_ENCODER_STRATEGY: "reference" } });

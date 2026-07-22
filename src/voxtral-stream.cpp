@@ -1,8 +1,8 @@
 // ============================================================================
-// Internal streaming session skeleton (v1) — implementation.
+// Internal streaming session runtime — implementation.
 //
-// Compatibility path: full buffered execution at finish.
-// Will be replaced incrementally by Mel/encoder/decoder stages.
+// PCM/STFT/log-Mel and the causal per-layer-KV encoder run incrementally during
+// feed(). The adapter and decoder are the remaining finish-only stages.
 //
 // See src/voxtral-stream.h and docs/architecture/streaming-runtime.md.
 // ============================================================================
@@ -11,6 +11,7 @@
 #include "voxtral-internal.h"   // voxtral_transcribe_mel_internal (Mel -> text path)
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -199,6 +200,15 @@ struct voxtral_stream {
     uint64_t feed_calls             = 0;
     uint64_t inference_runs         = 0;
 
+    // Monotonic timeline for realtime residence/backlog telemetry. The stream
+    // stores only aggregate finish breakdowns; encoder frame histograms live in
+    // the opt-in per-layer collector.
+    int64_t timeline_start_ns       = 0;
+    double  finish_frontend_ms     = 0.0;
+    double  finish_encoder_ms      = 0.0;
+    double  finish_decoder_ms      = 0.0;
+    double  first_mel_absolute_ms  = 0.0;
+
     std::vector<int32_t> tokens;
     std::string          transcript;
 
@@ -230,6 +240,11 @@ double samples_to_ms(uint64_t samples, int32_t sample_rate) {
     if (sample_rate <= 0) return 0.0;
     // Derived on demand from the 64-bit count — no floating-point accumulation.
     return static_cast<double>(samples) * 1000.0 / static_cast<double>(sample_rate);
+}
+
+int64_t stream_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // Non-blocking reentrancy guard. On construction it tries to engage; if another
@@ -311,6 +326,7 @@ bool ensure_frontend(voxtral_stream * s) {
         set_error(s, voxtral_status::out_of_memory, "failed to create incremental Mel frontend");
         return false;
     }
+    voxtral_mel_frontend_set_retain_history(s->mel_fe, s->params.retain_mel_history);
     return true;
 }
 
@@ -355,16 +371,32 @@ bool drain_mel_to_encoder(voxtral_stream * s) {
     if (!s->enc || !s->mel_fe) return true;
     const int64_t total = voxtral_mel_frontend_frame_count(s->mel_fe);
     if (total <= s->enc_pushed_frames) return true;
-    const float * data = voxtral_mel_frontend_frames_data(s->mel_fe);
-    if (!data) return true;
-    const int64_t base = s->enc_pushed_frames;
-    const int32_t n    = (int32_t) (total - base);
-    const float * frames = data + (size_t) base * VOXTRAL_MEL_N_MEL;
-    if (!voxtral_encoder_stream_push_mel(s->enc, frames, base, n)) {
-        set_error(s, voxtral_status::backend_error, "incremental encoder rejected Mel frames");
+    int64_t base = s->enc_pushed_frames;
+    if (base < voxtral_mel_frontend_frames_base(s->mel_fe) || total < base) {
+        set_error(s, voxtral_status::backend_error, "incremental Mel history base advanced past encoder cursor");
         return false;
     }
-    s->enc_pushed_frames = total;
+    // Feed the encoder on a fixed absolute Mel cadence: eight Mel frames are
+    // exactly four encoder frames, i.e. one future adapter group. A one-shot
+    // feed and an 80/160 ms feed therefore expose identical graph-ready
+    // boundaries to the KV scheduler instead of letting caller chunk size alter
+    // how much future Mel happens to be resident when a graph starts.
+    constexpr int32_t kMelDrainSlice = 8;
+    while (base < total) {
+        const int32_t n = (int32_t) std::min<int64_t>(kMelDrainSlice, total - base);
+        const float * frames = voxtral_mel_frontend_frame_data(s->mel_fe, base);
+        if (!frames) {
+            set_error(s, voxtral_status::backend_error, "incremental Mel frame is outside retained window");
+            return false;
+        }
+        if (!voxtral_encoder_stream_push_mel(s->enc, frames, base, n)) {
+            set_error(s, voxtral_status::backend_error, "incremental encoder rejected Mel frames");
+            return false;
+        }
+        base += n;
+        s->enc_pushed_frames = base;
+        voxtral_mel_frontend_discard_before(s->mel_fe, base);
+    }
     return true;
 }
 
@@ -417,6 +449,12 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
         return voxtral_status::limit_exceeded;
     }
 
+    // The payload became available when this accepted feed entered the
+    // pipeline. Include frontend creation and PCM conversion in residence;
+    // timestamping after conversion would make the metric systematically low.
+    const int64_t arrival_ns = stream_now_ns();
+    if (s->timeline_start_ns == 0) s->timeline_start_ns = arrival_ns;
+
     // Lazily bring up the incremental Mel frontend (inference streams). Done
     // before any state mutation so a failure leaves the stream untouched.
     if (!ensure_frontend(s)) {
@@ -445,20 +483,37 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
         // Inference stream: stream samples through the incremental Mel frontend.
         // No full PCM is retained — only the frontend's bounded rolling tail.
         ensure_left_pad(s);
-        if (!voxtral_mel_frontend_feed(s->mel_fe, s->feed_scratch.data(), s->feed_scratch.size())) {
-            set_error(s, voxtral_status::backend_error, "incremental Mel frontend rejected feed");
-            s->feed_scratch.clear();
-            return voxtral_status::backend_error;
+        if (s->first_mel_absolute_ms == 0.0 && voxtral_mel_frontend_frame_count(s->mel_fe) > 0) {
+            s->first_mel_absolute_ms = (double) (stream_now_ns() - s->timeline_start_ns) / 1e6;
         }
-        // Drive the incremental causal encoder over the new stable Mel frames, so
-        // encoder output is produced during feed (not deferred to finish).
         if (!ensure_encoder(s)) {
             s->feed_scratch.clear();
             return s->last_status;
         }
-        if (!drain_mel_to_encoder(s)) {
-            s->feed_scratch.clear();
-            return voxtral_status::backend_error;
+        // Bound frontend/encoder transient state for a large compute-only feed;
+        // realtime callers normally enter this loop once (80/160 ms chunk).
+        constexpr size_t kAudioDrainSlice = 16'000;
+        for (size_t audio_off = 0; audio_off < s->feed_scratch.size(); audio_off += kAudioDrainSlice) {
+            const size_t audio_n = std::min(kAudioDrainSlice, s->feed_scratch.size() - audio_off);
+            if (!voxtral_mel_frontend_feed(s->mel_fe, s->feed_scratch.data() + audio_off, audio_n)) {
+                set_error(s, voxtral_status::backend_error, "incremental Mel frontend rejected feed");
+                s->feed_scratch.clear();
+                return voxtral_status::backend_error;
+            }
+            // Drive the incremental causal encoder over the newly-stable Mel
+            // frames, so output is produced during feed rather than finish().
+            voxtral_encoder_stream_note_audio(
+                s->enc,
+                (int64_t) (received + (uint64_t) count),
+                arrival_ns,
+                voxtral_mel_frontend_frame_count(s->mel_fe),
+                stream_now_ns(),
+                s->timeline_start_ns,
+                kStreamLeftPad);
+            if (!drain_mel_to_encoder(s)) {
+                s->feed_scratch.clear();
+                return voxtral_status::backend_error;
+            }
         }
     } else {
         // Lifecycle-only stream (no context): retain the full canonical PCM as
@@ -483,6 +538,14 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
 }
 
 } // namespace
+
+void voxtral_stream_set_timeline_start_internal(voxtral_stream * stream,
+                                                int64_t timeline_start_ns) {
+    if (!stream || timeline_start_ns <= 0) return;
+    // This is an internal/test seam. It is meaningful only before the first
+    // feed; a running stream keeps the original anchor for all later chunks.
+    if (stream->timeline_start_ns == 0) stream->timeline_start_ns = timeline_start_ns;
+}
 
 // ============================================================================
 // Params validation
@@ -650,6 +713,7 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
     voxtral_result result;
     bool ok = false;
     try {
+        const int64_t finish_front_start_ns = stream_now_ns();
         ensure_left_pad(stream);   // no-op if already injected during feed
         const int64_t n_raw     = (int64_t) stream->total_samples_received;
         const int64_t mult      = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
@@ -659,27 +723,41 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
         voxtral_mel_frontend_finish(stream->mel_fe);
         voxtral_mel_frontend_assemble_even(stream->mel_fe, stream->mel_even, stream->mel_even_frames);
         stream->full_pcm_buffered_at_finish = false;
+        stream->finish_frontend_ms = (double) (stream_now_ns() - finish_front_start_ns) / 1e6;
 
         if (!ensure_encoder(stream)) {
             throw std::runtime_error(stream->last_error);
         }
         if (stream->enc) {
             // Feed the finish-flushed Mel frames, then finalize the encoder.
+            voxtral_encoder_stream_note_audio(stream->enc,
+                                              (int64_t) stream->total_samples_received,
+                                              stream_now_ns(),
+                                              voxtral_mel_frontend_frame_count(stream->mel_fe),
+                                              stream_now_ns(),
+                                              stream->timeline_start_ns,
+                                              kStreamLeftPad);
+            const int64_t finish_encoder_start_ns = stream_now_ns();
             if (!drain_mel_to_encoder(stream)) {
                 throw std::runtime_error(stream->last_error);
             }
             if (!voxtral_encoder_stream_finish(stream->enc)) {
                 throw std::runtime_error("incremental encoder finish failed");
             }
+            stream->finish_encoder_ms = (double) (stream_now_ns() - finish_encoder_start_ns) / 1e6;
             const float * enc_out    = voxtral_encoder_stream_output(stream->enc);
             const int32_t enc_frames = voxtral_encoder_stream_output_frames(stream->enc);
+            const int64_t finish_decoder_start_ns = stream_now_ns();
             ok = voxtral_transcribe_encoder_output_internal(
                 *stream->ctx, enc_out, enc_frames, stream->params.max_tokens, result);
+            stream->finish_decoder_ms = (double) (stream_now_ns() - finish_decoder_start_ns) / 1e6;
         } else {
             // Defensive fallback (should not happen for inference streams): run the
             // shared Mel -> text path over the accumulated incremental Mel.
+            const int64_t finish_decoder_start_ns = stream_now_ns();
             ok = voxtral_transcribe_mel_internal(*stream->ctx, stream->mel_even.data(),
                                                  stream->mel_even_frames, stream->params.max_tokens, result);
+            stream->finish_decoder_ms = (double) (stream_now_ns() - finish_decoder_start_ns) / 1e6;
         }
         stream->inference_runs++;   // one execution per finish, success or failure
     } catch (const std::exception & e) {
@@ -737,6 +815,11 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     stream->total_samples_consumed = 0;
     stream->feed_calls             = 0;
     stream->inference_runs         = 0;
+    stream->timeline_start_ns      = 0;
+    stream->finish_frontend_ms    = 0.0;
+    stream->finish_encoder_ms     = 0.0;
+    stream->finish_decoder_ms     = 0.0;
+    stream->first_mel_absolute_ms = 0.0;
     stream->tokens.clear();
     stream->transcript.clear();
     stream->events.clear();
@@ -871,6 +954,9 @@ int64_t voxtral_stream_pcm_base_sample(const voxtral_stream * s) {
 bool voxtral_stream_full_pcm_buffered_at_finish(const voxtral_stream * s) {
     return s ? s->full_pcm_buffered_at_finish : false;
 }
+bool voxtral_stream_mel_history_retained(const voxtral_stream * s) {
+    return s && s->mel_fe ? (s->params.retain_mel_history && voxtral_mel_frontend_frames_base(s->mel_fe) == 0) : false;
+}
 const float * voxtral_stream_mel_data(const voxtral_stream * s) {
     return (s && !s->mel_even.empty()) ? s->mel_even.data() : nullptr;
 }
@@ -917,6 +1003,21 @@ int64_t voxtral_stream_encoder_output_accumulated_bytes(const voxtral_stream * s
 }
 voxtral_encoder_metrics voxtral_stream_encoder_metrics_full(const voxtral_stream * s) {
     return stream_encoder_metrics(s);
+}
+int64_t voxtral_stream_decoder_kv_allocated_bytes(const voxtral_stream * s) {
+    return s ? voxtral_context_decoder_kv_bytes_internal(s->ctx) : 0;
+}
+double voxtral_stream_finish_frontend_ms(const voxtral_stream * s) {
+    return s ? s->finish_frontend_ms : 0.0;
+}
+double voxtral_stream_finish_encoder_ms(const voxtral_stream * s) {
+    return s ? s->finish_encoder_ms : 0.0;
+}
+double voxtral_stream_finish_decoder_ms(const voxtral_stream * s) {
+    return s ? s->finish_decoder_ms : 0.0;
+}
+double voxtral_stream_first_mel_absolute_ms(const voxtral_stream * s) {
+    return s ? s->first_mel_absolute_ms : 0.0;
 }
 const float * voxtral_stream_encoder_output_data(const voxtral_stream * s) {
     return (s && s->enc) ? voxtral_encoder_stream_output(s->enc) : nullptr;

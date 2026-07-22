@@ -403,6 +403,90 @@ void test_memory_bounded() {
     CHECK(inc.raw.frames == n / HOP);
 }
 
+void test_bounded_mel_consumption_and_dependency() {
+    // Exact STFT dependency seam used by encoder residence telemetry.
+    CHECK(voxtral_mel_frame_required_sample(-1) == 0);
+    CHECK(voxtral_mel_frame_required_sample(0) == 200);  // reflected left edge
+    CHECK(voxtral_mel_frame_required_sample(1) == 359);
+    CHECK(voxtral_mel_frame_required_sample(2) == 519);
+
+    const std::vector<float> sig = sig_tone(10 * VOXTRAL_SAMPLE_RATE, 240.0f, 77u);
+    voxtral_mel_frontend * fe = voxtral_mel_frontend_create(g_hann.data(), g_filters.data());
+    CHECK(fe != nullptr);
+    voxtral_mel_frontend_set_retain_history(fe, false);
+    size_t off = 0;
+    while (off < sig.size()) {
+        const size_t take = std::min<size_t>(1280, sig.size() - off);
+        CHECK(voxtral_mel_frontend_feed(fe, sig.data() + off, take));
+        off += take;
+        const int64_t produced = voxtral_mel_frontend_frame_count(fe);
+        voxtral_mel_frontend_discard_before(fe, produced);
+        CHECK(voxtral_mel_frontend_frames_base(fe) == produced);
+        CHECK(voxtral_mel_frontend_frames_data(fe) == nullptr);
+    }
+    voxtral_mel_frontend_finish(fe);
+    const int64_t final_frames = voxtral_mel_frontend_frame_count(fe);
+    voxtral_mel_frontend_discard_before(fe, final_frames);
+    CHECK(voxtral_mel_frontend_frames_base(fe) == final_frames);
+    CHECK(voxtral_mel_frontend_frames_data(fe) == nullptr);
+    const voxtral_mel_metrics metrics = voxtral_mel_frontend_metrics(fe);
+    CHECK(metrics.frames_total == final_frames);
+    CHECK(metrics.dft_frames_computed == final_frames);
+    voxtral_mel_frontend_destroy(fe);
+}
+
+void test_bounded_mel_absolute_slice_cursor() {
+    // Regression for the streaming drain contract: after discard_before(),
+    // absolute frame indices must be resolved against the frontend's NEW base.
+    // A stale caller-side base used to return later Mel rows for one-shot feeds
+    // while retained-history parity mode accidentally hid the bug.
+    const std::vector<float> sig = sig_tone(3 * VOXTRAL_SAMPLE_RATE, 310.0f, 0x6202u);
+    const MelResult batch = run_batch(sig);
+    voxtral_mel_frontend * fe = voxtral_mel_frontend_create(g_hann.data(), g_filters.data());
+    CHECK(fe != nullptr);
+    voxtral_mel_frontend_set_retain_history(fe, false);
+
+    std::vector<float> drained;  // frame-major
+    int64_t cursor = 0;
+    auto drain = [&]() {
+        const int64_t total = voxtral_mel_frontend_frame_count(fe);
+        while (cursor < total) {
+            const int32_t n = (int32_t) std::min<int64_t>(8, total - cursor);
+            const float * frames = voxtral_mel_frontend_frame_data(fe, cursor);
+            CHECK(frames != nullptr);
+            if (!frames) return;
+            drained.insert(drained.end(), frames, frames + (size_t) n * N_MEL);
+            cursor += n;
+            voxtral_mel_frontend_discard_before(fe, cursor);
+            CHECK(voxtral_mel_frontend_frames_base(fe) == cursor);
+            CHECK(voxtral_mel_frontend_frame_data(fe, cursor - 1) == nullptr);
+        }
+    };
+
+    size_t off = 0;
+    while (off < sig.size()) {
+        const size_t take = std::min<size_t>(1280, sig.size() - off);
+        CHECK(voxtral_mel_frontend_feed(fe, sig.data() + off, take));
+        off += take;
+        drain();
+    }
+    voxtral_mel_frontend_finish(fe);
+    drain();
+    CHECK(cursor == batch.frames);
+    CHECK(drained.size() == (size_t) batch.frames * N_MEL);
+    bool exact = drained.size() == (size_t) batch.frames * N_MEL;
+    for (int32_t f = 0; exact && f < batch.frames; ++f) {
+        for (int32_t m = 0; m < N_MEL; ++m) {
+            if (drained[(size_t) f * N_MEL + m] != batch.mel[(size_t) m * batch.frames + f]) {
+                exact = false;
+                break;
+            }
+        }
+    }
+    CHECK(exact);
+    voxtral_mel_frontend_destroy(fe);
+}
+
 void test_soak_optional() {
     if (!std::getenv("VOXTRAL_MEL_SOAK")) {
         std::printf("[SKIP] soak (set VOXTRAL_MEL_SOAK=1 to enable)\n");
@@ -432,6 +516,8 @@ int main() {
         {"repeated_finish_reset",    test_repeated_finish_and_reset},
         {"frames_mostly_during_feed",test_frames_mostly_during_feed},
         {"memory_bounded",           test_memory_bounded},
+        {"bounded_mel_consumption",   test_bounded_mel_consumption_and_dependency},
+        {"bounded_mel_slice_cursor",  test_bounded_mel_absolute_slice_cursor},
         {"soak_optional",            test_soak_optional},
     };
 

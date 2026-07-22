@@ -97,6 +97,11 @@ void voxtral_mel_compute_batch(
 // Number of batch mel frames for a signal of `n_samples` (n_samples/hop, >= 0).
 int32_t voxtral_mel_batch_frame_count(int32_t n_samples);
 
+// Highest absolute PCM sample index read by Mel frame `frame` under the exact
+// reflect-padded frontend rule. This is the dependency seam used by realtime
+// encoder residence telemetry; it is not an approximation of the hop size.
+int64_t voxtral_mel_frame_required_sample(int64_t frame);
+
 // ============================================================================
 // Incremental Mel frontend.
 // ----------------------------------------------------------------------------
@@ -131,6 +136,11 @@ voxtral_mel_frontend * voxtral_mel_frontend_create(
     const float * hann_window,   // [n_fft]
     const float * mel_filters);  // [n_freq * n_mel]
 
+// Configure whether emitted Mel frames are retained for post-finish parity
+// inspection. When false, callers should discard consumed prefixes with
+// voxtral_mel_frontend_discard_before() to keep host memory bounded.
+void voxtral_mel_frontend_set_retain_history(voxtral_mel_frontend * fe, bool retain);
+
 void voxtral_mel_frontend_destroy(voxtral_mel_frontend * fe);
 
 // Return to the freshly-created state, retaining allocated capacity for reuse.
@@ -159,6 +169,12 @@ int64_t voxtral_mel_frontend_frame_count(const voxtral_mel_frontend * fe);
 // pointer is INVALIDATED by the next feed/finish/reset (the buffer may grow), so
 // consume it immediately. Returns nullptr when no frames exist yet.
 const float * voxtral_mel_frontend_frames_data(const voxtral_mel_frontend * fe);
+int64_t       voxtral_mel_frontend_frames_base(const voxtral_mel_frontend * fe);
+// Borrow one absolute frame from the currently retained window. Returns
+// nullptr when `frame` has already been discarded or is not produced yet.
+const float * voxtral_mel_frontend_frame_data(const voxtral_mel_frontend * fe,
+                                               int64_t frame);
+void          voxtral_mel_frontend_discard_before(voxtral_mel_frontend * fe, int64_t frame);
 
 // Assemble the accumulated frames into a channel-major [n_mel, n_frames] matrix.
 //   *_raw   : all produced frames, no even trim (parity reference).

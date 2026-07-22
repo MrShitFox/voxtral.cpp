@@ -28,7 +28,7 @@ async function commitSha(localRepo) {
   }
 }
 
-/** Create the standard five-file artifact bundle for one integration run. */
+/** Create the standard bundle plus optional redacted plain-text evidence files. */
 export async function writeArtifactBundle(options) {
   const config = options.config ?? loadEnvironment();
   const timestamp = options.timestamp ?? new Date().toISOString();
@@ -56,6 +56,12 @@ export async function writeArtifactBundle(options) {
   const command = sanitize(options.command ?? result.commandLine ?? "", secrets);
   const stdout = sanitize(options.stdout ?? result.stdout ?? "", secrets);
   const stderr = sanitize(options.stderr ?? result.stderr ?? "", secrets);
+  const textArtifacts = Object.entries(options.textArtifacts ?? {}).map(([name, contents]) => {
+    if (path.basename(name) !== name || !/\.(?:txt|csv)$/u.test(name)) {
+      throw new Error(`invalid text artifact name: ${name}`);
+    }
+    return writeFile(path.join(directory, name), `${sanitize(String(contents), secrets)}\n`);
+  });
 
   await Promise.all([
     writeFile(path.join(directory, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`),
@@ -63,6 +69,7 @@ export async function writeArtifactBundle(options) {
     writeFile(path.join(directory, "stdout.log"), stdout),
     writeFile(path.join(directory, "stderr.log"), stderr),
     writeFile(path.join(directory, "result.json"), `${JSON.stringify(result, null, 2)}\n`),
+    ...textArtifacts,
   ]);
   return { runId, directory, metadata };
 }

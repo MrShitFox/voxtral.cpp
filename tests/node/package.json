@@ -9,6 +9,8 @@
     "test:incremental-mel:gpu": "VOXTRAL_TEST_GPU=1 VOXTRAL_TEST_STREAM=1 vitest run baseline/incremental-mel.test.js",
     "test:incremental-encoder:gpu": "VOXTRAL_TEST_GPU=1 VOXTRAL_TEST_STREAM=1 vitest run baseline/incremental-encoder.test.js",
     "test:encoder-kv:gpu": "VOXTRAL_TEST_GPU=1 VOXTRAL_TEST_STREAM=1 vitest run baseline/encoder-kv.test.js",
+    "test:encoder-realtime:long": "VOXTRAL_TEST_GPU=1 VOXTRAL_TEST_STREAM=1 VOXTRAL_TEST_ENCODER_REALTIME=1 vitest run baseline/encoder-realtime.test.js",
+    "test:encoder-realtime:soak": "VOXTRAL_TEST_GPU=1 VOXTRAL_TEST_STREAM=1 VOXTRAL_TEST_ENCODER_REALTIME=1 VOXTRAL_REALTIME_SOAK=1 vitest run baseline/encoder-realtime.test.js",
     "test:environment": "VOXTRAL_TEST_REMOTE=1 vitest run acceptance/environment.test.js",
     "test:baseline": "npm run test:gpu",
     "acceptance:baseline": "node scripts/acceptance-baseline.js",
@@ -16,6 +18,9 @@
     "acceptance:incremental-mel": "node scripts/acceptance-incremental-mel.js",
     "acceptance:incremental-encoder": "node scripts/acceptance-incremental-encoder.js",
     "acceptance:encoder-kv": "node scripts/acceptance-encoder-kv.js",
+    "acceptance:encoder-realtime": "node scripts/acceptance-encoder-realtime.js",
+    "benchmark:encoder-scheduler": "node scripts/benchmark-encoder-scheduler.js",
+    "test:encoder-kv-manual": "node scripts/test-encoder-kv-manual.js",
     "build:local": "node scripts/build-local.js",
     "sync:gpu": "node scripts/sync-gpu.js",
     "build:gpu": "node scripts/build-gpu.js"

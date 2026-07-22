@@ -269,6 +269,8 @@ struct voxtral_mel_frontend {
 
     // Frame-major accumulated mel: frame f occupies [f*n_mel, (f+1)*n_mel).
     std::vector<float> mel_frames;
+    int64_t mel_base_frame = 0;
+    bool retain_history = true;
 };
 
 namespace {
@@ -311,7 +313,7 @@ void fill_window(const voxtral_mel_frontend * fe, int64_t f, int32_t N, float * 
 void compute_and_store_frame(voxtral_mel_frontend * fe, int64_t f, int32_t N) {
     float window[FE_N_FFT];
     fill_window(fe, f, N, window);
-    const size_t base = fe->mel_frames.size();   // == f * n_mel (frames appended in order)
+    const size_t base = fe->mel_frames.size();
     fe->mel_frames.resize(base + FE_N_MEL);
     voxtral_mel_frame_from_window(window, fe->hann, fe->filters, fe->mel_frames.data() + base);
     fe->dft_frames_computed++;
@@ -348,6 +350,10 @@ void compact(voxtral_mel_frontend * fe) {
 
 } // namespace
 
+int64_t voxtral_mel_frame_required_sample(int64_t frame) {
+    return frame < 0 ? 0 : frame_hi_index(frame);
+}
+
 voxtral_mel_frontend * voxtral_mel_frontend_create(const float * hann_window, const float * mel_filters) {
     if (!hann_window || !mel_filters) {
         return nullptr;
@@ -359,6 +365,16 @@ voxtral_mel_frontend * voxtral_mel_frontend_create(const float * hann_window, co
     fe->hann    = hann_window;
     fe->filters = mel_filters;
     return fe;
+}
+
+void voxtral_mel_frontend_set_retain_history(voxtral_mel_frontend * fe, bool retain) {
+    if (!fe) return;
+    fe->retain_history = retain;
+    if (!retain && fe->mel_base_frame > 0) {
+        // The caller owns the absolute base; retain no stale prefix when
+        // switching a reused frontend into bounded mode.
+        fe->mel_frames.clear();
+    }
 }
 
 void voxtral_mel_frontend_destroy(voxtral_mel_frontend * fe) {
@@ -377,6 +393,7 @@ void voxtral_mel_frontend_reset(voxtral_mel_frontend * fe) {
     fe->pcm_peak_retained   = 0;
     fe->finalized           = false;
     fe->mel_frames.clear();
+    fe->mel_base_frame      = 0;
     // Keep pcm / mel_frames capacity for cheap reuse (no shrink_to_fit).
 }
 
@@ -441,11 +458,46 @@ const float * voxtral_mel_frontend_frames_data(const voxtral_mel_frontend * fe) 
     return (fe && !fe->mel_frames.empty()) ? fe->mel_frames.data() : nullptr;
 }
 
+int64_t voxtral_mel_frontend_frames_base(const voxtral_mel_frontend * fe) {
+    return fe ? fe->mel_base_frame : 0;
+}
+
+const float * voxtral_mel_frontend_frame_data(const voxtral_mel_frontend * fe,
+                                               int64_t frame) {
+    if (!fe || frame < fe->mel_base_frame || frame >= fe->next_frame) return nullptr;
+    const int64_t rel = frame - fe->mel_base_frame;
+    const int64_t retained = (int64_t) (fe->mel_frames.size() / (size_t) FE_N_MEL);
+    if (rel < 0 || rel >= retained) return nullptr;
+    return fe->mel_frames.data() + (size_t) rel * FE_N_MEL;
+}
+
+void voxtral_mel_frontend_discard_before(voxtral_mel_frontend * fe, int64_t frame) {
+    if (!fe || fe->retain_history) return;
+    if (frame <= fe->mel_base_frame) return;
+    const int64_t available = (int64_t) (fe->mel_frames.size() / (size_t) FE_N_MEL);
+    const int64_t target = std::min(frame, fe->mel_base_frame + available);
+    const int64_t drop_frames = target - fe->mel_base_frame;
+    if (drop_frames <= 0) return;
+    const size_t drop = (size_t) drop_frames * FE_N_MEL;
+    if (drop >= fe->mel_frames.size()) {
+        fe->mel_frames.clear();
+    } else {
+        fe->mel_frames.erase(fe->mel_frames.begin(), fe->mel_frames.begin() + (std::ptrdiff_t) drop);
+    }
+    fe->mel_base_frame = target;
+    // Keep a small reusable capacity, never a duration-sized allocation.
+    if (fe->mel_frames.capacity() > fe->mel_frames.size() * 4 + (size_t) FE_N_MEL * 256) {
+        std::vector<float> compacted(fe->mel_frames.begin(), fe->mel_frames.end());
+        fe->mel_frames.swap(compacted);
+    }
+}
+
 void voxtral_mel_frontend_assemble_raw(const voxtral_mel_frontend * fe,
                                        std::vector<float> & out, int32_t & out_n_frames) {
     out.clear();
     out_n_frames = 0;
     if (!fe) return;
+    if (fe->mel_base_frame != 0) return;
     const int32_t n_frames = (int32_t) fe->next_frame;
     out_n_frames = n_frames;
     if (n_frames <= 0) return;
@@ -462,6 +514,7 @@ void voxtral_mel_frontend_assemble_even(const voxtral_mel_frontend * fe,
     out.clear();
     out_n_frames = 0;
     if (!fe) return;
+    if (fe->mel_base_frame != 0) return;
     const int32_t n_total = (int32_t) fe->next_frame;
     const bool drop_first = (n_total % 2 != 0);
     const int32_t n_out = drop_first ? (n_total - 1) : n_total;

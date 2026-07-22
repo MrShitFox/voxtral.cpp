@@ -45,13 +45,17 @@ bool voxtral_encode_mel_batch_internal(
     std::vector<float> & out_enc,
     int32_t            & out_frames);
 
+// Fixed decoder self-attention K/V allocation owned by one inference context.
+int64_t voxtral_context_decoder_kv_bytes_internal(const voxtral_context * ctx);
+
 // ============================================================================
-// Incremental causal audio encoder (streaming). Bounded-window recomputation that
-// replays the batch run_encoder_chunked schedule from stable Mel frames, sharing
-// the same transformer graph as the batch path. See voxtral.cpp and
-// docs/architecture/streaming-runtime.md. Not part of the public surface.
+// Incremental causal audio encoder (streaming). Production uses a per-layer
+// bounded KV ring and static logical/physical microbatch scheduling; the legacy
+// bounded-window recomputation strategy remains an explicit reference mode.
+// See voxtral.cpp and docs/architecture/streaming-runtime.md. Not public.
 // ============================================================================
 struct voxtral_encoder_stream;   // defined in voxtral.cpp
+struct voxtral_stream;           // defined in voxtral-stream.cpp
 
 struct voxtral_encoder_metrics {
     int64_t melFramesReceived            = 0;  // stable Mel frames pushed to the encoder
@@ -71,7 +75,7 @@ struct voxtral_encoder_metrics {
     bool    finalized                    = false;
 
     // ---- Strategy identity ------------------------------------------------
-    // "per-layer-kv" (Session 6.1 production default) or "bounded-window-recompute".
+    // "per-layer-kv" (Session 6.2 production default) or "bounded-window-recompute".
     const char * strategy                = "per-layer-kv";
 
     // ---- Per-layer KV-cache work instrumentation (Stage 16) --------------
@@ -97,6 +101,40 @@ struct voxtral_encoder_metrics {
     int64_t encoderMelPeakRetainedFrames    = 0;  // peak host Mel tail frames
     int64_t encoderOutputQueuedFrames       = 0;  // accumulated (not-yet-consumed) encoder output frames
     int64_t encoderOutputPeakQueuedFrames   = 0;  // peak accumulated encoder output frames
+
+    // Scheduler shape/work accounting. `logical` counts real frames submitted
+    // per graph; `physical` is the fixed transformer query-row shape (including
+    // masked dummy rows). These counters are intentionally separate so padding
+    // can never be mistaken for useful encoder work.
+    const char * encoderScheduler            = "static";
+    int32_t encoderLogicalBatchFrames        = 4;
+    int32_t encoderPhysicalQueryRows         = 32;
+    int64_t encoderLogicalFramesSubmitted    = 0;
+    int64_t encoderPhysicalQueryRowsEvaluated = 0;
+    int64_t encoderPaddingRowsEvaluated       = 0;
+    int32_t encoderWarmupFrames               = 0;
+
+    // Optional timing collector (enabled by VOXTRAL_ENCODER_TELEMETRY=1).
+    // Values are aggregate percentiles; no per-frame array crosses the API.
+    double encoderFirstFrameAbsoluteMs       = 0.0;
+    double encoderFirstFrameResidenceMs      = 0.0;
+    double encoderResidenceP50Ms             = 0.0;
+    double encoderResidenceP95Ms             = 0.0;
+    double encoderResidenceP99Ms             = 0.0;
+    double encoderResidenceMaxMs             = 0.0;
+    double firstAdapterGroupAbsoluteMs       = 0.0;
+    double firstAdapterGroupResidenceMs      = 0.0;
+    double firstEightFrameGroupAbsoluteMs    = 0.0;
+    double firstEightFrameGroupResidenceMs   = 0.0;
+    double adapterGroupResidenceP50Ms        = 0.0;
+    double adapterGroupResidenceP95Ms        = 0.0;
+    double adapterGroupResidenceP99Ms        = 0.0;
+    double adapterGroupResidenceMaxMs        = 0.0;
+    double encoderComputeP50Ms               = 0.0;
+    double encoderComputeP95Ms               = 0.0;
+    double encoderComputeP99Ms               = 0.0;
+    double encoderComputeMaxMs               = 0.0;
+    double encoderComputeWarmMaxMs           = 0.0;  // excludes first graph/shader warmup
 };
 
 // Encoder frames produced from `mel_frames` Mel frames through the conv stem
@@ -121,6 +159,8 @@ int32_t voxtral_enc_frames_for_mel_internal(int32_t mel_frames);
 int32_t voxtral_enc_kv_capacity_internal();   // VOXTRAL_ENC_KV_CAP
 int32_t voxtral_enc_kv_max_new_internal();    // VOXTRAL_ENC_KV_MAX_NEW
 int32_t voxtral_enc_kv_window_internal();     // VOXTRAL_ENC_WINDOW
+int32_t voxtral_enc_kv_logical_batch_internal();
+int32_t voxtral_enc_kv_physical_rows_internal();
 
 // One physical ring segment: `len` contiguous frames starting at ring slot `slot`.
 struct voxtral_enc_kv_seg { int32_t slot = 0; int32_t len = 0; };
@@ -180,6 +220,21 @@ void    voxtral_encoder_stream_reset  (voxtral_encoder_stream * es);
 // a contiguity violation or a backend failure.
 bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
                                      const float * frames, int64_t base_frame, int32_t n);
+
+// Attach the wall-clock/audio timeline used by the optional residence collector.
+// `sample_count` is the number of real PCM samples available at this feed;
+// `arrival_ns` is the monotonic time at which that payload became available.
+void voxtral_encoder_stream_note_audio(voxtral_encoder_stream * es,
+                                        int64_t sample_count, int64_t arrival_ns,
+                                        int64_t mel_frames_ready, int64_t mel_ready_ns,
+                                        int64_t timeline_start_ns,
+                                        int64_t left_pad_samples);
+
+// Test/instrumentation seam: anchor the stream's monotonic timeline before the
+// first paced feed. Production callers leave this unset and the stream starts
+// its timeline at the first payload arrival.
+void voxtral_stream_set_timeline_start_internal(voxtral_stream * stream,
+                                                int64_t timeline_start_ns);
 
 // Run the last (incomplete) chunk exactly as the batch tail. Idempotent.
 bool voxtral_encoder_stream_finish(voxtral_encoder_stream * es);

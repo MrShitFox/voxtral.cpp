@@ -1,9 +1,9 @@
 # Node.js acceptance harness
 
-This directory is the reproducible acceptance layer for the current batch CLI and the future
-incremental runtime. It does not implement or simulate streaming inference. The base
-`StreamingTransport` deliberately throws `Not implemented`; concrete stdio and WebSocket
-transports belong to later runtime/API sessions.
+This directory is the reproducible acceptance layer for the batch CLI and the incremental Mel /
+per-layer encoder-KV runtime. The scheduler harness drives one native process per
+case; that process owns PCM pacing and no SSH round-trip occurs per chunk. Adapter/decoder
+streaming and network transports remain future runtime/API work.
 
 ## Commands
 
@@ -16,6 +16,9 @@ npm test
 npm run test:environment
 npm run test:gpu
 npm run acceptance:baseline
+npm run benchmark:encoder-scheduler
+npm run acceptance:encoder-realtime
+npm run test:encoder-kv-manual
 ```
 
 The first two commands are local and deterministic. `npm test` discovers the whole suite but
@@ -24,6 +27,30 @@ remote suites remain skipped unless their explicit scripts set the opt-in enviro
 `test:gpu` ensures the remote Vulkan build is current and runs the short 3.58-second fixture.
 `acceptance:baseline` runs environment, unit tests, local build, source-only rsync, remote build
 and GPU inference sequentially, then writes a summary artifact.
+
+`benchmark:encoder-scheduler` performs the staged logical/physical matrix
+(1/2/4/8/16/32/64/128 against every 32/64/128 shape it fits), a deterministic synthetic soak
+and the optional two-minute spoken fixture. Set
+`VOXTRAL_LONG_AUDIO` to the private M4A to enable the spoken stage. The fixture is transferred
+to `/root/voxtral-test-data` separately, normalized once, and never enters source rsync or Git.
+The helper compares local, transferred and normalized source SHA-256 values before any run.
+`acceptance:encoder-realtime` gates the selected 4/32 default against 128/128 on short plans and,
+when the fixture is available, 80/160/480 ms plus seeded-random paced long-form input. Every
+long plan decodes the complete token sequence/transcript, and the compute run also executes the
+independent global-batch encoder tensor oracle. `test:encoder-kv-manual` is an opt-in fused-flash
+versus explicit-manual-attention oracle with full token/text and pure-mode runtime comparison.
+
+For optional long-form regression tests:
+
+```bash
+VOXTRAL_LONG_AUDIO=/home/glebus/Desktop/Code/cppShit/voxtral.cpp/voxTest2min.m4a \
+npm run test:encoder-realtime:long
+npm run test:encoder-realtime:soak
+```
+
+Set `VOXTRAL_ENCODER_TRACE_JSONL=/absolute/path/trace.jsonl` in a native harness environment to
+capture compact per-frame dependency and residence timestamps. Ordinary JSON remains aggregate
+and does not contain a large timestamp array.
 
 Individual orchestration commands are also available:
 
@@ -50,7 +77,8 @@ secret out of argv. Source synchronization rejects every destructive destination
   ffmpeg normalization and raw PCM extraction. Streaming input is strictly mono 16 kHz PCM16 LE.
 - `helpers/chunks.js`: deterministic sample-based plans for full, 80/160/320/480/1000 ms,
   single-sample, seeded-random and custom sizes, including explicit zero-length feed events.
-- `helpers/artifacts.js`: unique run directories with metadata, command, stdout, stderr and result.
+- `helpers/artifacts.js`: unique run directories with metadata, command, stdout, stderr and result;
+  scheduler runs can add a redacted CSV summary, transcript and approximate token-boundary map.
 - `helpers/inference.js`: structured transcript, backend/device evidence and timing extraction for
   the existing batch CLI. The CLI has useful summaries but no stable machine-readable result mode;
   a JSON/event mode remains desirable for the future streaming CLI.

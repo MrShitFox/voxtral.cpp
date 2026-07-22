@@ -2,12 +2,11 @@
 #define VOXTRAL_STREAM_H
 
 // ============================================================================
-// Internal streaming session skeleton (v1)
+// Internal streaming session runtime (v2)
 // ----------------------------------------------------------------------------
 // This header is INTERNAL and UNSTABLE. It is intentionally not part of the
-// public C++ surface in include/voxtral.h. The public streaming C ABI, the
-// WebSocket server and the incremental Mel/encoder/decoder frontends are all
-// deliberately out of scope for this session (see
+// public C++ surface in include/voxtral.h. The public streaming C ABI and the
+// WebSocket server remain out of scope for this session (see
 // docs/architecture/streaming-runtime.md, "Implementation status").
 //
 // What this layer provides today:
@@ -18,12 +17,14 @@
 //   * incremental PCM16 / float32 feeding with 64-bit sample accounting;
 //   * a strictly bounded internal event queue (lifecycle + error events);
 //   * finish/reset/cancel/destroy;
-//   * a TEMPORARY compatibility execution path: at finish() the accumulated
-//     audio is transcribed once through the existing batch inference
-//     (`voxtral_transcribe_audio`). No token is produced before finish().
+//   * an incremental Mel frontend and per-layer encoder KV scheduler driven by
+//     feed() (production default logical=4 / physical=32);
+//   * finish-only adapter/decoder execution over the accumulated encoder output.
+//     No TOKEN or PARTIAL_TEXT event is produced before finish().
 //
-// This is NOT real-time streaming inference. Audio is fully buffered and the
-// model runs exactly once, at finish().
+// The encoder path is low-latency realtime-capable and does not retain full PCM.
+// End-to-end token/partial-text streaming is intentionally still deferred: the
+// adapter and decoder run synchronously at finish().
 //
 // ----------------------------------------------------------------------------
 // Ownership model (v1)
@@ -115,7 +116,7 @@ enum class voxtral_status {
 // (*)   A feed carrying >=1 sample moves created -> running. A zero-length feed
 //       is a successful no-op and does NOT change state or audio position.
 // (**)  `finishing` is a transient state entered only for the duration of the
-//       synchronous compatibility inference. Because the API is externally
+//       synchronous final adapter/decoder inference. Because the API is externally
 //       serialized, the ONLY way another call can observe `finishing` is a
 //       reentrant call from within finish() (e.g. a callback). The reentrancy
 //       guard rejects such calls with `busy` before the state machine runs, so
@@ -136,7 +137,7 @@ enum class voxtral_stream_state {
 
 // ----------------------------------------------------------------------------
 // Internal event queue. token/partial_text are reserved for the future
-// incremental decoder and are never emitted by the v1 compatibility path.
+// incremental decoder and are never emitted by the current finish-only path.
 // Every event owns its text (no dangling const char *).
 // ----------------------------------------------------------------------------
 enum class voxtral_stream_event_type {
@@ -165,12 +166,16 @@ struct voxtral_stream_params {
     int32_t  sample_rate = VOXTRAL_SAMPLE_RATE;   // must equal 16000
     int32_t  channels    = 1;                      // must equal 1
     int32_t  max_tokens  = 0;                       // 0 = decode whole buffer
-    // Bounded PCM accumulation. This is a TEMPORARY v1 compatibility limit, not
-    // a final public contract: it keeps the full-buffer finish safely below the
+    // Bounded utterance limit retained for the finish-only decoder. This is an
+    // internal compatibility guard, not a public streaming contract: it keeps
+    // the final decode safely below the
     // decoder KV window so it never reaches the (Vulkan-unsafe) kv_cache_shift_left
     // path. 9.6M samples = 10 minutes @ 16 kHz. Exceeding it returns
     // voxtral_status::limit_exceeded (NOT out_of_memory).
     uint64_t max_total_samples = 9'600'000ull;
+    // Keep complete Mel history only for tensor-parity/debug inspection.
+    // Production realtime streams consume and discard stable frames promptly.
+    bool retain_mel_history = false;
 };
 
 struct voxtral_stream;  // defined in voxtral-stream.cpp
@@ -221,8 +226,9 @@ voxtral_status voxtral_stream_feed_pcm16_internal(
 voxtral_status voxtral_stream_feed_f32_internal(
     voxtral_stream * stream, const float * samples, size_t sample_count);
 
-// Run the compatibility batch inference once over the accumulated audio and emit
-// FINAL_TEXT + COMPLETED. Idempotent after completion (never re-runs inference).
+// Flush the remaining Mel/encoder frames, then run the finish-only adapter and
+// decoder once and emit FINAL_TEXT + COMPLETED. Idempotent after completion
+// (never re-runs the encoder prefix).
 // Synchronous; see the threading contract.
 voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream);
 
@@ -245,7 +251,7 @@ voxtral_status voxtral_stream_cancel_internal(voxtral_stream * stream);
 void voxtral_stream_destroy_internal(voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
-// Introspection (read-only; for tests and the temporary compatibility harness).
+// Introspection (read-only; for tests and the internal realtime harness).
 // ----------------------------------------------------------------------------
 voxtral_stream_state voxtral_stream_get_state       (const voxtral_stream * stream);
 voxtral_status       voxtral_stream_last_status      (const voxtral_stream * stream);
@@ -293,6 +299,7 @@ int64_t     voxtral_stream_pcm_base_sample             (const voxtral_stream * s
 // True iff the whole PCM was still buffered when finish() ran (always false for
 // inference streams; the incremental frontend only keeps a bounded tail).
 bool        voxtral_stream_full_pcm_buffered_at_finish (const voxtral_stream * stream);
+bool        voxtral_stream_mel_history_retained        (const voxtral_stream * stream);
 
 // Assembled even-trimmed Mel matrix [n_mel, n_frames], channel-major, produced by
 // finish() (empty / nullptr before finish or for lifecycle-only streams). Borrowed;
@@ -302,8 +309,8 @@ int32_t       voxtral_stream_mel_data_frames(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
 // Incremental causal encoder introspection. For inference streams these track the
-// true incremental encoder state (bounded-window recomputation replaying the batch
-// chunk schedule); zero / false for lifecycle-only streams. See
+// production per-layer KV scheduler (or the opt-in bounded-recompute reference);
+// zero / false for lifecycle-only streams. See
 // docs/architecture/streaming-runtime.md.
 // ----------------------------------------------------------------------------
 bool    voxtral_stream_uses_incremental_encoder        (const voxtral_stream * stream);
@@ -323,6 +330,11 @@ int64_t voxtral_stream_encoder_output_accumulated_bytes(const voxtral_stream * s
 // instrumentation, or the reference bounded-window fields). For lifecycle-only
 // streams every field is zero / default. See voxtral_encoder_metrics.
 voxtral_encoder_metrics voxtral_stream_encoder_metrics_full(const voxtral_stream * stream);
+int64_t voxtral_stream_decoder_kv_allocated_bytes(const voxtral_stream * stream);
+double voxtral_stream_finish_frontend_ms(const voxtral_stream * stream);
+double voxtral_stream_finish_encoder_ms (const voxtral_stream * stream);
+double voxtral_stream_finish_decoder_ms (const voxtral_stream * stream);
+double voxtral_stream_first_mel_absolute_ms(const voxtral_stream * stream);
 
 // Accumulated encoder output [enc_dim, frames], channel-major (borrowed; valid
 // until the next feed/finish/reset/destroy). The incremental counterpart of the

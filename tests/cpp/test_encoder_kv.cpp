@@ -33,6 +33,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 static int g_checks   = 0;
@@ -145,6 +147,35 @@ void test_metadata() {
     CHECK(MAXNEW >= 1);
     CHECK(CAP == WIN + MAXNEW);
     CHECK(CAP - WIN == MAXNEW);   // exactly max_new frames of headroom
+}
+
+void test_scheduler_configuration() {
+    const char * names[] = {
+        "VOXTRAL_ENC_KV_MODE", "VOXTRAL_ENC_KV_GRID",
+        "VOXTRAL_ENC_KV_LOGICAL_BATCH", "VOXTRAL_ENC_KV_PHYSICAL_ROWS",
+    };
+    struct Saved { std::string name; bool set; std::string value; };
+    std::vector<Saved> saved;
+    for (const char * name : names) {
+        const char * value = std::getenv(name);
+        saved.push_back({name, value != nullptr, value ? value : ""});
+        unsetenv(name);
+    }
+
+    CHECK(voxtral_enc_kv_logical_batch_internal() == 4);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 32);
+    setenv("VOXTRAL_ENC_KV_LOGICAL_BATCH", "8", 1);
+    setenv("VOXTRAL_ENC_KV_PHYSICAL_ROWS", "64", 1);
+    CHECK(voxtral_enc_kv_logical_batch_internal() == 8);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 64);
+    setenv("VOXTRAL_ENC_KV_MODE", "throughput", 1);
+    CHECK(voxtral_enc_kv_logical_batch_internal() == 128);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 128);
+
+    for (const auto & item : saved) {
+        if (item.set) setenv(item.name.c_str(), item.value.c_str(), 1);
+        else unsetenv(item.name.c_str());
+    }
 }
 
 void test_overflow_guards() {
@@ -311,6 +342,7 @@ void test_batch_segmentation() {
 
 int main() {
     test_metadata();
+    test_scheduler_configuration();
     test_overflow_guards();
     test_first_batch();
     test_multi_frame_and_steady_state();

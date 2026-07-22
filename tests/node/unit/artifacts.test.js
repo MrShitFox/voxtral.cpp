@@ -21,9 +21,10 @@ describe("artifact collection", () => {
       testName: "artifact unit",
       command: "sshpass -e ssh root@gpu true",
       result: { exitCode: 0, wallMs: 12, password: "artifact-secret", stdout: "ok", stderr: "" },
+      textArtifacts: { "transcript.txt": "hello artifact-secret" },
     });
     expect(await readdir(bundle.directory)).toEqual([
-      "command.txt", "metadata.json", "result.json", "stderr.log", "stdout.log",
+      "command.txt", "metadata.json", "result.json", "stderr.log", "stdout.log", "transcript.txt",
     ]);
     const all = (await Promise.all((await readdir(bundle.directory)).map((name) => readFile(path.join(bundle.directory, name), "utf8")))).join("\n");
     expect(all).not.toContain("artifact-secret");
