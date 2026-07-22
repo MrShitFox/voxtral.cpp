@@ -173,6 +173,14 @@ if(BUILD_TESTING)
     target_include_directories(voxtral_encoder_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_encoder_unit COMMAND voxtral_encoder_unit)
 
+    # Model-free ring-planner tests for the per-layer encoder KV-cache (append,
+    # wrap, eviction, causal-window mask, absolute positions across rollover, conv
+    # window alignment). End-to-end tensor parity is proven by the GPU suite.
+    add_executable(voxtral_encoder_kv_unit tests/cpp/test_encoder_kv.cpp)
+    target_link_libraries(voxtral_encoder_kv_unit PRIVATE voxtral_lib)
+    target_include_directories(voxtral_encoder_kv_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME voxtral_encoder_kv_unit COMMAND voxtral_encoder_kv_unit)
+
     # Model-driven harness used by the Node.js acceptance suite. Not a CLI/server.
     add_executable(voxtral-stream-test tests/cpp/voxtral_stream_test.cpp)
     target_link_libraries(voxtral-stream-test PRIVATE voxtral_lib)

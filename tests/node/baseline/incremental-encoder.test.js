@@ -92,13 +92,19 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental causal encoder accepta
       expect.soft(result.finishStatus, `${spec}: finishStatus`).toBe("ok");
       expect.soft(result.inferenceRuns, `${spec}: inference runs once`).toBe(1);
 
-      // The encoder is genuinely incremental.
+      // The encoder is the per-layer KV-cache (Session 6.1 production default).
       expect.soft(result.incrementalEncoder, `${spec}: incremental encoder`).toBe(true);
-      expect.soft(result.encoderStrategy, `${spec}: strategy`).toBe("bounded-window-recompute");
+      expect.soft(result.encoderStrategy, `${spec}: strategy`).toBe("per-layer-kv");
 
-      // Numerical parity of the incremental encoder output against the batch encoder.
+      // Numerical parity of the KV encoder output against the global batch encoder
+      // (both are the artifact-free global sliding-window; bit-exact by construction).
       expect.soft(result.encoderMaxAbsDeltaVsBatch, `${spec}: encoder delta vs batch`)
         .toBeLessThanOrEqual(ENC_DELTA_GATE);
+
+      // Each enc frame runs the transformer exactly once (no bounded-window replay).
+      expect.soft(result.encoderWorkRatio, `${spec}: work ratio ~1`).toBeLessThanOrEqual(1.1);
+      expect.soft(result.encoderTransformerFramesComputed, `${spec}: transformer frames == unique`)
+        .toBe(result.encoderUniqueFrames);
 
       // New encoder frames are produced DURING feed (not deferred to finish), and
       // the split adds up with no lost/duplicated frame.
@@ -108,14 +114,14 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental causal encoder accepta
         `${spec}: frame split adds up`,
       ).toBe(result.encoderFrames);
 
-      // finish() never re-encodes the whole Mel; it runs at most the last 1-2 chunks.
+      // finish() never re-encodes the whole Mel; it runs only the final flush frames.
       expect.soft(result.fullMelReencodedAtFinish, `${spec}: no full re-encode at finish`).toBe(false);
 
-      // Bounded encoder context: never exceeds one architectural chunk, and the Mel
-      // window is released at finish.
-      expect.soft(result.encoderPeakContextFrames, `${spec}: peak context bounded`).toBeLessThanOrEqual(CHUNK_MEL);
-      expect.soft(result.encoderMaxWindowFrames, `${spec}: max window bounded`).toBeLessThanOrEqual(CHUNK_MEL);
-      expect.soft(result.encoderContextFramesRetained, `${spec}: context released at finish`).toBe(0);
+      // Bounded encoder state: the KV cache window is capped at the architectural
+      // window and the Mel tail is released at finish.
+      expect.soft(result.encoderKvLogicalFrames, `${spec}: KV window bounded`).toBeLessThanOrEqual(750);
+      expect.soft(result.encoderKvCapacityFrames, `${spec}: KV capacity`).toBe(878);
+      expect.soft(result.encoderContextFramesRetained, `${spec}: Mel tail released at finish`).toBe(0);
 
       // Exactly one FINAL_TEXT followed by one COMPLETED.
       expect.soft(result.events.map((e) => e.type), `${spec}: events`).toEqual(["final_text", "completed"]);
@@ -197,10 +203,12 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental causal encoder accepta
 
       expect.soft(result.state, `${sec}s: state`).toBe("completed");
       expect.soft(result.encoderMaxAbsDeltaVsBatch, `${sec}s: delta`).toBeLessThanOrEqual(ENC_DELTA_GATE);
-      // Bounded context: one architectural chunk plus at most a single feed's
-      // newly-stable frames that land before the next compaction (transient-then-
-      // compact, like the Mel frontend). Bounded and independent of duration.
-      expect.soft(result.encoderPeakContextFrames, `${sec}s: bounded context`).toBeLessThan(CHUNK_MEL + 1500);
+      // Bounded Mel retention: the KV encoder keeps only a small Mel tail for the conv
+      // stem (one feed's newly-stable frames, transient-then-trim). Bounded and
+      // independent of stream duration.
+      expect.soft(result.encoderPeakContextFrames, `${sec}s: bounded Mel tail`).toBeLessThan(CHUNK_MEL);
+      // The KV cache window itself never exceeds the architectural window.
+      expect.soft(result.encoderKvLogicalFrames, `${sec}s: KV window bounded`).toBeLessThanOrEqual(750);
 
       const workRatio = result.encoderInputFramesProcessed / Math.max(1, result.melFrames);
       points.push({
@@ -220,13 +228,14 @@ describe.skipIf(!enabled).sequential("RX 6600 incremental causal encoder accepta
     for (const p of points) {
       expect.soft(p.workRatio, `${p.seconds}s: work ratio bounded`).toBeLessThan(8);
     }
-    // (b) Does not grow with duration: the chunk-0 recompute is a one-time bounded
-    // transient, so the longer streams amortize DOWN (2 min ratio <= 30 s ratio).
+    // (b) Does not grow with duration: each enc frame runs the transformer exactly
+    // once, so the marginal work per Mel is constant (work ratio flat, not growing).
     const p30 = points.find((p) => p.seconds === 30);
     const p120 = points.find((p) => p.seconds === 120);
     expect(p120.workRatio).toBeLessThanOrEqual(p30.workRatio + 0.01);
-    // (c) Retained context is bounded and does NOT grow with duration.
-    expect(p120.encoderPeakContextFrames).toBeLessThanOrEqual(p30.encoderPeakContextFrames);
+    // (c) Retained Mel is bounded by a duration-independent constant (a per-feed
+    // transient), not O(duration) — the 5 s..2 min peaks are all in the same band.
+    for (const p of points) expect(p.encoderPeakContextFrames).toBeLessThan(300);
 
     const artifact = await writeArtifactBundle({
       config,

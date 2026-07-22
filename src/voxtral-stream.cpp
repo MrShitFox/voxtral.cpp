@@ -915,6 +915,9 @@ int64_t voxtral_stream_encoder_state_bytes(const voxtral_stream * s) {
 int64_t voxtral_stream_encoder_output_accumulated_bytes(const voxtral_stream * s) {
     return stream_encoder_metrics(s).encoderOutputAccumulatedBytes;
 }
+voxtral_encoder_metrics voxtral_stream_encoder_metrics_full(const voxtral_stream * s) {
+    return stream_encoder_metrics(s);
+}
 const float * voxtral_stream_encoder_output_data(const voxtral_stream * s) {
     return (s && s->enc) ? voxtral_encoder_stream_output(s->enc) : nullptr;
 }

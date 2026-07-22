@@ -70,6 +70,7 @@
 #include "voxtral.h"   // public API: voxtral_model, voxtral_context, voxtral_context_params,
                         // voxtral_init_from_model, voxtral_free, voxtral_transcribe_audio, constants
 #include "voxtral-mel.h"  // incremental Mel frontend + voxtral_mel_metrics
+#include "voxtral-internal.h"  // voxtral_encoder_metrics (full encoder KV / reference metrics)
 
 #include <cstddef>
 #include <cstdint>
@@ -317,6 +318,11 @@ int64_t voxtral_stream_encoder_peak_context_frames     (const voxtral_stream * s
 int64_t voxtral_stream_encoder_context_frames_retained (const voxtral_stream * stream);
 int64_t voxtral_stream_encoder_state_bytes             (const voxtral_stream * stream);
 int64_t voxtral_stream_encoder_output_accumulated_bytes(const voxtral_stream * stream);
+
+// Full encoder metrics (strategy identity + per-layer KV work/memory
+// instrumentation, or the reference bounded-window fields). For lifecycle-only
+// streams every field is zero / default. See voxtral_encoder_metrics.
+voxtral_encoder_metrics voxtral_stream_encoder_metrics_full(const voxtral_stream * stream);
 
 // Accumulated encoder output [enc_dim, frames], channel-major (borrowed; valid
 // until the next feed/finish/reset/destroy). The incremental counterpart of the

@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <numeric>
@@ -27,6 +28,25 @@
 static constexpr int32_t VOXTRAL_ENC_CHUNK_MEL     = 3000;  // mel frames per encoder chunk
 static constexpr int32_t VOXTRAL_ENC_CHUNK_OVERLAP  = 750;  // overlap in encoder-token space (= window)
 static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens per single chunk
+
+// Per-layer encoder KV-cache (Session 6.1). MAX_NEW is the grid-aligned batch size:
+// enc frames are always run through the transformer in fixed batches starting at
+// multiples of MAX_NEW, so a given frame's causal-window shape is independent of the
+// feed-chunk plan (the key to feed-plan-invariant, bit-exact output). It also bounds
+// the per-execution work, trading streaming latency (smaller = smoother) against
+// graph-launch overhead (larger = fewer launches). The ring capacity is window +
+// MAX_NEW so a whole batch's causal window fits contiguously and a batch's K/V write
+// never clobbers a still-live window frame (see voxtral_enc_kv_plan). K/V are F32.
+static constexpr int32_t VOXTRAL_ENC_KV_MAX_NEW = 128;
+static constexpr int32_t VOXTRAL_ENC_KV_CAP     = VOXTRAL_ENC_WINDOW + VOXTRAL_ENC_KV_MAX_NEW; // 878
+// Flash-attention query-row floor: the last grid batch of a stream can be small
+// (utterance length mod MAX_NEW). The Vulkan flash kernel picks a different variant
+// at very small query counts, so the query dimension is padded up to this floor
+// (extra rows attend-all and are sliced off). Grid-aligned batching already makes
+// that variant choice identical for the streaming and batch encoders, so this only
+// affects the sub-floor absolute quality, not feed-plan invariance. Unused by the
+// non-fused (VOXTRAL_ENC_KV_MANUAL) attention path.
+static constexpr int32_t VOXTRAL_ENC_KV_ATTN_MIN_ROWS = 32;
 
 // ============================================================================
 // Logging helper
@@ -958,7 +978,10 @@ voxtral_context * voxtral_init_from_model(
     backends[n_backends++] = cpu_be;
     const bool op_offload = has_gpu;
 
-    ctx->sched_encoder  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
+    // The encoder scheduler runs both the batch encoder graph and the larger
+    // per-layer KV graph (whose wrap-gather adds concat nodes per layer), so it is
+    // sized generously to fit the KV graph's node+leaf count across a ring wrap.
+    ctx->sched_encoder  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE * 8, false, op_offload);
     ctx->sched_adapter  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
     ctx->sched_dec_pre  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
     ctx->sched_dec_step = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
@@ -1446,6 +1469,206 @@ static ggml_cgraph * build_encoder_graph(
 
     if (out_seq_len) *out_seq_len = seq_len;
 
+    return gf;
+}
+
+// ============================================================================
+// Graph Building: Encoder per-layer KV-cache (Session 6.1)
+// ----------------------------------------------------------------------------
+// Produces ONLY the new enc frames [P, P+N) (P = plan.q_start, N = plan.n_new) and
+// runs each through the 32 transformer layers exactly once. Old frames are never
+// re-run: their K/V live in the persistent per-stream ring (ring_k/ring_v,
+// [kv_dim, capacity, enc_layers]). Per layer: compute Q/K/V for the new frames,
+// RoPE at ABSOLUTE positions, write post-RoPE K + V into the ring at the plan's
+// physical slots, then attend the new queries over the causal window gathered from
+// the ring (a single view when contiguous, a concat of two segments on wrap). The
+// write cpys are expanded before the window read is built, so — exactly as the
+// decoder KV cache — the read observes the just-written new frames (insertion-order
+// dependency, honoured by the Vulkan buffer barriers). Realtime models only.
+// ============================================================================
+static ggml_cgraph * build_encoder_kv_graph(
+    voxtral_context * ctx,
+    ggml_tensor * ring_k,          // [kv_dim, capacity, enc_layers] F32, persistent
+    ggml_tensor * ring_v,          // [kv_dim, capacity, enc_layers] F32, persistent
+    ggml_context * gctx,
+    const voxtral_enc_kv_plan_t & plan,
+    int32_t n_attn,                // flash-attn query rows (>= n_new; padded to avoid the
+                                   // Vulkan small-query kernel variant, extra rows discarded)
+    int64_t * out_materialized_frames)
+{
+    voxtral_model * model = ctx->model;
+    const auto & hp = model->hp;
+    const int32_t N        = plan.n_new;
+    const int32_t L        = plan.win_len;
+    const int32_t e_heads    = hp.enc_heads;
+    const int32_t e_kv_heads = hp.enc_kv_heads;
+    const int32_t e_hd       = hp.enc_head_dim;
+    const int32_t kv_dim     = e_kv_heads * e_hd;
+    const int32_t conv_len = (int32_t) (plan.conv_mel_end - plan.conv_mel_start);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
+
+    // --- Conv stem over the plan's Mel window, sliced to the new enc frames ------
+    ggml_tensor * mel_input = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, conv_len, VOXTRAL_NUM_MEL_BINS, 1);
+    ggml_set_name(mel_input, "mel_input");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, mel_input, ctx->backend);
+
+    int32_t conv0_len = 0;
+    ggml_tensor * conv0_out = causal_conv1d_graph(gctx, mel_input, conv_len,
+        model->enc_conv0_weight, model->enc_conv0_bias, hp.enc_dim, 3, 1, conv0_len, /*symmetric=*/false);
+    conv0_out = ggml_gelu_erf(gctx, conv0_out);
+    int32_t conv1_len = 0;
+    ggml_tensor * conv1_out = causal_conv1d_graph(gctx, conv0_out, conv0_len,
+        model->enc_conv1_weight, model->enc_conv1_bias, hp.enc_dim, 3, 2, conv1_len, /*symmetric=*/false);
+    conv1_out = ggml_gelu_erf(gctx, conv1_out);  // [conv1_len, enc_dim, 1]
+
+    // Slice local conv1 frames [conv_slice_start, conv_slice_start+N) — the global
+    // enc frames [P, P+N) — then transpose to [enc_dim, N] for the transformer.
+    ggml_tensor * x_len_first = ggml_view_3d(gctx, conv1_out,
+        N, hp.enc_dim, 1, conv1_out->nb[1], conv1_out->nb[2],
+        (size_t) plan.conv_slice_start * conv1_out->nb[0]);
+    ggml_tensor * x = ggml_cont(gctx, ggml_permute(gctx, x_len_first, 1, 0, 2, 3)); // [enc_dim, N, 1]
+    x = ggml_reshape_2d(gctx, x, hp.enc_dim, N);
+
+    // --- Inputs: absolute RoPE positions + causal-window mask [L, N] -------------
+    ggml_tensor * enc_positions = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, N);
+    ggml_set_name(enc_positions, "enc_positions");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_positions, ctx->backend);
+
+    // Mask is [L, n_attn]: the first N columns are the real causal-window mask; the
+    // padded columns [N, n_attn) attend-all (0) so their softmax is well-defined
+    // (their outputs are discarded after the flash attention).
+    ggml_tensor * enc_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, L, N);   // causal window mask
+    ggml_set_name(enc_mask, "enc_kv_mask");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_mask, ctx->backend);
+
+    const float scale = 1.0f / sqrtf((float) e_hd);
+    const size_t k_layer_stride = ring_k->nb[2];
+    const size_t v_layer_stride = ring_v->nb[2];
+    const size_t k_col = ring_k->nb[1];   // == kv_dim * sizeof(float)
+    const size_t v_col = ring_v->nb[1];
+
+    for (int32_t i = 0; i < hp.enc_layers; i++) {
+        auto & Lyr = model->enc_layers[i];
+
+        ggml_tensor * residual = x; // [enc_dim, N]
+        ggml_tensor * x_norm = enc_apply_norm(gctx, x, Lyr.attn_norm_weight, Lyr.attn_norm_bias,
+                                              hp.enc_norm_eps, /*layernorm=*/false);
+
+        ggml_tensor * q = ggml_add(gctx, ggml_mul_mat(gctx, Lyr.attn_q_weight, x_norm), Lyr.attn_q_bias);
+        ggml_tensor * k = ggml_mul_mat(gctx, Lyr.attn_k_weight, x_norm);                    // no bias
+        ggml_tensor * v = ggml_add(gctx, ggml_mul_mat(gctx, Lyr.attn_v_weight, x_norm), Lyr.attn_v_bias);
+
+        q = ggml_reshape_3d(gctx, q, e_hd, e_heads, N);
+        k = ggml_reshape_3d(gctx, k, e_hd, e_kv_heads, N);
+        q = ggml_rope_ext(gctx, q, enc_positions, nullptr,
+            e_hd, 0, 0, hp.enc_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(gctx, k, enc_positions, nullptr,
+            e_hd, 0, 0, hp.enc_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // Post-RoPE K + V flattened to [kv_dim, N] for storage.
+        ggml_tensor * k_store = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, N));
+        ggml_tensor * v_store = ggml_reshape_2d(gctx, v, kv_dim, N);   // V has no RoPE
+
+        // WRITE new K/V into the ring at the plan's physical slots (<=2 segments).
+        // Expanded now so the window read below sees the new frames.
+        int32_t src_off = 0;
+        for (int32_t s = 0; s < plan.write_nseg; ++s) {
+            const int32_t seg_slot = plan.write_seg[s].slot;
+            const int32_t seg_len  = plan.write_seg[s].len;
+            ggml_tensor * k_src = ggml_view_2d(gctx, k_store, kv_dim, seg_len, k_store->nb[1], (size_t) src_off * k_store->nb[1]);
+            ggml_tensor * v_src = ggml_view_2d(gctx, v_store, kv_dim, seg_len, v_store->nb[1], (size_t) src_off * v_store->nb[1]);
+            ggml_tensor * k_dst = ggml_view_2d(gctx, ring_k, kv_dim, seg_len, k_col, (size_t) i * k_layer_stride + (size_t) seg_slot * k_col);
+            ggml_tensor * v_dst = ggml_view_2d(gctx, ring_v, kv_dim, seg_len, v_col, (size_t) i * v_layer_stride + (size_t) seg_slot * v_col);
+            ggml_build_forward_expand(gf, ggml_cpy(gctx, k_src, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(gctx, v_src, v_dst));
+            src_off += seg_len;
+        }
+
+        // Assemble the causal window [win_start, win_end) as a contiguous [kv_dim, L]:
+        // the NEW frames [q_start, q_start+N) come straight from this execution's
+        // k_store/v_store (never round-tripped through the ring — this avoids any
+        // same-execution read-after-write on the ring, which the Vulkan backend does
+        // not order across aliased views), and the OLDER frames [win_start, q_start)
+        // are gathered from the committed ring (one contiguous segment, or a concat
+        // of two on wrap). Logical order is old-then-new, matching the mask.
+        const int32_t old_len = (int32_t) (plan.q_start - plan.win_start);
+        ggml_tensor * k_win;
+        ggml_tensor * v_win;
+        if (old_len <= 0) {
+            k_win = k_store;
+            v_win = v_store;
+        } else {
+            const int32_t cap = VOXTRAL_ENC_KV_CAP;
+            const int32_t os0 = (int32_t) (plan.win_start % cap);
+            const int32_t of0 = std::min(old_len, cap - os0);
+            ggml_tensor * k_old;
+            ggml_tensor * v_old;
+            if (of0 >= old_len) {
+                k_old = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, old_len, k_col, (size_t) i * k_layer_stride + (size_t) os0 * k_col));
+                v_old = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, old_len, v_col, (size_t) i * v_layer_stride + (size_t) os0 * v_col));
+            } else {
+                const int32_t l1 = old_len - of0;
+                ggml_tensor * k0 = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, of0, k_col, (size_t) i * k_layer_stride + (size_t) os0 * k_col));
+                ggml_tensor * k1 = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, l1,  k_col, (size_t) i * k_layer_stride));
+                ggml_tensor * v0 = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, of0, v_col, (size_t) i * v_layer_stride + (size_t) os0 * v_col));
+                ggml_tensor * v1 = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, l1,  v_col, (size_t) i * v_layer_stride));
+                k_old = ggml_concat(gctx, k0, k1, 1);
+                v_old = ggml_concat(gctx, v0, v1, 1);
+            }
+            k_win = ggml_concat(gctx, k_old, k_store, 1);   // [kv_dim, old_len + N == L]
+            v_win = ggml_concat(gctx, v_old, v_store, 1);
+            if (i == 0 && out_materialized_frames) *out_materialized_frames += old_len;
+        }
+
+        // Attention of the N new queries over the L-frame causal window.
+        ggml_tensor * q3 = ggml_permute(gctx, q, 0, 2, 1, 3);                               // [hd, N, heads]
+        ggml_tensor * k3 = ggml_permute(gctx, ggml_reshape_3d(gctx, k_win, e_hd, e_kv_heads, L), 0, 2, 1, 3); // [hd, L, heads]
+        ggml_tensor * v3 = ggml_permute(gctx, ggml_reshape_3d(gctx, v_win, e_hd, e_kv_heads, L), 0, 2, 1, 3);
+        // Production default: fused flash attention. It is bit-exact across every
+        // feed-chunk plan because the driver's grid-aligned batching gives each frame
+        // a fixed causal-window shape (win_start, L) — without that, the Vulkan flash
+        // kernel's sensitivity to the masked-head shape would break feed-plan
+        // invariance. VOXTRAL_ENC_KV_MANUAL selects the non-fused reference attention
+        // (softmax(scale·QKᵀ+mask)·V), which is window-shape-invariant on its own.
+        ggml_tensor * attn;
+        if (getenv("VOXTRAL_ENC_KV_MANUAL")) {
+            ggml_tensor * kq = ggml_mul_mat(gctx, k3, ggml_cont(gctx, q3));                 // [L, N, heads]
+            kq = ggml_soft_max_ext(gctx, kq, enc_mask, scale, 0.0f);
+            ggml_tensor * v_t = ggml_cont(gctx, ggml_transpose(gctx, v3));                  // [L, hd, heads]
+            attn = ggml_mul_mat(gctx, v_t, kq);                                             // [hd, N, heads]
+            attn = ggml_permute(gctx, attn, 0, 2, 1, 3);                                    // [hd, heads, N]
+            attn = ggml_reshape_2d(gctx, ggml_cont(gctx, attn), e_heads * e_hd, N);
+        } else {
+            // Query padded to n_attn only for a sub-floor final batch; rows sliced off.
+            ggml_tensor * mask_p = (n_attn > N)
+                ? ggml_pad_ext(gctx, enc_mask, 0, 0, 0, n_attn - N, 0, 0, 0, 0) : enc_mask;
+            ggml_tensor * mask_f16 = ggml_cast(gctx, mask_p, GGML_TYPE_F16);
+            ggml_tensor * q3p = ggml_cont(gctx, q3);
+            if (n_attn > N) q3p = ggml_pad_ext(gctx, q3p, 0, 0, 0, n_attn - N, 0, 0, 0, 0);
+            attn = ggml_flash_attn_ext(gctx, q3p, k3, v3, mask_f16, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+            attn = ggml_view_3d(gctx, attn, e_hd, e_heads, N, attn->nb[1], attn->nb[2], 0);
+            attn = ggml_reshape_2d(gctx, ggml_cont(gctx, attn), e_heads * e_hd, N);
+        }
+
+        ggml_tensor * attn_proj = ggml_add(gctx, ggml_mul_mat(gctx, Lyr.attn_o_weight, attn), Lyr.attn_o_bias);
+        x = ggml_add(gctx, residual, attn_proj);
+
+        // SwiGLU FFN (realtime).
+        residual = x;
+        x_norm = enc_apply_norm(gctx, x, Lyr.ffn_norm_weight, Lyr.ffn_norm_bias, hp.enc_norm_eps, false);
+        ggml_tensor * gate = ggml_silu(gctx, ggml_mul_mat(gctx, Lyr.ffn_w1_weight, x_norm));
+        ggml_tensor * up   = ggml_mul_mat(gctx, Lyr.ffn_w3_weight, x_norm);
+        ggml_tensor * ffn  = ggml_mul_mat(gctx, Lyr.ffn_w2_weight, ggml_mul(gctx, gate, up));
+        if (Lyr.ffn_w2_bias) ffn = ggml_add(gctx, ffn, Lyr.ffn_w2_bias);
+        x = ggml_add(gctx, residual, ffn);
+    }
+
+    // Final norm + stage into encoder_chunk_output[:, 0:N] for host readback.
+    x = enc_apply_norm(gctx, x, model->enc_norm_weight, model->enc_norm_bias, hp.enc_norm_eps, false);
+    ggml_tensor * out_view = ggml_view_2d(gctx, ctx->encoder_chunk_output, VOXTRAL_ENC_DIM, N,
+        ctx->encoder_chunk_output->nb[1], 0);
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, x, out_view));
     return gf;
 }
 
@@ -2135,6 +2358,371 @@ static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, i
 }
 
 // ============================================================================
+// Per-layer encoder KV-cache — model-free ring planner (Session 6.1)
+// ----------------------------------------------------------------------------
+// A single pure function derives every physical offset the KV graph needs for one
+// execution over new enc frames [q_start, q_start+n_new): the causal window, the
+// ring segments for the window READ and the new-frame WRITE, and the conv input
+// window. Absolute positions drive RoPE + eviction; ring slots = pos % capacity.
+// This is the only copy of the wrap/eviction arithmetic; the graph consumes it and
+// tests/cpp/test_encoder_kv.cpp locks it without a backend.
+// ============================================================================
+
+int32_t voxtral_enc_kv_capacity_internal() { return VOXTRAL_ENC_KV_CAP; }
+int32_t voxtral_enc_kv_max_new_internal()  { return VOXTRAL_ENC_KV_MAX_NEW; }
+int32_t voxtral_enc_kv_window_internal()   { return VOXTRAL_ENC_WINDOW; }
+
+bool voxtral_enc_kv_mask_allows(int64_t kv_abs, int64_t q_abs, int32_t window) {
+    return kv_abs <= q_abs && kv_abs >= q_abs - (int64_t) (window - 1);
+}
+
+// Split the logical span [abs_start, abs_start+len) into <= 2 physical ring
+// segments (in ascending-position order). Returns the segment count.
+static int32_t enc_kv_ring_segments(int64_t abs_start, int32_t len, int32_t capacity,
+                                    voxtral_enc_kv_seg out[2]) {
+    if (len <= 0) return 0;
+    const int32_t slot0 = (int32_t) (abs_start % capacity);
+    const int32_t first = std::min(len, capacity - slot0);
+    out[0] = { slot0, first };
+    if (first >= len) return 1;
+    out[1] = { 0, len - first };
+    return 2;
+}
+
+bool voxtral_enc_kv_plan(int64_t q_start, int32_t n_new,
+                         int32_t capacity, int32_t window,
+                         voxtral_enc_kv_plan_t & out) {
+    out = voxtral_enc_kv_plan_t{};
+    if (n_new <= 0 || capacity <= 0 || window <= 0) return false;
+    // capacity must hold the whole causal window of a batch (window-1 + n_new
+    // frames) so the window is a single logical span and the write cannot clobber a
+    // still-live frame. This bounds n_new <= capacity - window.
+    if (n_new > capacity - window) return false;
+    if (q_start < 0) return false;
+
+    out.q_start = q_start;
+    out.n_new   = n_new;
+
+    out.win_start = std::max<int64_t>(0, q_start - (int64_t) (window - 1));
+    out.win_end   = q_start + n_new;
+    out.win_len   = (int32_t) (out.win_end - out.win_start);
+
+    out.read_nseg  = enc_kv_ring_segments(out.win_start, out.win_len, capacity, out.read_seg);
+    out.read_wraps = out.read_nseg > 1;
+
+    out.write_nseg  = enc_kv_ring_segments(q_start, n_new, capacity, out.write_seg);
+    out.write_wraps = out.write_nseg > 1;
+
+    // Conv input: enc frame e depends on Mel[2e-3 .. 2e+1]; feed an even-aligned
+    // window with >= 2 enc frames of real left context so the sliced frames are
+    // past the fed window's front zero-pad (bit-exact), except at the true stream
+    // start (q_start < 2) where the zero-pad is the intended behaviour.
+    out.conv_mel_start   = std::max<int64_t>(0, 2 * (q_start - 2));
+    out.conv_mel_end     = 2 * (q_start + n_new);
+    out.conv_slice_start = (int32_t) (q_start - out.conv_mel_start / 2);
+
+    // Frames evicted as the head advances to q_start+n_new. Retention is keyed on
+    // the new head H': the cache logically keeps [max(0,H'-window), H') (<= window
+    // frames), so evicted = the delta of that lower bound over this batch.
+    const int64_t old_lo = std::max<int64_t>(0, q_start - (int64_t) window);
+    const int64_t new_lo = std::max<int64_t>(0, out.win_end - (int64_t) window);
+    out.evicted = new_lo - old_lo;
+    return true;
+}
+
+// Enc frames realizable from `mel_frames` stable Mel frames WITHOUT the conv
+// right-pad: enc frame e needs Mel[2e-3 .. 2e+1], so the largest fully-covered e is
+// floor((mel-2)/2). At the padded finish (mel a multiple of 8) this equals the
+// batch's enc_seq_used (mel/2), so the KV encoder emits exactly the batch frames;
+// mid-stream it stops short of the pad-right frame the batch would only add at the
+// true end. Monotonic non-decreasing in mel_frames.
+static int64_t enc_frames_realizable(int64_t mel_frames) {
+    return mel_frames < 2 ? 0 : (mel_frames - 2) / 2 + 1;
+}
+
+// ============================================================================
+// Per-layer encoder KV-cache — device ring + per-stream runtime (Session 6.1)
+// ----------------------------------------------------------------------------
+// Owns the persistent device K/V ring (build_encoder_kv_graph consumes it), a
+// bounded host Mel tail for the conv stem, and the accumulated encoder output.
+// Each enc frame passes through the 32 transformer layers exactly once.
+// ============================================================================
+struct voxtral_encoder_kv_state {
+    voxtral_context * ctx = nullptr;
+
+    // Persistent device ring, [kv_dim, capacity, enc_layers] F32 (K and V).
+    ggml_context        * ctx_ring = nullptr;
+    ggml_backend_buffer_t buf_ring = nullptr;
+    ggml_tensor         * ring_k   = nullptr;
+    ggml_tensor         * ring_v   = nullptr;
+    int64_t               ring_bytes = 0;
+
+    int64_t emitted    = 0;   // absolute enc frames produced (== next q_start)
+    int64_t stable_mel = 0;   // absolute stable Mel frames received
+
+    // Bounded host Mel tail for the conv stem, frame-major ([n_mel] per frame).
+    // Spans [tail_base, stable_mel); trimmed to the next batch's conv left context.
+    std::vector<float> mel_tail;
+    int64_t            tail_base = 0;
+
+    std::vector<float>   enc_accum;  // host channel-major [enc_dim, emitted] (Stage 11 linear buffer)
+    std::vector<float>   conv_cm;    // scratch: conv Mel window channel-major [n_mel, conv_len]
+    std::vector<float>   mask_buf;   // scratch: causal window mask [win_len * n_new]
+    std::vector<int32_t> pos_buf;    // scratch: absolute RoPE positions [n_new]
+
+    bool finalized = false;
+
+    // Work / memory instrumentation (Stages 16/17).
+    int64_t transformer_frames   = 0;   // enc frames through the transformer (each once)
+    int64_t kv_appends           = 0;
+    int64_t kv_evictions         = 0;
+    int64_t kv_wraps             = 0;
+    int64_t kv_materialized      = 0;
+    int64_t graph_execs          = 0;
+    int32_t max_new_per_exec     = 0;
+    int64_t frames_before_finish = 0;
+    int64_t frames_at_finish     = 0;
+    int64_t frames_at_finish_exec= 0;   // transformer frames evaluated inside finish()
+    int64_t peak_logical         = 0;
+    int64_t peak_mel_tail        = 0;
+    int64_t peak_output          = 0;
+};
+
+static bool encoder_kv_alloc(voxtral_encoder_kv_state * kv) {
+    if (kv->ring_k) return true;
+    voxtral_context * ctx = kv->ctx;
+    const int32_t kv_dim = ctx->model->hp.enc_kv_heads * ctx->model->hp.enc_head_dim;
+    const int32_t layers = ctx->model->hp.enc_layers;
+
+    ggml_init_params p = { 2 * ggml_tensor_overhead(), nullptr, /*.no_alloc=*/true };
+    kv->ctx_ring = ggml_init(p);
+    if (!kv->ctx_ring) return false;
+    kv->ring_k = ggml_new_tensor_3d(kv->ctx_ring, GGML_TYPE_F32, kv_dim, VOXTRAL_ENC_KV_CAP, layers);
+    kv->ring_v = ggml_new_tensor_3d(kv->ctx_ring, GGML_TYPE_F32, kv_dim, VOXTRAL_ENC_KV_CAP, layers);
+    ggml_set_name(kv->ring_k, "enc_kv_k");
+    ggml_set_name(kv->ring_v, "enc_kv_v");
+    kv->buf_ring = ggml_backend_alloc_ctx_tensors(kv->ctx_ring, ctx->backend);
+    if (!kv->buf_ring) { ggml_free(kv->ctx_ring); kv->ctx_ring = nullptr; return false; }
+    kv->ring_bytes = (int64_t) ggml_nbytes(kv->ring_k) + (int64_t) ggml_nbytes(kv->ring_v);
+    // No zeroing: every slot in a query's causal window was written by this or a
+    // prior execution (write-before-read); slots outside the window are never read.
+    LOG_INFO(ctx, "encoder KV: ring %d x %d x %d F32, %.2f MB on device",
+             kv_dim, VOXTRAL_ENC_KV_CAP, layers, (double) kv->ring_bytes / 1e6);
+    return true;
+}
+
+static void encoder_kv_free_ring(voxtral_encoder_kv_state * kv) {
+    if (kv->buf_ring) { ggml_backend_buffer_free(kv->buf_ring); kv->buf_ring = nullptr; }
+    if (kv->ctx_ring) { ggml_free(kv->ctx_ring); kv->ctx_ring = nullptr; }
+    kv->ring_k = kv->ring_v = nullptr;
+    kv->ring_bytes = 0;
+}
+
+// Run one KV graph over the enc frames [q_start, q_start+n_new) described by `plan`
+// and append the outputs of columns [emit_col, n_new) to enc_accum. Requires the
+// Mel tail to cover [conv_mel_start, conv_mel_end). emit_col > 0 is the finish-tail
+// backward extension: frames [q_start, q_start+emit_col) were already emitted (their
+// K/V are re-written identically), so only the newer frames are appended.
+static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_enc_kv_plan_t & plan,
+                                 int32_t emit_col = 0) {
+    voxtral_context * ctx = kv->ctx;
+    const int32_t N       = plan.n_new;
+    const int32_t L       = plan.win_len;
+    const int32_t n_mel   = VOXTRAL_MEL_N_MEL;
+    const int32_t conv_len = (int32_t) (plan.conv_mel_end - plan.conv_mel_start);
+
+    // Materialize the conv Mel window channel-major [n_mel, conv_len] from the tail.
+    const int64_t tail_frames = (int64_t) (kv->mel_tail.size() / (size_t) n_mel);
+    if (plan.conv_mel_start < kv->tail_base || plan.conv_mel_end > kv->tail_base + tail_frames) {
+        LOG_ERR(ctx, "encoder KV: Mel tail [%lld,%lld) misses conv window [%lld,%lld)",
+                (long long) kv->tail_base, (long long) (kv->tail_base + tail_frames),
+                (long long) plan.conv_mel_start, (long long) plan.conv_mel_end);
+        return false;
+    }
+    kv->conv_cm.assign((size_t) n_mel * conv_len, 0.0f);
+    for (int32_t i = 0; i < conv_len; ++i) {
+        const int64_t rel = (plan.conv_mel_start + i) - kv->tail_base;
+        const float * src = kv->mel_tail.data() + (size_t) rel * n_mel;
+        for (int32_t m = 0; m < n_mel; ++m) kv->conv_cm[(size_t) m * conv_len + i] = src[m];
+    }
+
+    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 8 +
+                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 8, false);
+    std::vector<uint8_t> meta_buf(meta_size);
+    ggml_init_params p = { meta_size, meta_buf.data(), /*.no_alloc=*/true };
+    ggml_context * gctx = ggml_init(p);
+
+    const int32_t n_attn = std::max(N, VOXTRAL_ENC_KV_ATTN_MIN_ROWS);
+    int64_t materialized = 0;
+    ggml_cgraph * gf = build_encoder_kv_graph(ctx, kv->ring_k, kv->ring_v, gctx, plan, n_attn, &materialized);
+
+    ggml_backend_sched_reset(ctx->sched_encoder);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched_encoder, gf)) {
+        LOG_ERR(ctx, "encoder KV: failed to allocate graph (N=%d L=%d n_attn=%d)", N, L, n_attn);
+        ggml_free(gctx);
+        return false;
+    }
+
+    if (ggml_tensor * t = find_tensor_in_graph(gf, "mel_input"))
+        ggml_backend_tensor_set(t, kv->conv_cm.data(), 0, (size_t) n_mel * conv_len * sizeof(float));
+    if (ggml_tensor * t = find_tensor_in_graph(gf, "enc_positions")) {
+        kv->pos_buf.resize(N);
+        for (int32_t i = 0; i < N; ++i) kv->pos_buf[i] = (int32_t) (plan.q_start + i);
+        ggml_backend_tensor_set(t, kv->pos_buf.data(), 0, (size_t) N * sizeof(int32_t));
+    }
+    if (ggml_tensor * t = find_tensor_in_graph(gf, "enc_kv_mask")) {
+        kv->mask_buf.assign((size_t) L * N, 0.0f);
+        for (int32_t ql = 0; ql < N; ++ql) {
+            const int64_t q_abs = plan.q_start + ql;
+            for (int32_t kl = 0; kl < L; ++kl) {
+                const int64_t kv_abs = plan.win_start + kl;
+                kv->mask_buf[(size_t) ql * L + kl] =
+                    voxtral_enc_kv_mask_allows(kv_abs, q_abs, VOXTRAL_ENC_WINDOW) ? 0.0f : -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(t, kv->mask_buf.data(), 0, kv->mask_buf.size() * sizeof(float));
+    }
+
+    ggml_backend_sched_graph_compute(ctx->sched_encoder, gf);
+    ggml_backend_sched_reset(ctx->sched_encoder);
+    ggml_free(gctx);
+
+    // Append the newly-emitted enc frames [emit_col, N) (channel-major) to the accum.
+    const int32_t emit_n = N - emit_col;
+    const size_t old = kv->enc_accum.size();
+    kv->enc_accum.resize(old + (size_t) emit_n * VOXTRAL_ENC_DIM);
+    ggml_backend_tensor_get(ctx->encoder_chunk_output, kv->enc_accum.data() + old,
+                            (size_t) emit_col * VOXTRAL_ENC_DIM * sizeof(float),
+                            (size_t) emit_n * VOXTRAL_ENC_DIM * sizeof(float));
+
+    // Bookkeeping / metrics. The logical head advances to q_start+N (== the new head
+    // for a normal batch; == target for the backward-extended finish tail).
+    kv->emitted             = plan.q_start + N;
+    kv->transformer_frames += N;
+    kv->kv_appends         += N;
+    kv->kv_evictions       += plan.evicted;
+    if (plan.read_wraps || plan.write_wraps) kv->kv_wraps++;
+    kv->kv_materialized    += materialized;
+    kv->graph_execs++;
+    if (N > kv->max_new_per_exec) kv->max_new_per_exec = N;
+    const int64_t logical = kv->emitted - std::max<int64_t>(0, kv->emitted - VOXTRAL_ENC_WINDOW);
+    if (logical > kv->peak_logical) kv->peak_logical = logical;
+    if ((int64_t) kv->enc_accum.size() / VOXTRAL_ENC_DIM > kv->peak_output)
+        kv->peak_output = (int64_t) kv->enc_accum.size() / VOXTRAL_ENC_DIM;
+    return true;
+}
+
+// Trim the Mel tail to the next grid-aligned batch's conv left context (bounded:
+// a couple of enc frames of Mel history beyond the running emit position).
+static void encoder_kv_trim_tail(voxtral_encoder_kv_state * kv) {
+    const int64_t keep_from = std::max<int64_t>(0, 2 * (kv->emitted - 2));
+    if (keep_from > kv->tail_base) {
+        const size_t drop = (size_t) (keep_from - kv->tail_base) * VOXTRAL_MEL_N_MEL;
+        if (drop >= kv->mel_tail.size()) kv->mel_tail.clear();
+        else kv->mel_tail.erase(kv->mel_tail.begin(), kv->mel_tail.begin() + (std::ptrdiff_t) drop);
+        kv->tail_base = keep_from;
+    }
+    const int64_t tail_now = (int64_t) (kv->mel_tail.size() / (size_t) VOXTRAL_MEL_N_MEL);
+    if (tail_now > kv->peak_mel_tail) kv->peak_mel_tail = tail_now;
+}
+
+// Run enc frames [q0, q0+n) through one KV graph and append their outputs.
+static bool encoder_kv_run(voxtral_encoder_kv_state * kv, int64_t q0, int32_t n, bool final) {
+    voxtral_enc_kv_plan_t plan;
+    if (!voxtral_enc_kv_plan(q0, n, VOXTRAL_ENC_KV_CAP, VOXTRAL_ENC_WINDOW, plan)) return false;
+    if (plan.conv_mel_end > kv->stable_mel) return false;   // not enough Mel (caller guards)
+    if (!run_encoder_kv_batch(kv, plan, /*emit_col=*/0)) return false;
+    if (final) { kv->frames_at_finish += n; kv->frames_at_finish_exec += n; }
+    else       { kv->frames_before_finish += n; }
+    encoder_kv_trim_tail(kv);
+    return true;
+}
+
+// Emit realizable enc frames in FIXED, grid-aligned batches: every batch starts at a
+// multiple of ENC_KV_MAX_NEW, so a given enc frame is always computed in the same
+// batch with the same causal-window shape (win_start, L) regardless of the feed-chunk
+// plan. That fixes the attention reduction order per frame, making the streaming
+// encoder bit-identical to the global batch encoder across all chunk plans and ring
+// rollovers. During feed only full grid batches run (the partial remainder is
+// buffered); finish flushes the remainder including the final partial batch.
+static bool encoder_kv_drive(voxtral_encoder_kv_state * kv, bool final) {
+    int32_t GRID = VOXTRAL_ENC_KV_MAX_NEW;
+    if (const char * g = getenv("VOXTRAL_ENC_KV_GRID")) {   // latency/throughput tuning knob
+        const int32_t v = atoi(g);
+        if (v >= 1 && v <= VOXTRAL_ENC_KV_MAX_NEW) GRID = v;
+    }
+    const int64_t target = enc_frames_realizable(kv->stable_mel);   // true global count
+    while (kv->emitted < target) {
+        const int64_t rem = target - kv->emitted;
+        if (!final && rem < GRID) break;                            // wait for a full grid batch
+        const int32_t n = (int32_t) std::min<int64_t>(GRID, rem);
+        if (!encoder_kv_run(kv, kv->emitted, n, final)) return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Global batch encoder (Session 6.1) — the artifact-free source of truth.
+// ----------------------------------------------------------------------------
+// Runs the per-layer KV encoder over a full even-trimmed Mel in one shot, giving
+// each enc frame a real 750-frame causal window (no chunk-boundary warmup
+// truncation or conv zero-pad), producing the SAME tensor as the streaming KV
+// encoder. Replaces run_encoder_chunked as the production batch/offline encoder;
+// run_encoder_chunked is retained as the legacy/reference strategy. Fills
+// ctx.encoder_output (device) and ctx.enc_seq_used exactly like run_encoder_chunked.
+// ============================================================================
+static bool run_encoder_global(voxtral_context * ctx, const float * mel_cm, int32_t n_frames) {
+    if (n_frames <= 0) { LOG_ERR(ctx, "encoder global: audio too short"); return false; }
+
+    voxtral_encoder_kv_state kv;
+    kv.ctx = ctx;
+    if (!encoder_kv_alloc(&kv)) { LOG_ERR(ctx, "encoder global: KV ring allocation failed"); return false; }
+
+    // Push the whole Mel (channel-major [n_mel, n_frames] -> frame-major tail).
+    const int32_t n_mel = VOXTRAL_MEL_N_MEL;
+    kv.mel_tail.resize((size_t) n_frames * n_mel);
+    for (int32_t f = 0; f < n_frames; ++f)
+        for (int32_t m = 0; m < n_mel; ++m)
+            kv.mel_tail[(size_t) f * n_mel + m] = mel_cm[(size_t) m * n_frames + f];
+    kv.tail_base  = 0;
+    kv.stable_mel = n_frames;
+
+    bool ok = encoder_kv_drive(&kv, /*final=*/true);
+    if (ok) {
+        const int32_t emitted = (int32_t) kv.emitted;
+        const int32_t used    = (emitted / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+        if (used <= 0) {
+            LOG_ERR(ctx, "encoder global: fewer than %d enc frames (%d)", VOXTRAL_DOWNSAMPLE_FACTOR, emitted);
+            ok = false;
+        } else if (!alloc_encoder_output(ctx, used)) {
+            LOG_ERR(ctx, "encoder global: failed to allocate encoder output (%d)", used);
+            ok = false;
+        } else {
+            ggml_backend_tensor_set(ctx->encoder_output, kv.enc_accum.data(), 0,
+                                    (size_t) used * VOXTRAL_ENC_DIM * sizeof(float));
+            ctx->enc_seq_used     = used;
+            ctx->total_enc_tokens = used;
+            LOG_INFO(ctx, "encoder global: %d mel frames -> %d enc frames (%d used)",
+                     n_frames, emitted, used);
+        }
+    }
+    encoder_kv_free_ring(&kv);
+    return ok;
+}
+
+// Production batch encoder default is the artifact-free global encoder; the legacy
+// chunked bounded-window recompute is selected by VOXTRAL_ENCODER_STRATEGY=reference
+// (kept for A/B, tensor parity and regression debugging — see docs).
+static bool run_encoder_batch(voxtral_context * ctx, const float * mel_data, int32_t n_frames) {
+    const char * s = getenv("VOXTRAL_ENCODER_STRATEGY");
+    const bool legacy = s && (strcmp(s, "reference") == 0 || strcmp(s, "ref") == 0 ||
+                              strcmp(s, "chunked") == 0 || strcmp(s, "bounded") == 0 ||
+                              strcmp(s, "bounded-window-recompute") == 0);
+    return legacy ? run_encoder_chunked(ctx, mel_data, n_frames)
+                  : run_encoder_global(ctx, mel_data, n_frames);
+}
+
+// ============================================================================
 // Incremental causal encoder (streaming) — bounded-window recomputation that
 // REPLAYS the exact run_encoder_chunked schedule, driven by stable Mel frames as
 // they arrive during feed(). Reuses run_encoder_chunk() (and hence
@@ -2164,9 +2752,28 @@ static constexpr int32_t VOXTRAL_ENC_MEL_STRIDE =
 // encoder frames before finish().
 static constexpr int32_t VOXTRAL_ENC_STREAM_EMIT_MEL = 256;
 
+// Production default = per-layer KV-cache; reference = bounded-window recompute,
+// retained for A/B, tensor parity and regression debugging. Selected once per
+// stream via VOXTRAL_ENCODER_STRATEGY (kv | reference); not a public API contract.
+enum class enc_strategy { kv, reference };
+
+static enc_strategy encoder_strategy_from_env() {
+    const char * s = getenv("VOXTRAL_ENCODER_STRATEGY");
+    if (s && (strcmp(s, "reference") == 0 || strcmp(s, "ref") == 0 ||
+              strcmp(s, "bounded") == 0 || strcmp(s, "bounded-window-recompute") == 0)) {
+        return enc_strategy::reference;
+    }
+    return enc_strategy::kv;   // Session 6.1 production default
+}
+
 struct voxtral_encoder_stream {
     voxtral_context * ctx = nullptr;
 
+    // Active strategy + the per-layer KV runtime (allocated lazily when kv).
+    enc_strategy strategy = enc_strategy::kv;
+    voxtral_encoder_kv_state * kv = nullptr;
+
+    // --- reference (bounded-window recompute) state ---------------------------
     // Bounded Mel window, frame-major: relative frame r (absolute window_base + r)
     // occupies [r*n_mel, (r+1)*n_mel). window_base == cur_chunk*mel_stride, so the
     // retained span never exceeds ~CHUNK_MEL frames (plus one transient feed).
@@ -2316,13 +2923,47 @@ voxtral_encoder_stream * voxtral_encoder_stream_create(voxtral_context * ctx) {
     auto * es = new (std::nothrow) voxtral_encoder_stream();
     if (!es) return nullptr;
     es->ctx = ctx;
+    es->strategy = encoder_strategy_from_env();
+    if (es->strategy == enc_strategy::kv) {
+        es->kv = new (std::nothrow) voxtral_encoder_kv_state();
+        if (!es->kv) { delete es; return nullptr; }
+        es->kv->ctx = ctx;
+    }
     return es;
 }
 
-void voxtral_encoder_stream_destroy(voxtral_encoder_stream * es) { delete es; }
+void voxtral_encoder_stream_destroy(voxtral_encoder_stream * es) {
+    if (es && es->kv) { encoder_kv_free_ring(es->kv); delete es->kv; es->kv = nullptr; }
+    delete es;
+}
+
+static void encoder_kv_reset(voxtral_encoder_kv_state * kv) {
+    // Logically invalidate the cache: metadata only, no device memset (unwritten
+    // slots are never read). The device ring buffer is retained for cheap reuse.
+    kv->emitted = 0;
+    kv->stable_mel = 0;
+    kv->mel_tail.clear();
+    kv->tail_base = 0;
+    kv->enc_accum.clear();
+    kv->finalized = false;
+    kv->transformer_frames = 0;
+    kv->kv_appends = 0;
+    kv->kv_evictions = 0;
+    kv->kv_wraps = 0;
+    kv->kv_materialized = 0;
+    kv->graph_execs = 0;
+    kv->max_new_per_exec = 0;
+    kv->frames_before_finish = 0;
+    kv->frames_at_finish = 0;
+    kv->frames_at_finish_exec = 0;
+    kv->peak_logical = 0;
+    kv->peak_mel_tail = 0;
+    kv->peak_output = 0;
+}
 
 void voxtral_encoder_stream_reset(voxtral_encoder_stream * es) {
     if (!es) return;
+    if (es->kv) encoder_kv_reset(es->kv);
     es->mel_window.clear();
     es->window_base = 0;
     es->stable_mel  = 0;
@@ -2340,18 +2981,29 @@ void voxtral_encoder_stream_reset(voxtral_encoder_stream * es) {
     es->encoder_peak_context = 0;
     es->frames_before_finish = 0;
     es->frames_at_finish     = 0;
-    // Keep vector capacities for cheap reuse.
+    // Keep vector capacities (and the device KV ring) for cheap reuse.
 }
 
 // Push newly-stable, frame-major Mel frames [base_frame, base_frame+n) (each
-// n_mel contiguous) and run any chunks that became available. base_frame must
-// equal the running stable_mel (contiguous, in order).
+// n_mel contiguous) and run whatever became available. base_frame must equal the
+// running stable_mel (contiguous, in order).
 bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
                                      const float * frames, int64_t base_frame, int32_t n) {
     if (!es || es->finalized) return false;
     if (n <= 0) return true;
     if (!frames) return false;
     if (base_frame != es->stable_mel) return false;   // must be contiguous
+
+    if (es->kv) {
+        if (!encoder_kv_alloc(es->kv)) return false;
+        es->kv->mel_tail.insert(es->kv->mel_tail.end(), frames,
+                                frames + (size_t) n * VOXTRAL_MEL_N_MEL);
+        es->kv->stable_mel += n;
+        es->stable_mel += n;                 // keep the shared counter in step
+        es->mel_frames_received += n;
+        return encoder_kv_drive(es->kv, /*final=*/false);
+    }
+
     es->mel_window.insert(es->mel_window.end(), frames,
                           frames + (size_t) n * VOXTRAL_MEL_N_MEL);
     es->stable_mel += n;
@@ -2362,31 +3014,90 @@ bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
     return ok;
 }
 
-// Finalize: drive the remaining (last, possibly incomplete) chunk(s) exactly as
-// the batch tail, then the accumulated output is complete.
+// Finalize: emit the remaining realizable frames, then the accumulated output is
+// complete. For the KV path this evaluates only the final frontend-flush frames
+// through the transformer (never a replay of the encoder prefix).
 bool voxtral_encoder_stream_finish(voxtral_encoder_stream * es) {
     if (!es) return false;
     if (es->finalized) return true;
+
+    if (es->kv) {
+        const bool ok = encoder_kv_drive(es->kv, /*final=*/true);
+        es->kv->finalized = true;
+        es->finalized = true;
+        es->emitted = es->kv->emitted;
+        es->kv->mel_tail.clear();           // frames complete; tail no longer needed
+        es->kv->tail_base = es->kv->stable_mel;
+        return ok;
+    }
+
     const bool ok = encoder_stream_drive(es, /*final=*/true);
     es->finalized = true;
     es->encoder_new_frames = es->emitted;
-    // Frames are complete; the retained Mel window is no longer needed.
     es->mel_window.clear();
     es->window_base = es->stable_mel;
     return ok;
 }
 
 const float * voxtral_encoder_stream_output(const voxtral_encoder_stream * es) {
-    return (es && !es->enc_accum.empty()) ? es->enc_accum.data() : nullptr;
+    if (!es) return nullptr;
+    const std::vector<float> & accum = es->kv ? es->kv->enc_accum : es->enc_accum;
+    return accum.empty() ? nullptr : accum.data();
 }
 
 int32_t voxtral_encoder_stream_output_frames(const voxtral_encoder_stream * es) {
-    return es ? (int32_t) es->emitted : 0;
+    if (!es) return 0;
+    return (int32_t) (es->kv ? es->kv->emitted : es->emitted);
 }
 
 voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_stream * es) {
     voxtral_encoder_metrics m{};
     if (!es) return m;
+
+    if (es->kv) {
+        const voxtral_encoder_kv_state * kv = es->kv;
+        m.strategy                     = "per-layer-kv";
+        m.melFramesReceived            = es->mel_frames_received;
+        m.encoderExecutions            = kv->graph_execs;
+        m.encoderNewFramesProduced     = kv->emitted;
+        m.encoderContextFramesRetained = (int64_t) (kv->mel_tail.size() / (size_t) VOXTRAL_MEL_N_MEL);
+        m.encoderPeakContextFrames     = kv->peak_mel_tail;
+        m.encoderFramesBeforeFinish    = kv->frames_before_finish;
+        m.encoderFramesFlushedAtFinish = kv->frames_at_finish;
+        m.encoderOutputFrames          = kv->emitted;
+        m.encoderStateBytes            = (int64_t) (kv->mel_tail.capacity() * sizeof(float) +
+                                                    kv->conv_cm.capacity() * sizeof(float) +
+                                                    kv->mask_buf.capacity() * sizeof(float));
+        m.encoderOutputAccumulatedBytes= (int64_t) (kv->enc_accum.size() * sizeof(float));
+        m.finalized                    = kv->finalized;
+        // Ideal work: each unique enc frame runs the transformer exactly once.
+        m.encoderUniqueFrames             = kv->emitted;
+        m.encoderTransformerFramesComputed= kv->transformer_frames;
+        m.encoderFrameLayerEvaluations    = kv->transformer_frames * (int64_t) es->ctx->model->hp.enc_layers;
+        m.encoderInputFramesProcessed     = kv->transformer_frames;   // transformer frames (unit: enc frames)
+        m.encoderFramesRecomputed         = kv->transformer_frames - kv->emitted;   // 0 in the ideal case
+        m.encoderKvAppends                = kv->kv_appends;
+        m.encoderKvEvictions              = kv->kv_evictions;
+        m.encoderKvWraps                  = kv->kv_wraps;
+        m.encoderKvMaterializedFrames     = kv->kv_materialized;
+        m.encoderGraphExecutions          = kv->graph_execs;
+        m.encoderMaxNewFramesPerExecution = kv->max_new_per_exec;
+        m.encoderMaxWindowFrames          = kv->max_new_per_exec;
+        m.encoderFramesComputedDuringFinish= kv->frames_at_finish_exec;
+        m.encoderKvAllocatedBytes         = kv->ring_bytes;
+        m.encoderKvLogicalFrames          = kv->emitted - std::max<int64_t>(0, kv->emitted - VOXTRAL_ENC_WINDOW);
+        m.encoderKvPeakLogicalFrames      = kv->peak_logical;
+        m.encoderKvCapacityFrames         = VOXTRAL_ENC_KV_CAP;
+        m.encoderKvElementSize            = (int32_t) sizeof(float);
+        m.encoderMelRetainedBytes         = (int64_t) (kv->mel_tail.size() * sizeof(float));
+        m.encoderMelRetainedFrames        = (int64_t) (kv->mel_tail.size() / (size_t) VOXTRAL_MEL_N_MEL);
+        m.encoderMelPeakRetainedFrames    = kv->peak_mel_tail;
+        m.encoderOutputQueuedFrames       = kv->emitted;
+        m.encoderOutputPeakQueuedFrames   = kv->peak_output;
+        return m;
+    }
+
+    m.strategy                    = "bounded-window-recompute";
     m.melFramesReceived           = es->mel_frames_received;
     m.encoderExecutions           = es->encoder_executions;
     m.encoderInputFramesProcessed = es->encoder_input_frames;
@@ -2403,6 +3114,9 @@ voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_str
     m.encoderOutputAccumulatedBytes = (int64_t) (es->enc_accum.size() * sizeof(float));
     m.curChunk                    = es->cur_chunk;
     m.finalized                   = es->finalized;
+    m.encoderUniqueFrames             = es->emitted;
+    m.encoderTransformerFramesComputed= es->encoder_input_frames;   // reference recomputes overlap
+    m.encoderKvCapacityFrames         = 0;
     return m;
 }
 
@@ -2837,9 +3551,9 @@ bool voxtral_transcribe_mel_internal(
         return false;
     }
 
-    // Run encoder (chunked for arbitrarily long audio)
+    // Run encoder (global sliding-window by default; legacy chunked via strategy env)
     auto t_encoder = std::chrono::steady_clock::now();
-    if (!run_encoder_chunked(&ctx, mel, n_frames)) {
+    if (!run_encoder_batch(&ctx, mel, n_frames)) {
         return false;
     }
     LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
@@ -2914,7 +3628,7 @@ bool voxtral_encode_mel_batch_internal(
     if (mel == nullptr || n_frames <= 0) {
         return false;
     }
-    if (!run_encoder_chunked(&ctx, mel, n_frames)) {
+    if (!run_encoder_batch(&ctx, mel, n_frames)) {
         return false;
     }
     const int32_t frames = ctx.enc_seq_used;

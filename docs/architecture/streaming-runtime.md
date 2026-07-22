@@ -1272,3 +1272,118 @@ encoder ~123 мс во всех вариантах — overhead накоплен
   место, где сейчас вызывается полный батч. Следующий шаг — заменить полный батч на
   `mel_begin/push/flush` (§6.3) поверх того же буфера, сохраняя ≥240 сэмплов PCM для
   STFT-overlap; parity-тесты (chunk-invariance) уже готовы как регресс-щит.
+
+---
+
+## Сессия 6.1 — per-layer encoder KV-cache + унификация на global encoder ✅ SRC / 🧪 EXP
+
+Session 6 реализовала incremental encoder как **bounded-window recomputation** (реплей
+`run_encoder_chunked`). Session 6.1 заменяет его на настоящий **per-layer KV-cache** и —
+по решению — **унифицирует и батч-энкодер** на ту же global sliding-window семантику.
+
+### Почему global, а не «bit-exact к chunked»
+
+`run_encoder_chunked` — это lossy приближение: для потоков > ~30 с каждый чанк c≥1
+пересчитывает ~750 «warmup» кадров с **усечённым** окном внимания (обрезано к началу
+чанка) и **zero-pad** conv на стыке; kept-кадры чанка аттендят эти усечённые K/V. Настоящий
+KV-cache (каждый кадр считается один раз, реальное окно 750) — artifact-free и **более
+корректный**, поэтому он не может быть bit-exact к chunked на длинных потоках (выход
+chunked зависит именно от того пересчёта, который KV устраняет). Для single-chunk (< 30 с)
+разницы нет (warmup чанка 0 обрезается к истинному началу = корректно), поэтому короткий
+baseline transcript не меняется.
+
+**Решение:** KV-энкодер — источник истины. Батч/оффлайн путь (`run_encoder_global`) переведён
+на ту же global-семантику; `run_encoder_chunked` остаётся legacy/reference за переключателем
+`VOXTRAL_ENCODER_STRATEGY=reference` (для A/B, tensor-parity и regression-debug). Значение по
+умолчанию (`kv`) — streaming KV + batch global.
+
+### Точная форма encoder KV (✅ SRC `include/voxtral.h`, `src/voxtral.cpp`)
+
+| Параметр | Значение | Источник |
+|---|---|---|
+| enc_layers | 32 | `VOXTRAL_ENC_LAYERS` |
+| enc_dim | 1280 | `VOXTRAL_ENC_DIM` |
+| enc_heads / enc_kv_heads | 32 / 32 (MHA, без GQA) | `VOXTRAL_ENC_HEADS/KV_HEADS` |
+| enc_head_dim | 64 | `VOXTRAL_ENC_HEAD_DIM` |
+| kv_dim | 2048 (= 32×64) | derived |
+| window | 750 enc (≈15 с) | `VOXTRAL_ENC_WINDOW` |
+| K/V element type | **F32** | matches decoder KV + reference precision |
+| ring capacity (CAP) | 878 (= window + MAX_NEW 128) | `VOXTRAL_ENC_KV_CAP` |
+| bytes/frame (K+V, все слои) | 524288 (0.5 MB) | 2048×2×32×4 |
+| **encoder KV device bytes/stream** | **460 MB** (= CAP×0.5 MB) | 🧪 EXP RX 6600 |
+
+### Физическая стратегия — кольцевой буфер, gather-on-attention
+
+Тензоры `enc_kv_k/v = [kv_dim, CAP, enc_layers]` F32 на backend, per-stream (в
+`voxtral_encoder_kv_state`, свой `ggml_context`+buffer, освобождается на destroy). Слот =
+`abs_pos % CAP`. **RoPE-позиции абсолютные** (0,1,2,… неизменны после rollover; slot ≠
+position). Причинная маска `[max(0,q−749),q]`. На каждую KV-graph-экзекуцию:
+
+1. новые Mel → conv (bit-exact incremental: feed `Mel[max(0,2(P−2)),2(P+N))`, slice) → новые
+   enc-кадры `x [enc_dim,N]`;
+2. per layer: norm → Q/K/V только новых кадров → RoPE(abs) → **запись** post-RoPE K и V в ring
+   (`ggml_cpy` по физическим слотам, ≤2 сегмента при wrap);
+3. окно `[win_start, win_end)` собирается как contiguous `[kv_dim, L]`: **новые** кадры берутся
+   прямо из `k_store/v_store` этой экзекуции (без round-trip через ring — исключает
+   read-after-write того же графа), **старые** — из committed ring (cont / concat при wrap);
+4. attention новых Q по окну (маска `[L,N]`), O-proj, residual, SwiGLU FFN;
+5. final norm → новые enc-кадры → host accum.
+
+Планировщик колец (`voxtral_enc_kv_plan`) — единственная копия wrap/eviction-арифметики,
+залочена model-free тестом `tests/cpp/test_encoder_kv.cpp` (append, wrap, eviction, causal
+mask, абсолютные позиции через rollover, conv-alignment; ground-truth ring-модель).
+
+### Grid-aligned batching — ключ к feed-plan-инвариантности 🧪 EXP
+
+Кадры прогоняются через трансформер **фиксированными батчами, выровненными по сетке**
+(старт = кратное `MAX_NEW=128`). Тем самым форма причинного окна кадра (`win_start`, `L`) не
+зависит от плана подачи. Это критично: без выравнивания порядок редукции в attention-matmul
+(позиция аттендуемого блока в окне) зависел бы от `win_start`, и результат уплывал бы по
+feed-плану на ~0.02 (накапливаясь через KV-cache). С выравниванием streaming == global batch
+**bit-for-bit** на всех планах и через rollover. Во время feed эмитятся только полные grid-батчи
+(остаток буферизуется); finish досыпает остаток + right-pad.
+
+Attention по умолчанию — **fused flash** (быстрее); grid-выравнивание делает выбор
+kernel-варианта детерминированным, поэтому flash bit-exact. `VOXTRAL_ENC_KV_MANUAL` включает
+non-fused `softmax(scale·QKᵀ+mask)·V` (сам по себе window-shape-инвариантен) как reference.
+
+### Численный parity (RX 6600, Vulkan) 🧪 EXP
+
+| Клип | Планы | enc frames | KvWraps | Work ratio | Max abs delta vs global batch | Result |
+|---|---|---|---|---|---|---|
+| 3.6 с (single-chunk) | full/1000/480/320/160/80 мс | 376 | 0 | 1.0 | **0** (bit-exact) | ✅ |
+| 32 с (rollover) | full/80/480 мс | 1808 | 4 | 1.0 | **0** (bit-exact) | ✅ |
+| 120 с (много rollover) | full/80 мс | 6284 | 22 | 1.0 | **0** (bit-exact) | ✅ |
+
+`encoderTransformerFramesComputed == encoderUniqueFrames`, `frameLayerEvaluations = frames×32`,
+одинаковый `encoderSha256`/токены/transcript по всем планам. Короткий baseline transcript
+(«What are you doing here? He asked.») не изменился. Legacy chunked (reference) на длинных
+потоках расходится (задокументированный warmup-артефакт), на коротких — совпадает.
+
+### Эффективность / память / finish 🧪 EXP
+
+- Work ratio == 1.0 (каждый кадр — один раз; никакого bounded-window replay). Периодические
+  ~100 мс recompute-спайки устранены.
+- **Latency (80 мс feed):** p95 ≈ 0.9 мс (< 20 мс), warmup-excluded max ≈ 73–78 мс (< 80 мс).
+  Grid-batch (128 кадров) исполняется раз в ~GRID/4 feed; между ними feed только буферизует.
+- **Encoder KV** = 460 MB/stream (F32), константа, не растёт с длительностью; logical frames ≤ 750;
+  освобождается на destroy; reset — только метаданные (без device memset); два стрима — разные
+  буферы. **Mel** для production streaming — ограниченный tail (≤ ~130 кадров, не растёт с
+  длительностью); полная Mel-история больше не удерживается encoder-путём.
+- **finish** прогоняет через трансформер только финальный flush (буферизованный неполный
+  grid + right-pad), никогда не реплеит encoder-префикс.
+
+### Ограничения (обязательный статус)
+
+```
+PCM/STFT/log-Mel is incremental.
+The causal convolutions are incremental.
+The transformer encoder uses a per-layer bounded KV-cache; each encoder frame is evaluated once.
+The batch/offline encoder is unified on the same artifact-free global sliding-window semantics;
+the legacy chunked bounded-window recompute is retained behind VOXTRAL_ENCODER_STRATEGY=reference.
+Full Mel history is not retained by the production path.
+Adapter and decoder still run only at finish.
+Encoder output is still accumulated until the adapter becomes incremental.
+No token or partial transcript is emitted during feed.
+This is not complete end-to-end real-time transcription yet.
+```

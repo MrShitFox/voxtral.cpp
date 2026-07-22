@@ -325,6 +325,7 @@ struct StreamRun {
     std::string encoderSha;
     double   encoderMaxAbsDeltaVsBatch = 0.0;
     bool     fullMelReencodedAtFinish  = false;
+    voxtral_encoder_metrics encMetrics;   // full strategy + KV work/memory instrumentation
 
     // Per-feed latency (data feeds only): incremental Mel + encoder work per feed.
     int64_t  dataFeeds            = 0;
@@ -332,6 +333,7 @@ struct StreamRun {
     double   feedLatencyP50Ms     = 0.0;
     double   feedLatencyP95Ms     = 0.0;
     double   feedLatencyMaxMs     = 0.0;
+    double   feedLatencyWarmMaxMs = 0.0;   // max excluding warmup (first few feeds)
     double   finishLatencyMs      = 0.0;
 };
 
@@ -367,6 +369,25 @@ double encoder_delta_vs_batch(const voxtral_context * cctx,
     for (int64_t i = 0; i < n; ++i) {
         const double d = std::fabs((double) batch_enc[(size_t) i] - (double) inc_enc[(size_t) i]);
         if (d > md) md = d;
+    }
+    if (getenv("VOXTRAL_ENC_KV_DIAG")) {
+        auto frame_delta = [&](int32_t f) {
+            double fm = 0.0;
+            for (int32_t c = 0; c < VOXTRAL_ENC_DIM; ++c) {
+                const size_t i = (size_t) f * VOXTRAL_ENC_DIM + c;
+                fm = std::max(fm, std::fabs((double) batch_enc[i] - (double) inc_enc[i]));
+            }
+            return fm;
+        };
+        int first_bad = -1, bad_frames = 0;
+        for (int32_t f = 0; f < batch_frames; ++f) if (frame_delta(f) > 1e-4) { if (first_bad<0) first_bad=f; ++bad_frames; }
+        std::fprintf(stderr, "[ENC_KV_DIAG] frames=%d firstBad=%d badFrames=%d maxDelta=%.6g\n",
+                     batch_frames, first_bad, bad_frames, md);
+        std::fprintf(stderr, "[ENC_KV_DIAG] curve:");
+        for (int32_t f : {0, 1, 2, 4, 8, 16, 32, 64, 100, 150, 200, 250, 300, 303, 304, 320, 350, 375}) {
+            if (f < batch_frames) std::fprintf(stderr, " f%d=%.2e", f, frame_delta(f));
+        }
+        std::fprintf(stderr, "\n");
     }
     return md;
 }
@@ -462,6 +483,10 @@ StreamRun drive_stream(voxtral_stream * stream,
         r.feedLatencyP50Ms  = percentile(feed_ms, 0.50);
         r.feedLatencyP95Ms  = percentile(feed_ms, 0.95);
         r.feedLatencyMaxMs  = percentile(feed_ms, 1.00);
+        // Warmup-excluded max: drop the first few feeds (Vulkan pipeline/shader
+        // creation happens on the first encoder graph execution).
+        std::vector<double> warm(feed_ms.begin() + std::min<size_t>(feed_ms.size(), 3), feed_ms.end());
+        r.feedLatencyWarmMaxMs = warm.empty() ? r.feedLatencyMaxMs : percentile(warm, 1.00);
     }
 
     // Chunk-invariant SHA-256 of the full canonical PCM (maintained incrementally
@@ -511,6 +536,7 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.encoderContextFramesRetained  = voxtral_stream_encoder_context_frames_retained(stream);
     r.encoderStateBytes             = voxtral_stream_encoder_state_bytes(stream);
     r.encoderOutputAccumulatedBytes = voxtral_stream_encoder_output_accumulated_bytes(stream);
+    r.encMetrics                    = voxtral_stream_encoder_metrics_full(stream);
     r.fullMelReencodedAtFinish      = false;   // finish runs at most the last 1-2 encoder chunks
 
     const float * inc_enc    = voxtral_stream_encoder_output_data(stream);
@@ -570,8 +596,35 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"pcmBaseSample\":" << r.pcmBaseSample << ",";
     js << "\"fullPcmBufferedAtFinish\":" << (r.fullPcmBufferedAtFinish ? "true" : "false") << ",";
     // --- Incremental causal encoder ---
+    const voxtral_encoder_metrics & em = r.encMetrics;
+    const double workRatio = em.encoderUniqueFrames > 0
+        ? (double) em.encoderTransformerFramesComputed / (double) em.encoderUniqueFrames : 0.0;
     js << "\"incrementalEncoder\":" << (r.incrementalEncoder ? "true" : "false") << ",";
-    js << "\"encoderStrategy\":\"bounded-window-recompute\",";
+    js << "\"encoderStrategy\":\"" << (em.strategy ? em.strategy : "per-layer-kv") << "\",";
+    js << "\"referenceStrategyAvailable\":true,";
+    // Per-layer KV work instrumentation (Stage 16).
+    js << "\"encoderUniqueFrames\":" << em.encoderUniqueFrames << ",";
+    js << "\"encoderTransformerFramesComputed\":" << em.encoderTransformerFramesComputed << ",";
+    js << "\"encoderFrameLayerEvaluations\":" << em.encoderFrameLayerEvaluations << ",";
+    js << "\"encoderWorkRatio\":" << workRatio << ",";
+    js << "\"encoderKvAppends\":" << em.encoderKvAppends << ",";
+    js << "\"encoderKvEvictions\":" << em.encoderKvEvictions << ",";
+    js << "\"encoderKvWraps\":" << em.encoderKvWraps << ",";
+    js << "\"encoderKvMaterializedFrames\":" << em.encoderKvMaterializedFrames << ",";
+    js << "\"encoderGraphExecutions\":" << em.encoderGraphExecutions << ",";
+    js << "\"encoderMaxNewFramesPerExecution\":" << em.encoderMaxNewFramesPerExecution << ",";
+    js << "\"encoderFramesComputedDuringFinish\":" << em.encoderFramesComputedDuringFinish << ",";
+    // Per-layer KV memory instrumentation (Stage 17).
+    js << "\"encoderKvAllocatedBytes\":" << em.encoderKvAllocatedBytes << ",";
+    js << "\"encoderKvLogicalFrames\":" << em.encoderKvLogicalFrames << ",";
+    js << "\"encoderKvPeakLogicalFrames\":" << em.encoderKvPeakLogicalFrames << ",";
+    js << "\"encoderKvCapacityFrames\":" << em.encoderKvCapacityFrames << ",";
+    js << "\"encoderKvElementSize\":" << em.encoderKvElementSize << ",";
+    js << "\"encoderMelRetainedFrames\":" << em.encoderMelRetainedFrames << ",";
+    js << "\"encoderMelPeakRetainedFrames\":" << em.encoderMelPeakRetainedFrames << ",";
+    js << "\"encoderMelRetainedBytes\":" << em.encoderMelRetainedBytes << ",";
+    js << "\"encoderOutputQueuedFrames\":" << em.encoderOutputQueuedFrames << ",";
+    js << "\"encoderOutputPeakQueuedFrames\":" << em.encoderOutputPeakQueuedFrames << ",";
     js << "\"encoderFrames\":" << r.encoderFrames << ",";
     js << "\"encoderFramesBeforeFinish\":" << r.encoderFramesBeforeFinish << ",";
     js << "\"encoderFramesFlushedAtFinish\":" << r.encoderFramesFlushedAtFinish << ",";
@@ -591,6 +644,7 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"feedLatencyP50Ms\":" << r.feedLatencyP50Ms << ",";
     js << "\"feedLatencyP95Ms\":" << r.feedLatencyP95Ms << ",";
     js << "\"feedLatencyMaxMs\":" << r.feedLatencyMaxMs << ",";
+    js << "\"feedLatencyWarmMaxMs\":" << r.feedLatencyWarmMaxMs << ",";
     js << "\"finishLatencyMs\":" << r.finishLatencyMs << ",";
     js << "\"contextOwnedByStream\":" << (r.contextOwned ? "true" : "false") << ",";
     js << "\"tokens\":[";

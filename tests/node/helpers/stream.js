@@ -43,6 +43,7 @@ export async function runStreamSession({
   modelPath = null,
   maxTokens = 0,
   ab = false,
+  env = null,
   timeoutMs = 300_000,
 } = {}) {
   const binary = remoteStreamBinary(config);
@@ -72,7 +73,11 @@ export async function runStreamSession({
     args.push("--mode", mode);
   }
 
-  const command = `cd ${shellQuote(config.remoteRepo)} && ${args.join(" ")}`;
+  // Optional environment (e.g. VOXTRAL_ENCODER_STRATEGY=reference, VOXTRAL_ENC_KV_GRID).
+  const envPrefix = env
+    ? Object.entries(env).map(([k, v]) => `${k}=${shellQuote(String(v))}`).join(" ") + " "
+    : "";
+  const command = `cd ${shellQuote(config.remoteRepo)} && ${envPrefix}${args.join(" ")}`;
   const proc = await runRemote(command, { config, timeoutMs });
 
   const jsonLine = proc.stdout
