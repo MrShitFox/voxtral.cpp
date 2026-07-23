@@ -1780,6 +1780,197 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "]";
 }
 
+// ============================================================================
+// Session 9 — production lifecycle hardening.
+//
+// Reuse ONE owned context/stream across many sequential short streams via
+// reset(), proving VRAM/RSS plateau, byte-identical token output every
+// iteration (no stale KV / token history / event sequence), and a documented
+// reset->created transition. Then exercise the lifecycle edge cases against the
+// state-machine contract (finish idempotency, feed-after-finish rejection,
+// cancel, reset-after-terminal, destroy under backpressure). Emits one JSON
+// line for the Node acceptance harness.
+// ============================================================================
+int run_sequential_streams(voxtral_model * model,
+                           const voxtral_context_params & cp,
+                           voxtral_stream_params sp,
+                           const std::vector<int16_t> & full_pcm,
+                           int32_t iterations,
+                           int32_t short_samples) {
+    const size_t K = std::min<size_t>((size_t) std::max(1, short_samples), full_pcm.size());
+    const std::vector<int16_t> pcm(full_pcm.begin(), full_pcm.begin() + K);
+    const size_t chunk = (size_t) 80 * VOXTRAL_SAMPLE_RATE / 1000;   // 80 ms = 1280 samples
+    std::vector<size_t> counts;
+    for (size_t o = 0; o < K; o += chunk) counts.push_back(std::min<size_t>(chunk, K - o));
+
+    DriveOptions opt;
+    opt.paced = false;
+    opt.check_parity = false;
+    opt.check_manual_oracle = false;
+    opt.retain_event_history = false;
+
+    voxtral_stream * stream = voxtral_stream_create_internal(model, cp, sp);
+    if (!stream) { std::cerr << "sequential: stream create failed\n"; return 5; }
+    voxtral_stream_warmup_internal(stream);   // prepare graphs/shaders once
+
+    struct Iter {
+        int32_t i; size_t tokens; int64_t vram; int64_t rss;
+        uint64_t events; std::string stateAfterFinish;
+        std::string resetStatus; bool resetPristine; bool tokensMatchFirst;
+    };
+    std::vector<Iter> iters; iters.reserve(iterations);
+    std::vector<int32_t> first_tokens;
+    bool all_tokens_consistent = true, all_reset_pristine = true, all_reset_ok = true;
+
+    for (int32_t i = 0; i < iterations; ++i) {
+        StreamRun run = drive_stream(stream, pcm, counts, opt);
+        Iter it{};
+        it.i = i;
+        it.tokens = run.tokens.size();
+        it.vram = read_vram_used_bytes();
+        it.rss = read_process_rss_kib();
+        it.events = voxtral_stream_events_emitted(stream);
+        it.stateAfterFinish = voxtral_stream_state_name(voxtral_stream_get_state(stream));
+        if (i == 0) first_tokens = run.tokens;
+        it.tokensMatchFirst = (run.tokens == first_tokens);
+        if (!it.tokensMatchFirst) all_tokens_consistent = false;
+
+        const voxtral_status rs = voxtral_stream_reset_internal(stream);
+        it.resetStatus = voxtral_stream_status_name(rs);
+        if (rs != voxtral_status::ok) all_reset_ok = false;
+        voxtral_stream_event ev;
+        it.resetPristine = rs == voxtral_status::ok &&
+            voxtral_stream_get_state(stream) == voxtral_stream_state::created &&
+            voxtral_stream_samples_received(stream) == 0 &&
+            voxtral_stream_samples_consumed(stream) == 0 &&
+            voxtral_stream_tokens(stream).empty() &&
+            voxtral_stream_transcript(stream).empty() &&
+            voxtral_stream_events_emitted(stream) == 0 &&
+            !voxtral_stream_poll_event(stream, ev);
+        if (!it.resetPristine) all_reset_pristine = false;
+        iters.push_back(it);
+    }
+    voxtral_stream_destroy_internal(stream);
+
+    // Plateau over the last min(20, N) iterations (excludes warmup fault-in).
+    const size_t tail = std::min<size_t>(20, iters.size());
+    int64_t vram_lo = INT64_MAX, vram_hi = 0, rss_lo = INT64_MAX, rss_hi = 0;
+    for (size_t k = iters.size() - tail; k < iters.size(); ++k) {
+        vram_lo = std::min(vram_lo, iters[k].vram); vram_hi = std::max(vram_hi, iters[k].vram);
+        rss_lo  = std::min(rss_lo,  iters[k].rss);  rss_hi  = std::max(rss_hi,  iters[k].rss);
+    }
+
+    // ---- lifecycle edge cases against the documented state machine ----
+    struct Edge { std::string name; bool pass; std::string detail; };
+    std::vector<Edge> edges; bool all_edges_pass = true;
+    auto add_edge = [&](const std::string & name, bool pass, const std::string & detail) {
+        edges.push_back({name, pass, detail});
+        if (!pass) all_edges_pass = false;
+    };
+
+    // (a) finish idempotency + feed-after-finish rejection.
+    {
+        voxtral_stream * s = voxtral_stream_create_internal(model, cp, sp);
+        for (size_t o = 0; o < pcm.size(); o += chunk) {
+            const size_t c = std::min<size_t>(chunk, pcm.size() - o);
+            voxtral_stream_feed_pcm16_internal(s, pcm.data() + o, c);
+        }
+        const voxtral_status f1 = voxtral_stream_finish_internal(s);
+        const voxtral_status f2 = voxtral_stream_finish_internal(s);   // idempotent -> ok
+        const int16_t one = 0;
+        const voxtral_status fa = voxtral_stream_feed_pcm16_internal(s, &one, 1);  // -> err
+        add_edge("finish_twice_idempotent", f1 == voxtral_status::ok && f2 == voxtral_status::ok,
+                 std::string(voxtral_stream_status_name(f1)) + "/" + voxtral_stream_status_name(f2));
+        add_edge("feed_after_finish_rejected", fa != voxtral_status::ok,
+                 voxtral_stream_status_name(fa));
+        voxtral_stream_destroy_internal(s);
+    }
+    // (b) cancel mid-stream, then finish (no inference) and reset -> created.
+    {
+        voxtral_stream * s = voxtral_stream_create_internal(model, cp, sp);
+        if (!pcm.empty()) voxtral_stream_feed_pcm16_internal(s, pcm.data(), std::min<size_t>(chunk, pcm.size()));
+        const voxtral_status cx = voxtral_stream_cancel_internal(s);
+        const bool cancelled = voxtral_stream_get_state(s) == voxtral_stream_state::cancelled;
+        const voxtral_status fin = voxtral_stream_finish_internal(s);   // ok, no inference
+        const voxtral_status rs = voxtral_stream_reset_internal(s);
+        add_edge("cancel_sets_cancelled", cx == voxtral_status::ok && cancelled,
+                 voxtral_stream_status_name(cx));
+        add_edge("finish_after_cancel_ok", fin == voxtral_status::ok, voxtral_stream_status_name(fin));
+        add_edge("reset_after_cancel_created",
+                 rs == voxtral_status::ok && voxtral_stream_get_state(s) == voxtral_stream_state::created,
+                 voxtral_stream_status_name(rs));
+        voxtral_stream_destroy_internal(s);
+    }
+    // (c) destroy under backpressure: fill the bounded event queue, never drain,
+    //     then destroy. Reaching the next line = no crash / no deadlock.
+    {
+        voxtral_stream * s = voxtral_stream_create_internal(model, cp, sp);
+        voxtral_stream_test_set_max_events(s, 1);
+        for (size_t o = 0; o < pcm.size(); o += chunk) {
+            const size_t c = std::min<size_t>(chunk, pcm.size() - o);
+            voxtral_stream_feed_pcm16_internal(s, pcm.data() + o, c);   // no poll -> queue fills
+        }
+        voxtral_stream_finish_internal(s);
+        voxtral_stream_destroy_internal(s);   // destroy without draining
+        add_edge("destroy_under_backpressure_no_crash", true, "reached");
+    }
+    // (d) reset from created / double reset is a safe no-op.
+    {
+        voxtral_stream * s = voxtral_stream_create_internal(model, cp, sp);
+        const voxtral_status r1 = voxtral_stream_reset_internal(s);
+        const voxtral_status r2 = voxtral_stream_reset_internal(s);
+        add_edge("reset_from_created_idempotent",
+                 r1 == voxtral_status::ok && r2 == voxtral_status::ok,
+                 std::string(voxtral_stream_status_name(r1)) + "/" + voxtral_stream_status_name(r2));
+        voxtral_stream_destroy_internal(s);
+    }
+
+    const bool overall = all_tokens_consistent && all_reset_pristine && all_reset_ok && all_edges_pass;
+    std::ostringstream js;
+    js << "{";
+    js << "\"mode\":\"sequential-streams\",";
+    js << "\"iterations\":" << iterations << ",";
+    js << "\"shortSamples\":" << K << ",";
+    js << "\"tokensPerStream\":" << (iters.empty() ? 0 : iters[0].tokens) << ",";
+    js << "\"allTokensConsistent\":" << (all_tokens_consistent ? "true" : "false") << ",";
+    js << "\"allResetPristine\":" << (all_reset_pristine ? "true" : "false") << ",";
+    js << "\"allResetOk\":" << (all_reset_ok ? "true" : "false") << ",";
+    js << "\"tailWindow\":" << tail << ",";
+    js << "\"vramTailLoBytes\":" << vram_lo << ",\"vramTailHiBytes\":" << vram_hi << ",";
+    js << "\"vramTailRangeBytes\":" << (vram_hi - vram_lo) << ",";
+    js << "\"rssTailLoKiB\":" << rss_lo << ",\"rssTailHiKiB\":" << rss_hi << ",";
+    js << "\"rssTailRangeKiB\":" << (rss_hi - rss_lo) << ",";
+    js << "\"firstVramBytes\":" << (iters.empty() ? 0 : iters.front().vram) << ",";
+    js << "\"lastVramBytes\":" << (iters.empty() ? 0 : iters.back().vram) << ",";
+    js << "\"firstRssKiB\":" << (iters.empty() ? 0 : iters.front().rss) << ",";
+    js << "\"lastRssKiB\":" << (iters.empty() ? 0 : iters.back().rss) << ",";
+    js << "\"edges\":[";
+    for (size_t e = 0; e < edges.size(); ++e) {
+        if (e) js << ",";
+        js << "{\"name\":\"" << edges[e].name << "\",\"pass\":" << (edges[e].pass ? "true" : "false")
+           << ",\"detail\":\"" << edges[e].detail << "\"}";
+    }
+    js << "],";
+    js << "\"allEdgesPass\":" << (all_edges_pass ? "true" : "false") << ",";
+    js << "\"iters\":[";
+    for (size_t k = 0; k < iters.size(); ++k) {
+        if (k) js << ",";
+        js << "{\"i\":" << iters[k].i << ",\"tokens\":" << iters[k].tokens
+           << ",\"vram\":" << iters[k].vram << ",\"rss\":" << iters[k].rss
+           << ",\"events\":" << iters[k].events
+           << ",\"stateAfterFinish\":\"" << iters[k].stateAfterFinish << "\""
+           << ",\"resetStatus\":\"" << iters[k].resetStatus << "\""
+           << ",\"resetPristine\":" << (iters[k].resetPristine ? "true" : "false")
+           << ",\"tokensMatchFirst\":" << (iters[k].tokensMatchFirst ? "true" : "false") << "}";
+    }
+    js << "],";
+    js << "\"state\":\"" << (overall ? "completed" : "failed") << "\",";
+    js << "\"ok\":" << (overall ? "true" : "false");
+    js << "}";
+    std::cout << js.str() << "\n";
+    return overall ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -1800,6 +1991,8 @@ int main(int argc, char ** argv) {
     bool discard_event_history = false;
     int32_t synthetic_seconds = 0;    // >0: generate synthetic audio instead of reading --wav
     uint64_t max_total_samples = 0;   // >0: override the stream's full-buffer sample cap
+    int32_t sequential_streams = 0;   // >0: reuse one context/stream across N short streams
+    int32_t sequential_samples = 48000; // short-clip length per sequential iteration (3 s)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1825,6 +2018,8 @@ int main(int argc, char ** argv) {
         else if (a == "--discard-event-history") { discard_event_history = true; }
         else if (a == "--synthetic-seconds") { const char * v = val("--synthetic-seconds"); if (!v) return 2; synthetic_seconds = int32_t(std::strtol(v, nullptr, 10)); }
         else if (a == "--max-total-samples") { const char * v = val("--max-total-samples"); if (!v) return 2; max_total_samples = std::strtoull(v, nullptr, 10); }
+        else if (a == "--sequential-streams") { const char * v = val("--sequential-streams"); if (!v) return 2; sequential_streams = int32_t(std::strtol(v, nullptr, 10)); }
+        else if (a == "--sequential-samples") { const char * v = val("--sequential-samples"); if (!v) return 2; sequential_samples = int32_t(std::strtol(v, nullptr, 10)); }
         else if (a == "--gpu") {
             const char * v = val("--gpu"); if (!v) return 2;
             std::string g = v;
@@ -1923,6 +2118,11 @@ int main(int argc, char ** argv) {
     sp.max_tokens = max_tokens;
     sp.retain_mel_history = !skip_parity || manual_oracle;
     if (max_total_samples > 0) sp.max_total_samples = max_total_samples;
+
+    // Session 9 production lifecycle / sequential-reuse harness (own dispatch).
+    if (sequential_streams > 0) {
+        return run_sequential_streams(model, cp, sp, pcm16, sequential_streams, sequential_samples);
+    }
 
     int exit_code = 0;
     std::ostringstream js;
