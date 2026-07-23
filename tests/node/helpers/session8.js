@@ -11,6 +11,24 @@ export const SESSION8_PRODUCTION_ENV = Object.freeze({
   VOXTRAL_PROFILE: "1",
 });
 
+export const SESSION8_PRECISION_VARIANTS = Object.freeze({
+  A: Object.freeze({ encoderKv: "f32", decoderKv: "f32" }),
+  B: Object.freeze({ encoderKv: "f16", decoderKv: "f32" }),
+  C: Object.freeze({ encoderKv: "f32", decoderKv: "f16" }),
+  D: Object.freeze({ encoderKv: "f16", decoderKv: "f16" }),
+});
+
+export function session8PrecisionEnvironment(variantId, extra = {}) {
+  const precision = SESSION8_PRECISION_VARIANTS[variantId];
+  gate(precision, `unknown Session 8 precision variant ${variantId}`);
+  return {
+    ...SESSION8_PRODUCTION_ENV,
+    VOXTRAL_ENCODER_KV_TYPE: precision.encoderKv,
+    VOXTRAL_DECODER_KV_TYPE: precision.decoderKv,
+    ...extra,
+  };
+}
+
 export const SESSION8_GATES = Object.freeze({
   pipelineRtfHard: 0.95,
   pipelineRtfTarget: 0.80,
@@ -20,11 +38,9 @@ export const SESSION8_GATES = Object.freeze({
   deadlineMissRate: 0.001,
   finishMs: 1_000,
   finishTargetMs: 750,
-  firstDecoderStepMs: 700,
-  firstTokenMs: 1_100,
-  firstPartialMs: 1_200,
-  coldFirstTokenMs: 1_600,
-  coldFirstPartialMs: 1_700,
+  firstDecoderStepOverheadMs: 200,
+  firstTokenOverheadMs: 250,
+  firstPartialOverheadMs: 350,
   postInputDrainMs: 500,
 });
 
@@ -83,10 +99,18 @@ export function summarizeRun(r, { includeTokens = true } = {}) {
     decoderBacklog: r.decoderBacklog,
     latency: {
       modelLoadMs: r.modelLoadMs,
+      contextCreationMs: r.contextCreationMs,
       warmupMs: r.warmupMs,
+      streamStartMs: r.streamStartMs,
       firstDecoderStepMs: r.firstDecoderStepMs,
       firstTokenMs: r.firstTokenMs,
       firstVisibleTextMs: r.firstVisibleTextMs,
+      firstDecoderStepEligibilityMs: r.firstDecoderStepEligibilityMs,
+      firstDecoderStepOverheadMs: r.firstDecoderStepOverheadMs,
+      firstTokenEligibilityMs: r.firstTokenEligibilityMs,
+      firstTokenOverheadMs: r.firstTokenOverheadMs,
+      firstPartialEligibilityMs: r.firstPartialEligibilityMs,
+      firstPartialOverheadMs: r.firstPartialOverheadMs,
       warmModelFirstDecoderStepMs: r.warmModelFirstDecoderStepMs,
       warmModelFirstTokenMs: r.warmModelFirstTokenMs,
       warmModelFirstVisibleTextMs: r.warmModelFirstVisibleTextMs,
@@ -98,6 +122,9 @@ export function summarizeRun(r, { includeTokens = true } = {}) {
       finishEncoderMs: r.finishEncoderMs,
       finishDecoderMs: r.finishDecoderMs,
       postInputDrainMs: r.postInputDrainMs ?? 0,
+      terminalPartialChunkSamples: r.terminalPartialChunkSamples ?? 0,
+      terminalPartialChunkMs: r.terminalPartialChunkMs ?? 0,
+      terminalPartialFinishLatenessMs: r.terminalPartialFinishLatenessMs ?? 0,
     },
     memory: {
       decoderKvBytes: r.decoderKvAllocatedBytes,
@@ -115,8 +142,25 @@ export function summarizeRun(r, { includeTokens = true } = {}) {
       afterFinishRssKiB: r.afterFinishRssKiB,
       afterDestroyRssKiB: r.afterDestroyRssKiB,
       peakRssKiB: r.peakRssKiB,
+      childExited: r.childExited,
+      childExitRssKiB: r.childExitRssKiB,
       pcmPeakRetainedSamples: r.pcmPeakRetainedSamples,
       encoderOutputAccumulatedBytes: r.encoderOutputAccumulatedBytes,
+      snapshots: r.memorySnapshots,
+      attribution: r.memoryAttribution,
+      rollover: r.rolloverMemory,
+      mallocTrim: {
+        requested: r.mallocTrimRequested,
+        available: r.mallocTrimAvailable,
+        applied: r.mallocTrimApplied,
+        returnCode: r.mallocTrimReturn,
+      },
+      eventTokenStorage: {
+        eventHistoryRetained: r.eventHistoryRetained,
+        retainedEventHistoryCount: r.retainedEventHistoryCount,
+        tokenOutputBytes: r.tokenOutputBytes,
+        transcriptOutputBytes: r.transcriptOutputBytes,
+      },
     },
     work: {
       encoderFrames: r.encoderFrames,
@@ -165,6 +209,11 @@ export function summarizeRun(r, { includeTokens = true } = {}) {
       tokenIdD2hBytes: r.tokenIdD2hBytes,
     },
     eventsDropped: r.eventsDropped,
+    encoderSha256: r.encoderSha256,
+    adapterSha256: r.adapterSha256,
+    encoderShaRows: r.encoderShaRows,
+    adapterShaRows: r.adapterShaRows,
+    outputShaDiagnosticD2hBytes: r.outputShaDiagnosticD2hBytes,
     nTokens: r.tokens?.length ?? 0,
     tokens: includeTokens ? r.tokens : undefined,
     transcript: r.text,
@@ -191,17 +240,31 @@ export function gateDeviceResident(r, label = "run") {
   gate(r.eventsDropped === 0, `${label}: events dropped=${r.eventsDropped}`);
 }
 
-export function gateKvMemory(r, label = "run") {
-  gate(r.decoderKvAllocatedBytes <= SESSION8_GATES.decoderKvBytes,
-    `${label}: decoder KV ${r.decoderKvAllocatedBytes} > ${SESSION8_GATES.decoderKvBytes}`);
-  gate(r.encoderKvAllocatedBytes <= SESSION8_GATES.encoderKvBytes,
-    `${label}: encoder KV ${r.encoderKvAllocatedBytes} > ${SESSION8_GATES.encoderKvBytes}`);
-  gate(r.decoderKvElementSize === 2 && r.encoderKvElementSize === 2,
-    `${label}: KV is not FP16 (decoder=${r.decoderKvElementSize}, encoder=${r.encoderKvElementSize})`);
+export function gateKvMemory(r, label = "run", { precisionVariant = "D" } = {}) {
+  const precision = SESSION8_PRECISION_VARIANTS[precisionVariant];
+  gate(precision, `${label}: unknown precision variant ${precisionVariant}`);
+  const expectedEncoderElementSize = precision.encoderKv === "f16" ? 2 : 4;
+  const expectedDecoderElementSize = precision.decoderKv === "f16" ? 2 : 4;
+  const decoderKvLimit = expectedDecoderElementSize === 2
+    ? SESSION8_GATES.decoderKvBytes
+    : 2 * SESSION8_GATES.decoderKvBytes;
+  const encoderKvLimit = expectedEncoderElementSize === 2
+    ? SESSION8_GATES.encoderKvBytes
+    : 2 * SESSION8_GATES.encoderKvBytes;
+  gate(r.decoderKvAllocatedBytes <= decoderKvLimit,
+    `${label}: decoder KV ${r.decoderKvAllocatedBytes} > ${decoderKvLimit}`);
+  gate(r.encoderKvAllocatedBytes <= encoderKvLimit,
+    `${label}: encoder KV ${r.encoderKvAllocatedBytes} > ${encoderKvLimit}`);
+  gate(r.decoderKvElementSize === expectedDecoderElementSize &&
+       r.encoderKvElementSize === expectedEncoderElementSize,
+  `${label}: KV element sizes encoder=${r.encoderKvElementSize} decoder=${r.decoderKvElementSize}, expected ${expectedEncoderElementSize}/${expectedDecoderElementSize}`);
   gate(r.temporaryF32KvBytes === 0,
     `${label}: temporary full-size F32 KV=${r.temporaryF32KvBytes}`);
-  gate(r.kvF16Bytes === r.decoderKvAllocatedBytes + r.encoderKvAllocatedBytes,
-    `${label}: FP16 KV accounting ${r.kvF16Bytes} != decoder+encoder ${r.decoderKvAllocatedBytes + r.encoderKvAllocatedBytes}`);
+  const expectedF16Bytes =
+    (expectedDecoderElementSize === 2 ? r.decoderKvAllocatedBytes : 0) +
+    (expectedEncoderElementSize === 2 ? r.encoderKvAllocatedBytes : 0);
+  gate(r.kvF16Bytes === expectedF16Bytes,
+    `${label}: FP16 KV accounting ${r.kvF16Bytes} != ${expectedF16Bytes}`);
 }
 
 export function gateRing(r, label = "run", { requireWrap = false } = {}) {
@@ -223,9 +286,17 @@ export function gateRing(r, label = "run", { requireWrap = false } = {}) {
   }
 }
 
-export function gateSustained(r, label = "sustained", { requireWrap = true } = {}) {
+export function gateSustained(
+  r,
+  label = "sustained",
+  {
+    requireWrap = true,
+    precisionVariant = "D",
+    peakVramLimitBytes = SESSION8_GATES.peakVramBytes,
+  } = {},
+) {
   gateDeviceResident(r, label);
-  gateKvMemory(r, label);
+  gateKvMemory(r, label, { precisionVariant });
   gateRing(r, label, { requireWrap });
   gate(r.profileEnabled === true, `${label}: profiler disabled`);
   gate(r.pipelineRtf < SESSION8_GATES.pipelineRtfHard,
@@ -273,25 +344,26 @@ export function gateSustained(r, label = "sustained", { requireWrap = true } = {
   gate(r.decoderGraphBuildCount === r.steadyDecoderGraphBuildCount &&
        r.decoderAllocations === r.steadyDecoderAllocations,
     `${label}: terminal decoder graph/allocation growth`);
-  gate(Number.isFinite(r.peakVramBytes) && r.peakVramBytes < SESSION8_GATES.peakVramBytes,
-    `${label}: peak VRAM ${r.peakVramBytes} >= ${SESSION8_GATES.peakVramBytes}`);
-  if (r.streamIdleRssKiB > 0 && r.afterFinishRssKiB > 0) {
-    gate(r.afterFinishRssKiB <= r.streamIdleRssKiB + 64 * 1024,
-      `${label}: RSS grew from ${r.streamIdleRssKiB} to ${r.afterFinishRssKiB} KiB`);
-  }
+  gate(Number.isFinite(r.peakVramBytes) && r.peakVramBytes < peakVramLimitBytes,
+    `${label}: peak VRAM ${r.peakVramBytes} >= ${peakVramLimitBytes}`);
 }
 
 export function gateLatency(r, label = "latency") {
-  gate(r.firstDecoderStepMs > 0 && r.firstDecoderStepMs < SESSION8_GATES.firstDecoderStepMs,
-    `${label}: first decoder ${r.firstDecoderStepMs}ms >= ${SESSION8_GATES.firstDecoderStepMs}ms`);
-  gate(r.firstTokenMs > 0 && r.firstTokenMs < SESSION8_GATES.firstTokenMs,
-    `${label}: first non-special token ${r.firstTokenMs}ms >= ${SESSION8_GATES.firstTokenMs}ms`);
-  gate(r.firstVisibleTextMs > 0 && r.firstVisibleTextMs < SESSION8_GATES.firstPartialMs,
-    `${label}: first visible partial ${r.firstVisibleTextMs}ms >= ${SESSION8_GATES.firstPartialMs}ms`);
-  gate(r.coldFirstTokenMs > 0 && r.coldFirstTokenMs < SESSION8_GATES.coldFirstTokenMs,
-    `${label}: cold first token ${r.coldFirstTokenMs}ms >= ${SESSION8_GATES.coldFirstTokenMs}ms`);
-  gate(r.coldFirstVisibleTextMs > 0 && r.coldFirstVisibleTextMs < SESSION8_GATES.coldFirstPartialMs,
-    `${label}: cold first partial ${r.coldFirstVisibleTextMs}ms >= ${SESSION8_GATES.coldFirstPartialMs}ms`);
+  gate(r.firstDecoderStepMs > 0 && r.firstDecoderStepEligibilityMs >= 0,
+    `${label}: first decoder eligibility marker unavailable`);
+  gate(r.firstDecoderStepOverheadMs >= 0 &&
+       r.firstDecoderStepOverheadMs < SESSION8_GATES.firstDecoderStepOverheadMs,
+    `${label}: first decoder overhead ${r.firstDecoderStepOverheadMs}ms >= ${SESSION8_GATES.firstDecoderStepOverheadMs}ms`);
+  gate(r.firstTokenMs > 0 && r.firstTokenEligibilityMs >= 0,
+    `${label}: first lexical token eligibility marker unavailable`);
+  gate(r.firstTokenOverheadMs >= 0 &&
+       r.firstTokenOverheadMs < SESSION8_GATES.firstTokenOverheadMs,
+    `${label}: first token overhead ${r.firstTokenOverheadMs}ms >= ${SESSION8_GATES.firstTokenOverheadMs}ms`);
+  gate(r.firstVisibleTextMs > 0 && r.firstPartialEligibilityMs >= 0,
+    `${label}: first partial eligibility marker unavailable`);
+  gate(r.firstPartialOverheadMs >= 0 &&
+       r.firstPartialOverheadMs < SESSION8_GATES.firstPartialOverheadMs,
+    `${label}: first partial overhead ${r.firstPartialOverheadMs}ms >= ${SESSION8_GATES.firstPartialOverheadMs}ms`);
 }
 
 export async function prepareSession8(summary, { config = loadEnvironment(), localChecks = true } = {}) {

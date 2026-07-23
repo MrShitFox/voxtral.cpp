@@ -6,6 +6,8 @@ import { loadEnvironment } from "../config/environment.js";
 import { runProcess } from "./exec.js";
 
 const SAFE_REMOTE_REPO = "/root/voxtral.cpp";
+const SAFE_FIXTURE_DIR = "/root/voxtral-fixtures";
+const SAFE_FIXTURE_NAMES = new Set(["voxTest2min.m4a", "voxTest4min.m4a"]);
 
 async function sha256File(filePath) {
   const hash = crypto.createHash("sha256");
@@ -75,11 +77,11 @@ export function buildRsyncInvocation(config = loadEnvironment()) {
       "--exclude=.artifacts/",
       "--exclude=.cache/",
       "--exclude=*.gguf",
-      // The user's private long-form fixture is intentionally outside the
-      // repository contract. `.git/info/exclude` is not consulted by rsync,
-      // so keep an explicit source-sync guard here as well.
-      "--exclude=/voxTest2min.m4a",
-      "--exclude=/voxTest2min-16k-mono-pcm16.*",
+      // Private fixtures and every generated audio derivative stay outside the
+      // source tree. `.git/info/exclude` is not consulted by rsync.
+      "--exclude=*.m4a",
+      "--exclude=*.wav",
+      "--exclude=*.pcm",
       `${config.localRepo.replace(/\/+$/u, "")}/`,
       `${config.gpuUser}@${config.gpuHost}:${config.remoteRepo}/`,
     ],
@@ -88,8 +90,8 @@ export function buildRsyncInvocation(config = loadEnvironment()) {
 }
 
 /**
- * Build the non-destructive rsync invocation for the private long-form fixture.
- * This deliberately targets the external test-data directory, never the source
+ * Build the non-destructive rsync invocation for a private long-form fixture.
+ * This deliberately targets the external fixture directory, never the source
  * checkout, and never uses --delete. The fixture is therefore not part of the
  * normal source synchronization contract.
  */
@@ -99,10 +101,10 @@ export function buildFixtureRsyncInvocation(localFixture, config = loadEnvironme
     throw new Error(`Fixture is not a regular local file: ${source}`);
   }
   const basename = path.basename(source);
-  if (basename !== "voxTest2min.m4a") {
+  if (!SAFE_FIXTURE_NAMES.has(basename)) {
     throw new Error(`Refusing unexpected fixture name: ${basename}`);
   }
-  const remoteDir = "/root/voxtral-test-data";
+  const remoteDir = SAFE_FIXTURE_DIR;
   const remotePath = `${remoteDir}/${basename}`;
   return {
     command: "sshpass",
@@ -153,10 +155,16 @@ export async function syncFixture(localFixture, options = {}) {
  */
 export async function normalizeFixtureOnGpu(options = {}) {
   const config = options.config ?? loadEnvironment();
-  const dir = "/root/voxtral-test-data";
-  const input = `${dir}/voxTest2min.m4a`;
-  const wav = `${dir}/voxTest2min-16k-mono-pcm16.wav`;
-  const pcm = `${dir}/voxTest2min-16k-mono-pcm16.pcm`;
+  const input = path.posix.normalize(
+    options.sourcePath ?? `${SAFE_FIXTURE_DIR}/voxTest2min.m4a`,
+  );
+  const basename = path.posix.basename(input);
+  if (path.posix.dirname(input) !== SAFE_FIXTURE_DIR || !SAFE_FIXTURE_NAMES.has(basename)) {
+    throw new Error(`Refusing fixture normalization outside ${SAFE_FIXTURE_DIR}: ${input}`);
+  }
+  const stem = basename.replace(/\.m4a$/u, "");
+  const wav = `${SAFE_FIXTURE_DIR}/${stem}-16k-mono-pcm16.wav`;
+  const pcm = `${SAFE_FIXTURE_DIR}/${stem}-16k-mono-pcm16.pcm`;
   const command = [
     `test -s ${shellQuote(input)}`,
     `ffmpeg -v error -y -i ${shellQuote(input)} -ar 16000 -ac 1 -c:a pcm_s16le ${shellQuote(wav)}`,

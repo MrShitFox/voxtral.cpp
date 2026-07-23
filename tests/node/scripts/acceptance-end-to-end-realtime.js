@@ -5,11 +5,17 @@ import path from "node:path";
 
 import { loadEnvironment } from "../config/environment.js";
 import { writeArtifactBundle } from "../helpers/artifacts.js";
+import { loadLatestPrecisionMatrix } from "../helpers/precision-cache.js";
+import {
+  divergenceRegions,
+  semanticRisk,
+  tokenRecords,
+  transcriptMetrics,
+} from "../helpers/quality.js";
 import { normalizeFixtureOnGpu, syncFixture } from "../helpers/remote.js";
 import { runStreamSession } from "../helpers/stream.js";
 import {
   SESSION8_GATES,
-  SESSION8_PRODUCTION_ENV,
   exactTokens,
   gate,
   gateDeviceResident,
@@ -17,6 +23,7 @@ import {
   gateLatency,
   gateRing,
   prepareSession8,
+  session8PrecisionEnvironment,
   summarizeRun,
 } from "../helpers/session8.js";
 
@@ -30,9 +37,9 @@ const summary = {
   steps: [],
 };
 
-function gateRealtime(r, label) {
+function gateRealtime(r, label, { precisionVariant, peakVramLimitBytes }) {
   gateDeviceResident(r, label);
-  gateKvMemory(r, label);
+  gateKvMemory(r, label, { precisionVariant });
   gateRing(r, label);
   gate(r.decoderMode === "incremental", `${label}: decoder mode=${r.decoderMode}`);
   gate(r.pipelineRtf < SESSION8_GATES.pipelineRtfHard,
@@ -50,9 +57,23 @@ function gateRealtime(r, label) {
     `${label}: decoder replay/skip steps=${r.decoderSteps}, emitted=${r.decoderTokensEmitted}`);
   gate(r.tokensFlushedAtFinish <= 18,
     `${label}: finish tail ${r.tokensFlushedAtFinish} tokens > 18`);
+  gate(Number.isFinite(r.peakVramBytes) && r.peakVramBytes < peakVramLimitBytes,
+    `${label}: peak VRAM ${r.peakVramBytes} >= ${peakVramLimitBytes}`);
 }
 
 try {
+  const matrix = await loadLatestPrecisionMatrix(config);
+  const selected = matrix.result.productionDecision.selected;
+  gate(selected, "precision matrix has no selected production variant");
+  const productionEnv = session8PrecisionEnvironment(selected);
+  const realtimeGateOptions = {
+    precisionVariant: selected,
+    peakVramLimitBytes: matrix.result.rx6600VramTotalBytes,
+  };
+  summary.precisionMatrixArtifact = matrix.directory;
+  summary.selectedPrecision = selected;
+  summary.encoderKv = matrix.result.variants[selected].encoderKv;
+  summary.decoderKv = matrix.result.variants[selected].decoderKv;
   await prepareSession8(summary, { config });
   if (soak) {
     const seconds = Number(process.env.VOXTRAL_SOAK_SECONDS ?? 600);
@@ -67,10 +88,10 @@ try {
       skipParity: true,
       monitorMemory: true,
       maxTotalSamples: (seconds + 60) * 16_000,
-      env: SESSION8_PRODUCTION_ENV,
+      env: productionEnv,
       timeoutMs: (seconds + 180) * 1000,
     });
-    gateRealtime(run, "10-minute paced soak");
+    gateRealtime(run, "10-minute paced soak", realtimeGateOptions);
     gate(run.deadlineMissRate < SESSION8_GATES.deadlineMissRate,
       `10-minute paced soak: deadline miss rate ${run.deadlineMissRate}`);
     summary.soak = summarizeRun(run);
@@ -96,13 +117,13 @@ try {
       warmup: true,
       skipParity: true,
       monitorMemory: true,
-      env: SESSION8_PRODUCTION_ENV,
+      env: productionEnv,
       timeoutMs: 420_000,
     });
     summary.paced = summarizeRun(paced);
-    gateRealtime(paced, "2-minute spoken paced stream");
+    gateRealtime(paced, "2-minute spoken paced stream", realtimeGateOptions);
 
-    // Large-fixture quality gate: compare the complete paced FP16/4x4
+    // Large-fixture quality gate: compare the complete paced selected 4x4
     // production sequence with an independent F32/4x32 finish-only oracle.
     // The oracle is compute-only to avoid another two minutes of artificial
     // pacing; feed boundaries and the canonical PCM remain identical.
@@ -112,7 +133,7 @@ try {
       audioPath: fixture.wavPath,
       mode: "80ms",
       env: {
-        ...SESSION8_PRODUCTION_ENV,
+        ...productionEnv,
         VOXTRAL_STREAM_DECODER: "reference",
         VOXTRAL_ENCODER_KV_TYPE: "f32",
         VOXTRAL_DECODER_KV_TYPE: "f32",
@@ -120,15 +141,36 @@ try {
       },
       timeoutMs: 600_000,
     });
-    gate(exactTokens(paced.tokens, spokenReference.tokens),
-      "2-minute spoken FP16 production tokens differ from F32/4x32 oracle");
-    gate(paced.text === spokenReference.text,
-      "2-minute spoken FP16 production transcript differs from F32/4x32 oracle");
+    const spokenDivergence = divergenceRegions(
+      tokenRecords(spokenReference),
+      tokenRecords(paced),
+    );
+    const spokenTranscript = transcriptMetrics(spokenReference.text, paced.text);
+    const spokenSemanticRisk = semanticRisk(
+      spokenReference.text,
+      paced.text,
+      spokenDivergence,
+    );
+    gate(spokenDivergence.tokenDivergenceRate <= 0.005,
+      `2-minute selected token divergence ${spokenDivergence.tokenDivergenceRate} > 0.5%`);
+    gate(spokenTranscript.wer.rate <= 0.005,
+      `2-minute selected WER ${spokenTranscript.wer.rate} > 0.5%`);
+    gate(spokenTranscript.cer.rate <= 0.0025,
+      `2-minute selected CER ${spokenTranscript.cer.rate} > 0.25%`);
+    gate(!spokenSemanticRisk.changedNumbers &&
+         !spokenSemanticRisk.changedNegations &&
+         !spokenSemanticRisk.sentenceCountChanged &&
+         !spokenSemanticRisk.sustainedTokenDesynchronization,
+    "2-minute selected precision failed semantic quality gates");
     summary.spokenParity = {
       productionTokens: paced.tokens.length,
       referenceTokens: spokenReference.tokens.length,
       transcript: paced.text,
-      exact: true,
+      exact: exactTokens(paced.tokens, spokenReference.tokens) &&
+        paced.text === spokenReference.text,
+      tokenDivergence: spokenDivergence,
+      transcriptMetrics: spokenTranscript,
+      semanticRisk: spokenSemanticRisk,
     };
 
     const plans = ["full", "80ms", "160ms", "480ms", "seeded-random:20260722"];
@@ -141,21 +183,22 @@ try {
         config,
         planName: `strict-reference-${name}`,
         mode,
-        env: { ...SESSION8_PRODUCTION_ENV, VOXTRAL_STREAM_DECODER: "reference" },
+        env: { ...productionEnv, VOXTRAL_STREAM_DECODER: "reference" },
         timeoutMs: 300_000,
       });
       const production = await runStreamSession({
         config,
         planName: `strict-production-${name}`,
         mode,
-        env: SESSION8_PRODUCTION_ENV,
+        env: productionEnv,
+        monitorMemory: true,
         timeoutMs: 300_000,
       });
       gate(exactTokens(production.tokens, reference.tokens),
         `${mode}: token divergence from finish-only oracle`);
       gate(production.text === reference.text,
         `${mode}: transcript divergence from finish-only oracle`);
-      gateRealtime(production, `${mode}: production`);
+      gateRealtime(production, `${mode}: production`, realtimeGateOptions);
       if (acceptedTokens === null) {
         acceptedTokens = production.tokens;
         acceptedTranscript = production.text;

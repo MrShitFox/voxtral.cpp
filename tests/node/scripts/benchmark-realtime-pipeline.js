@@ -1,11 +1,12 @@
 import { loadEnvironment } from "../config/environment.js";
 import { writeArtifactBundle } from "../helpers/artifacts.js";
+import { loadLatestPrecisionMatrix } from "../helpers/precision-cache.js";
 import { runStreamSession } from "../helpers/stream.js";
 import {
-  SESSION8_PRODUCTION_ENV,
   exactTokens,
   gate,
   prepareSession8,
+  session8PrecisionEnvironment,
   summarizeRun,
 } from "../helpers/session8.js";
 
@@ -86,15 +87,28 @@ const variants = [
     },
   },
   {
-    name: "production-dual-fp16-4x4",
+    name: "production-selected-4x4",
     encoderShape: "4/4",
-    encoderKv: "F16",
-    decoderKv: "F16",
-    env: SESSION8_PRODUCTION_ENV,
+    encoderKv: null,
+    decoderKv: null,
+    env: null,
   },
 ];
 
 try {
+  const matrix = await loadLatestPrecisionMatrix(config);
+  const selected = matrix.result.productionDecision.selected;
+  gate(selected, "precision matrix has no selected production variant");
+  const selectedVariant = matrix.result.variants[selected];
+  const productionEnv = session8PrecisionEnvironment(selected);
+  Object.assign(variants.at(-1), {
+    name: `production-selected-${selected.toLowerCase()}-4x4`,
+    encoderKv: selectedVariant.encoderKv,
+    decoderKv: selectedVariant.decoderKv,
+    env: productionEnv,
+  });
+  summary.precisionMatrixArtifact = matrix.directory;
+  summary.selectedPrecision = selected;
   await prepareSession8(summary, { config });
   let oracleTokens = null;
   let oracleTranscript = null;
@@ -142,7 +156,7 @@ try {
     mode: "80ms",
     realtimeMs: 80,
     skipParity: true,
-    env: { ...SESSION8_PRODUCTION_ENV, MESA_SHADER_CACHE_DISABLE: "true" },
+    env: { ...productionEnv, MESA_SHADER_CACHE_DISABLE: "true" },
     timeoutMs: 180_000,
   });
   const warmGraphs = await runStreamSession({
@@ -152,7 +166,7 @@ try {
     realtimeMs: 80,
     warmup: true,
     skipParity: true,
-    env: SESSION8_PRODUCTION_ENV,
+    env: productionEnv,
     timeoutMs: 180_000,
   });
   summary.runtimeMatrix = {

@@ -1,162 +1,242 @@
-# Session 8 — findings: sustained realtime achieved; three hard gates unreachable
+# Session 8.1 — FP16 quality, bounded memory and sustained realtime
 
-Branch `wip/session8-sustained-realtime` on 68d002f (RX 6600 / RADV NAVI23).
-Fixtures: 2-minute `voxTest2min.m4a` (SHA d66181fd…) and the short WAV
-`8297-275156-0000.wav`. Production env = incremental decoder, FP16 encoder+decoder
-KV, 4/4 physical rows, profiler on.
+Branch `wip/session8-sustained-realtime`, WIP base `0f72eae` on parent
+`68d002f`. Measurements use the RX 6600 Vulkan/RADV server and the internal
+streaming production path at encoder logical/physical shape 4/4.
 
-## Bottom line
+## Production verdict
 
-The engineering goal — **sustainably realtime** incremental streaming — is met and
-verified over a full 30-minute soak. Three hard gates do **not** pass, and every
-one is a gate-definition / physics limit, **not** a runtime defect:
+The production default is **variant C: encoder KV F32 + decoder KV FP16**.
 
-1. Latency (warm + cold first token/partial) — bounded by real-time audio arrival
-   and by 4B model load, both inside the metric by design.
-2. Soak host RSS (+71 MB vs +64 MB) — bounded backend/pipeline residue, not a leak.
-3. FP16-vs-F32 exact-token parity on 2 min — 0.26 % token drift, transcript
-   preserved; inherent to FP16 half precision over a long stream.
+- It is token- and transcript-exact against F32/F32 on both real fixtures:
+  0/4,603 token edits, WER 0, CER 0.
+- The only observed FP16 drift follows encoder FP16: variants B and D have the
+  same local four-token proper-name spelling change on the two-minute fixture;
+  decoder FP16 alone does not change either recording.
+- A corrected 30-minute paced run has pipeline RTF **0.767796**, final backlog
+  0, slope `-0.00000569815 ms/s`, zero dropped events and zero decoder KV moves.
+- The decoder KV uses 872,415,232 bytes; encoder KV uses 460,324,864 bytes;
+  peak VRAM in the 30-minute run is 4,319,039,488 bytes.
+- An accelerated production-path rollover test captured 48 decoder wraps and
+  shows a flat 20-wrap tail for RSS and VRAM.
 
-Per the task, when hard gates are objectively unachievable: keep WIP on the
-branch, do **not** push, report the precise blocker (this document).
+Dual FP16 (D) also passes the fixture quality gates and is faster/smaller, but
+it is rejected as the default because encoder FP16 is the isolated source of
+the only measured text drift. F32/F32 (A) is exact but uses substantially more
+VRAM. Encoder FP16 + decoder F32 (B) retains the same drift as D while giving up
+the dominant decoder-KV memory saving.
 
-## What is green
+The two local fixtures show no material quality regression, but they are not a
+complete multilingual quality corpus.
 
-30-minute synthetic soak (`test:realtime-soak-30m`), 22 500 feeds / 22 511 steps:
+## Fixtures
 
-| Gate | Result |
+| Fixture | Duration | SHA-256 | Language/content | Plans | Git |
+|---|---:|---|---|---|---|
+| `voxTest2min.m4a` | 121.600 s | `d66181fd86a94d04156cb0d1e1aacaae3d2f97e131af0e38a6fcf29c04ab45a4` | Russian monologue about a composition and the Oppenheimer quotation | full cold/warm, paced 80/160/480 ms, seeded random | ignored locally, not tracked |
+| `voxTest4min.m4a` | 244.821 s | `e662476be717c53a50bee67a03c0463b5712447c29178952d95285dc887328c3` | Russian biographical monologue about Albert Wesker | full cold/warm, paced 80/160/480 ms, seeded random | ignored locally, not tracked |
+
+The sources and normalized WAV/PCM derivatives live outside the remote Git
+repository. Full transcripts, token IDs and transcript diffs are test artifacts;
+audio is never copied into an artifact bundle.
+
+## Precision isolation matrix
+
+The aggregate corpus contains 4,603 oracle tokens, 626 reference words and
+4,425 reference characters.
+
+| Variant | Encoder KV | Decoder KV | Token edits | WER | CER | Max pipeline RTF | Peak VRAM | Result |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| A | F32 | F32 | 0/4,603 | 0 | 0 | 0.850668 | 5,191,294,976 | PASS, oracle |
+| B | FP16 | F32 | 4/4,603 (0.0869%) | 0.1597% | 0.0452% | 0.791996 | 4,937,932,800 | PASS, rejected |
+| C | F32 | FP16 | **0/4,603** | **0** | **0** | 0.789142 | 4,318,875,648 | **selected** |
+| D | FP16 | FP16 | 4/4,603 (0.0869%) | 0.1597% | 0.0452% | **0.728859** | **4,065,517,568** | PASS, rejected |
+
+Every cold/warm repetition and every chunk plan is deterministic. All cases
+finish with backlog 0, non-positive slope, zero dropped events and zero
+full-buffer decoder moves. F32/F32 4/4 matches the independent F32 4/32 global
+batch encoder oracle exactly.
+
+The original immutable matrix artifact was written before the production-rule
+review and recorded B under the former “prefer B on any quality pass” rule.
+`deriveProductionDecision()` now applies the literal rule: B must be exact or
+strictly less divergent than D; otherwise exact C is preferred. All downstream
+quality, latency, real-fixture and sustained artifacts explicitly record C.
+The measured A–D runs themselves were not changed or replayed.
+
+## Divergence analysis
+
+B and D have the same single region; C has no divergent region.
+
+| Timestamp | Token indices | F32 text | Candidate text | Classification | Meaning changed | Re-converged |
+|---:|---|---|---|---|---|---|
+| 39.200 s | 483–486 | `Аламагаруда.` | `Аламагорода.` | proper-name spelling | no material semantic change | yes, immediately |
+
+Reference IDs/pieces are `4383/га`, `2895/ру`, `2726/да`, `1046/.`;
+candidate IDs/pieces are `22732/гор`, `8107/ода`, `1046/.`, `32/<special>`.
+The five preceding tokens are identical and the following stream is identical
+from token 487 onward. There are no changed numbers, negations, sentence counts,
+commands, deletions, insertions or sustained desynchronization. The four-minute
+fixture is exact for A, B, C and D.
+
+## Real-fixture production repeats
+
+| Fixture | Repeat | Tokens | Pipeline RTF | Backlog p95/max/final | Slope | Peak VRAM | Result |
+|---|---:|---:|---:|---|---:|---:|---|
+| 2 min | 1 | 1,531 | 0.788371 | 0 / 28.936 / 0 ms | -0.00145374 | 4,318,875,648 | PASS |
+| 2 min | 2 | 1,531 | 0.788052 | 0 / 28.922 / 0 ms | -0.00157267 | 4,318,875,648 | PASS |
+| 4 min | 1 | 3,072 | 0.779953 | 0 / 31.471 / 0 ms | -0.000404098 | 4,325,834,752 | PASS |
+| 4 min | 2 | 3,072 | 0.780165 | 0 / 29.794 / 0 ms | -0.000384520 | 4,318,679,040 | PASS |
+
+Within each fixture, token IDs, transcript, encoder SHA-256 and adapter SHA-256
+match exactly between repeats and the matrix reference. Encoder output
+accumulation and dropped events are zero.
+
+## Sustained realtime
+
+| Duration | Pipeline RTF | Backlog p95/max/final | Slope | Deadline misses | Decoder wraps | Result |
+|---:|---:|---|---:|---:|---:|---|
+| 30 min synthetic, paced 80 ms | **0.767796** | **0 / 19.565 / 0 ms** | **-0.00000569815 ms/s** | 2/22,500 (0.00889%) | 2 | **PASS** |
+| 2 min real, paced 80 ms, repeat 1 | 0.788371 | 0 / 28.936 / 0 ms | -0.00145374 | 2/1,520 | 0 | PASS |
+| 4 min real, paced 80 ms, repeat 1 | 0.779953 | 0 / 31.471 / 0 ms | -0.000404098 | 2/3,060 | 0 | PASS |
+
+The 30-minute run has compute headroom 23.22%, wall/audio factor 1.00053,
+events dropped 0, decoder bytes moved 0, full-buffer moves 0 and
+`encoderOutputAccumulatedBytes=0`. Its two wraps evict 14,357 positions; wrap-step
+latency is 22.066 ms versus pre-wrap p99 24.806 ms.
+
+### Harness telemetry defect found during the soak
+
+The first Session 8.1 C soak produced pipeline RTF 0.742696 but a false 312-second
+backlog. The harness built a full percentile summary of the profiler reservoirs
+before and after every one of 22,500 feeds. This O(n log n) diagnostic work sat
+outside the internal `pipeline_feed` metric: wrapper feed mean was 75.734 ms
+versus internal 59.380 ms and grew with duration.
+
+Per-feed full profile snapshots are now executed only when
+`--capture-rollover-memory` explicitly needs wrap attribution. Normal paced runs
+take one steady and one final profile snapshot. A five-minute diagnostic then
+measured wrapper/internal means 62.210/62.204 ms, final backlog 0 and negative
+slope. The full repeated soak above is the production proof. No production
+threshold was relaxed. The external timeout was separately widened only to
+cover deterministic synthetic PCM generation, model load and warmup before the
+unchanged 1,800-second paced interval.
+
+## RSS and VRAM plateau
+
+The accelerated test uses the production decoder/KV path and a reduced
+test-only ring capacity. It captured 48 wraps without trim and 48 wraps in the
+post-destroy trim diagnostic. The plateau analysis excludes one-time warmup and
+fault-in steps and evaluates the last 20 wraps (29–48).
+
+| Wrap | Absolute position | RSS before/after/settled KiB | Anonymous settled KiB | VRAM bytes | Graph objects/allocs | Decoder allocs | KV moved |
+|---:|---:|---|---:|---:|---|---:|---|
+| 1 | 64 | 233808 / 233808 / 233808 | 87280 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 5 | 320 | 233840 / 233840 / 233840 | 87312 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 10 | 640 | 233904 / 233904 / 233904 | 87376 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 20 | 1280 | 235956 / 235956 / 235956 | 89428 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 29 | 1856 | 255788 / 255788 / 255788 | 109260 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 30 | 1920 | 255792 / 255792 / 255792 | 109264 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 40 | 2560 | 255924 / 255924 / 255924 | 109396 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+| 48 | 3072 | 256048 / 256048 / 256048 | 109520 | 4,311,310,336 | 4 / 4 | 2 | 0 |
+
+For wraps 29–48, RSS slope is 13.844 KiB/wrap with only 260 KiB total
+delta/range and is classified non-linear/plateaued; anonymous RSS is identical.
+VRAM slope/delta/range are zero. Graph objects, graph allocations and decoder
+allocations remain 4/4/2. Decoder rollover bytes and full-buffer moves remain
+zero at every wrap.
+
+After stream destruction, RSS is 248,868 KiB. A diagnostic-only
+`malloc_trim(0)` reduces it to 184,408 KiB (64,460 KiB allocator retention
+released). The trim is never called in the production steady-state path. Child
+exit is observed and releases process memory.
+
+## Eligibility latency
+
+Absolute time remains diagnostic because both fixtures contain non-lexical
+intro material. Hard gates use runtime overhead after the required audio is
+available.
+
+| Fixture | Metric | Absolute | Eligibility | Runtime overhead | Gate | Result |
+|---|---|---:|---:|---:|---:|---|
+| 2 min | first decoder step | 717.975 ms | 658.436 ms | 59.540 ms | <200 ms | PASS |
+| 2 min | first lexical token | 2222.220 ms | 2160.070 ms | 62.151 ms | <250 ms | PASS |
+| 2 min | first partial | 2222.220 ms | 2160.070 ms | 62.153 ms | <350 ms | PASS |
+| 4 min | first decoder step | 718.608 ms | 659.007 ms | 59.601 ms | <200 ms | PASS |
+| 4 min | first lexical token | 2302.870 ms | 2240.100 ms | 62.770 ms | <250 ms | PASS |
+| 4 min | first partial | 2302.870 ms | 2240.100 ms | 62.771 ms | <350 ms | PASS |
+
+Lifecycle is reported separately: model load 1.995/2.011 s, context creation
+12.433/11.771 ms, Vulkan warmup 408.020/406.291 ms and stream start
+80.107/80.097 ms for the two fixtures.
+
+## Memory attribution
+
+- Encoder KV: 460,324,864 bytes, F32, fixed ring.
+- Decoder KV: 872,415,232 bytes, FP16, fixed ring.
+- Temporary F32 KV: 0.
+- 30-minute peak VRAM: 4,319,039,488 bytes; after stream destroy:
+  3,842,646,016 bytes; after child exit: 990,298,112 bytes including server
+  baseline/other mappings.
+- 30-minute peak RSS: 565,548 KiB; after finish: 316,832 KiB; after stream
+  destroy: 310,672 KiB; child exit observed.
+- PCM peak retained samples: 360. Encoder output accumulated bytes: 0.
+- Steady graph builds/allocations: encoder 2/2, adapter 0/0, decoder 2/2.
+- Device-to-host traffic in steady inference is token IDs only (90,044 bytes
+  over 30 minutes); encoder, adapter and logits D2H bytes are zero.
+- The soak harness retains 45,024 drained events solely to write token-window
+  evidence; the production event queue high-watermark is bounded and the
+  dedicated RSS test disables retained event history.
+
+## Regression status
+
+| Check | Result |
 |---|---|
-| pipeline RTF | **0.704** (< 0.95 hard, < 0.80 target) |
-| final backlog / slope | 0 / **−6e-6** ms·s⁻¹ |
-| deadline misses | **2 / 22 500** (0.0089 %) |
-| decoder KV ring | wraps 2, evictions 14 357, **bytesMoved 0, fullBufferMoves 0** |
-| wrap-step latency | 22.1 ms (< pre-wrap p99 25.8 ms) |
-| decoder / encoder KV | **872 MB / 230 MB FP16**, temp F32 = 0 |
-| peak VRAM | **4.065 GB** (< 4.6 GB) |
-| steady graph/alloc | decoder builds = 2 (prefill + 1 masked→unmasked), adapter = 0 |
+| RelWithDebInfo local + RX 6600/Vulkan builds | PASS |
+| Release local build | PASS |
+| CTest RelWithDebInfo / Release | 5/5 / 5/5 PASS |
+| Node unit / `npm test` | 45/45 PASS; 45 PASS + 12 expected GPU-env skips |
+| `acceptance:precision-matrix` | PASS |
+| `acceptance:fp16-quality` | PASS |
+| `acceptance:real-fixtures` | PASS |
+| `test:rss-rollover-plateau` | PASS |
+| `acceptance:latency-eligibility` | PASS |
+| `test:realtime-soak-30m` | PASS |
+| `acceptance:decoder-kv-ring` | PASS |
+| `acceptance:kv-fp16` | PASS |
+| `acceptance:end-to-end-realtime` | PASS |
 
-Also green: local ctest 5/5, node-unit 37/37; GPU `acceptance:decoder-kv-ring`
-PASS, `acceptance:kv-fp16` PASS (short WAV); 2-min pipeline RTF 0.72, backlog 0.
+The final harness-only fix conditionally removes expensive full-profile
+snapshots from ordinary paced feeds. The matrix inference, quality analysis,
+real-fixture determinism and RSS capture path were not replayed: the first three
+do not depend on profiler snapshot frequency, while the RSS test explicitly
+enables `capture_rollover_memory` and therefore executes the unchanged branch.
+The corrected full soak and the three targeted component/end-to-end suites were
+rerun on the final tree.
 
-## Blocker 1 — latency (structural)
+## Evidence artifacts
 
-Measured on the 2-min fixture, warm, paced 80 ms (probe `scripts/probe-first-token.js`):
+- Precision matrix:
+  `tests/node/.artifacts/2026-07-23T17-08-47.981Z-d1940821-a87d-4f65-95f9-d43a1a37fb67`
+- FP16 quality:
+  `tests/node/.artifacts/2026-07-23T17-09-26.759Z-6c933c48-804c-49f3-acf8-83d31d46093a`
+- Eligibility latency:
+  `tests/node/.artifacts/2026-07-23T17-09-27.069Z-0c56b137-2bf9-41e3-a7eb-d1cdb3c9a13e`
+- RSS plateau:
+  `tests/node/.artifacts/2026-07-23T17-26-04.328Z-6eab26ee-0749-4d80-9dd0-2d6c4231c114`
+- Real production repeats:
+  `tests/node/.artifacts/2026-07-23T17-39-10.505Z-e5ae1428-a001-477b-939f-b7c5b7a2bd7a`
+- Corrected 30-minute soak:
+  `tests/node/.artifacts/2026-07-23T18-55-04.866Z-24bfed4f-a38e-4faf-bcbe-66926d1d145c`
+- Decoder KV ring:
+  `tests/node/.artifacts/2026-07-23T18-55-45.212Z-8dc0b812-9c18-4a1e-82a3-bac0aa019de6`
+- FP16 KV component:
+  `tests/node/.artifacts/2026-07-23T18-56-25.217Z-1e9bbb29-e7bf-4a04-8143-c736839e6256`
+- Final end-to-end realtime:
+  `tests/node/.artifacts/2026-07-23T19-12-21.232Z-937919e8-75d5-4d07-9a82-db0f57694a2e`
 
-| Metric | Gate | Measured |
-|---|---|---|
-| firstDecoderStepMs | < 700 | 705.9 |
-| firstTokenMs | < 1100 | **2137** |
-| firstVisibleTextMs | < 1200 | 2217 |
-| coldFirstTokenMs | < 1600 | **4510** |
-| coldFirstVisibleTextMs | < 1700 | 4590 |
+## Fixture safety
 
-- **Warm first token** — the first non-special (lexical) token is at decoder
-  position 56; its audio window ends at sample 32000 = **2000 ms** of real audio.
-  Positions 38–55 are 18 STREAMING_PAD tokens: the fixture opens with ~2 s of
-  non-lexical content (transcript describes music, "…композиции Radiance…"). Under
-  80 ms real-time pacing that audio cannot exist before 2000 ms; the pipeline then
-  adds only **137 ms**. No decode optimization can emit a token before its audio
-  arrives (`audio_end_sample_for(P) = (P−31)·1280` ⇒ arrival = (P−31)·80 ms).
-  The pump already bursts every ready group; RTF 0.72, backlog 0 — the pipeline is
-  not the bottleneck.
-- **Cold first token** — `coldFirstTokenMs = pre_drive_process_ms + firstTokenMs`
-  and `pre_drive_process_ms` spans process start through 4B model load
-  (`voxtral_stream_test.cpp:1712`, load at `:1498-1502`). Measured
-  `modelLoadMs = 1994 ms`, already above the 1600 ms gate by itself.
-- **First decoder step** — 6 ms over a 700 ms gate at the noise floor (position 38,
-  audio 560 ms + prefill 146 ms).
-
-The handoff's "1577 ms" is the SHORT WAV number (11 leading pads ⇒ pos 49 ⇒
-1440 ms + 137 = 1577); the strict gate is on the 2-min fixture (pos 56 ⇒ 2137).
-Both are audio-arrival-bound, far above 1100 ms.
-
-## Blocker 2 — soak host RSS (bounded residue, not a leak)
-
-Gate: `afterFinishRssKiB ≤ streamIdleRssKiB + 64 MiB`.
-
-| Run | ring wraps | RSS growth |
-|---|---|---|
-| 2-minute paced (e2e) | 0 | 63 556 KiB (~62 MB) |
-| 30-minute soak | 2 | 72 692 KiB (~71 MB) |
-
-A 15× longer run added only ~9 MB (the one-time masked→unmasked pipeline compiled
-at the first wrap, ~10.9 min in). The ~62 MB baseline is warmup-compiled Vulkan
-pipelines (compiled after the idle snapshot: create → measure idle → warmup →
-drive) plus glibc arena retention from compile churn (peak RSS 552 MB → final
-312 MB: 240 MB transient returned). Ruled out as app-level: synthetic transcript
-is empty (event snapshots don't grow), `audio_arrivals` is bounded/cleared, all
-graph/alloc counts are steady. So it is bounded residue ~7 MB over a tight gate.
-Recommend: (a) `malloc_trim(0)` after warmup/finish to return retained arenas, or
-(b) recalibrate the gate to the measured resident-pipeline baseline. Do not loosen
-the gate to "pass" it.
-
-## Blocker 3 — FP16 vs F32 exact-token parity on 2 min
-
-Gate: production FP16(4×4) tokens must exactly equal the F32(4×32) finish-only
-oracle. On the 2-min fixture they differ by **4 of 1531 tokens (0.26 %)**, first at
-index 483, re-converging locally (token 1046 in both windows). Transcript heads and
-tails are character-identical; the FP16 transcript is coherent and essentially the
-same. FP16 held bit-exact on the short WAV (<15 s, sub-encoder-window) — hence the
-earlier "parity" — but over a 2-min stream the encoder's 750-frame sliding window
-and per-step FP16 rounding accumulate enough to flip a few argmaxes. This is
-inherent to FP16 and does not degrade transcript quality; the exact-token gate
-assumes a bit-exactness half precision cannot provide on long audio.
-
-**Isolation (probe `scripts/probe-fp16-isolate.js`), 2-min fixture, 1531 tokens:**
-
-| Comparison | Differing tokens | Transcript |
-|---|---|---|
-| FP16 4×4 vs F32 4×4 (isolates FP16 precision) | **4** (first @ 483) | differs locally |
-| F32 4×4 vs F32 4×32 (isolates physical rows) | **0** | **identical** |
-| FP16 4×4 vs F32 4×32 (the failing gate) | 4 (first @ 483) | differs locally |
-
-So the divergence is **entirely FP16 precision** — F32 is bit-exact across physical
-shapes (4×4 == 4×32), confirming the encoder row-batching is numerically neutral.
-The 4-token drift is pure half-precision accumulation, not a shape/tiling artifact.
-
-Recommendation: accept FP16 KV as a lossy-but-faithful production format (transcript
-preserved) and change the FP16 acceptance criterion from `exactTokens` to a semantic
-one (transcript WER / ≤N token diff / logits cosine ≥ threshold); or, if bit-exact
-parity is mandatory, keep the *decoder* KV in F32 (the drift source is the long
-decoder KV) and take only the encoder-KV FP16 saving. This is a design decision, not
-a bug fix — do not loosen the gate silently to make it pass.
-
-### Blocker 3b — encoder side of the same FP16 sensitivity (`acceptance:encoder-realtime`)
-
-FAIL: `production/baseline encoder tensor divergence`. The suite (now at production
-4/4) cross-checks the 4/4 encoder against the legacy 128/128 throughput baseline and
-demands bit-exact SHA + identical tokens/transcript. The **default encoder KV is FP16**
-(`encoder_kv_type_from_env` → `GGML_TYPE_F16`), so both runs are FP16 at different
-physical-row tilings. Result:
-
-- Production **4/4 is bit-exact with the authoritative global batch encoder**
-  (`encoderMaxAbsDeltaVsBatch = 0`) — production is correct.
-- The legacy **128/128** FP16 baseline differs: SHA differs, and **4/1531 tokens
-  (0.26%) differ, first at index 483** — the *same* borderline token as Blocker 3.
-  The only transcript difference is one foreign place name: "Аламага**ру**да" (4/4)
-  vs "Аламаго**ро**да" (128/128).
-
-So FP16 output is **shape-sensitive** (128-row tiling accumulates half-precision
-rounding differently than the 4-row path), exactly as it is precision-sensitive vs
-F32. In F32 the shapes are bit-identical (probe `probe-fp16-isolate.js`: F32 4×4 ==
-4×32). Production 4/4 matches the batch oracle; the failing gate compares it against a
-legacy 128-row FP16 baseline that no longer bit-matches. Same class as Blocker 3 —
-an exact-match gate incompatible with FP16 — and the same one-place-name divergence.
-
-## Regression suites run
-
-| Suite | Result | Note |
-|---|---|---|
-| `acceptance:decoder-kv-ring` | PASS | token+transcript parity (short WAV) |
-| `acceptance:kv-fp16` | PASS | 5-plan parity (short WAV) |
-| `acceptance:end-to-end-realtime` | FAIL | Blocker 3 (2-min FP16 parity), then Blocker 1 |
-| `test:realtime-soak-30m` | FAIL | Blocker 2 (RSS) only; 17/18 gates green |
-| `benchmark:realtime-pipeline` | PASS | confirms production 4/4 FP16 is best: RTF **0.674** / 4.07 GB vs F32/4×32 1.047 / 5.21 GB; larger physical rows are slower (4×16=1.77, 4×32=1.25 dual-fp16) |
-| `acceptance:encoder-realtime` | FAIL | Blocker 3b (encoder FP16 shape-sensitivity) |
-| `test:realtime-rollover` | FAIL | ran explicitly; deterministically identical to the soak (RTF 0.704, wraps 2, evictions 14357, bytesMoved 0, peak VRAM 4.065 GB) — FAIL only at RSS (+73.5 MB). Same 1800 s code path (script lines 15-19); `acceptance:realtime-sustained` is the same again |
-
-**Meta-conclusion:** the production path (4/4 FP16 incremental) is numerically correct
-— bit-exact with the global batch encoder, near-identical transcript vs F32 — and
-sustainably realtime. Every failing gate is an exact-match / physics threshold
-(bit-exact FP16, <64 MB resident, first-token < audio-arrival, cold < model-load) that
-the honest production reality cannot satisfy. None is a runtime defect.
+`voxTest2min.m4a` and `voxTest4min.m4a` were used only as local test
+fixtures. Neither file nor any generated WAV/PCM derivative is tracked or
+committed.

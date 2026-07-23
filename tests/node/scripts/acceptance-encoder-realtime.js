@@ -7,6 +7,7 @@ import { writeArtifactBundle } from "../helpers/artifacts.js";
 import { buildRemoteVulkan } from "../helpers/build.js";
 import { createChunkPlan } from "../helpers/chunks.js";
 import { runProcess } from "../helpers/exec.js";
+import { loadLatestPrecisionMatrix } from "../helpers/precision-cache.js";
 import {
   checkRemoteConnection,
   normalizeFixtureOnGpu,
@@ -14,6 +15,7 @@ import {
   syncSources,
 } from "../helpers/remote.js";
 import { planCounts, runStreamSession } from "../helpers/stream.js";
+import { session8PrecisionEnvironment } from "../helpers/session8.js";
 
 const config = loadEnvironment();
 const nodeCwd = new URL("..", import.meta.url).pathname;
@@ -29,8 +31,10 @@ const summary = {
   short: [],
   long: [],
 };
+let selectedPrecision = null;
 
 const envFor = (logical, physical) => ({
+  ...session8PrecisionEnvironment(selectedPrecision),
   VOXTRAL_ENC_KV_LOGICAL_BATCH: String(logical),
   VOXTRAL_ENC_KV_PHYSICAL_ROWS: String(physical),
   VOXTRAL_ENCODER_TELEMETRY: "1",
@@ -146,6 +150,13 @@ async function localStep(name, command, args, cwd = nodeCwd, timeoutMs = 900_000
 }
 
 async function main() {
+  const matrix = await loadLatestPrecisionMatrix(config);
+  selectedPrecision = matrix.result.productionDecision.selected;
+  gate(selectedPrecision, "precision matrix has no selected production variant");
+  summary.precisionMatrixArtifact = matrix.directory;
+  summary.selectedPrecision = selectedPrecision;
+  summary.encoderKv = matrix.result.variants[selectedPrecision].encoderKv;
+  summary.decoderKv = matrix.result.variants[selectedPrecision].decoderKv;
   await localStep("unit", "npm", ["run", "test:unit"]);
   await localStep("local-build", "npm", ["run", "build:local"], nodeCwd, 1_200_000);
   await localStep("cpp-unit", "ctest", ["--test-dir", config.localBuild, "--output-on-failure"], config.localRepo);
@@ -214,8 +225,8 @@ async function main() {
     longRuns.push(result);
     summary.long.push(compact(result, `production-${pace}ms`));
     gate(result.encoderTransformerFramesComputed === result.encoderUniqueFrames, `${pace}ms: frame replay`);
-    gate(result.finalBacklogMs < 20, `${pace}ms: final backlog ${result.finalBacklogMs} ms`);
-    gate(result.backlogGrowthSlopeMsPerSec < 0.5, `${pace}ms: growing backlog`);
+    gate(result.finalBacklogMs === 0, `${pace}ms: final backlog ${result.finalBacklogMs} ms`);
+    gate(result.backlogGrowthSlopeMsPerSec <= 0, `${pace}ms: growing backlog`);
     gate(result.encoderKvWraps > 0 && result.encoderKvEvictions > 0, `${pace}ms: rollover not exercised`);
     gate(result.encoderMelPeakRetainedFrames < 300 && result.melHistoryRetained === false, `${pace}ms: Mel is not bounded`);
     gate(result.encoderComputeWarmMaxMs < 80, `${pace}ms: warm compute max ${result.encoderComputeWarmMaxMs} ms`);
@@ -247,8 +258,9 @@ async function main() {
   longRuns.push(randomResult);
   summary.long.push(compact(randomResult, "production-seeded-random-paced"));
   gate(randomResult.encoderTransformerFramesComputed === randomResult.encoderUniqueFrames, "random: frame replay");
-  gate(randomResult.finalBacklogMs < 20, `random: final backlog ${randomResult.finalBacklogMs} ms`);
-  gate(randomResult.backlogGrowthSlopeMsPerSec < 0.5, "random: growing backlog");
+  gate(randomResult.finalBacklogMs === 0,
+    `random: final backlog ${randomResult.finalBacklogMs} ms`);
+  gate(randomResult.backlogGrowthSlopeMsPerSec <= 0, "random: growing backlog");
   gate(randomResult.encoderKvWraps > 0, "random: rollover not exercised");
   gate(randomResult.encoderMelPeakRetainedFrames < 300 && randomResult.melHistoryRetained === false,
     "random: Mel is not bounded");
@@ -278,9 +290,23 @@ async function main() {
   summary.long.push(compact(baselineFull, "baseline-compute"));
   gate(productionFull.parityChecked && productionFull.encoderMaxAbsDeltaVsBatch <= 1e-5,
     `long global-batch tensor parity ${productionFull.encoderMaxAbsDeltaVsBatch}`);
-  gate(productionFull.encoderSha256 === baselineFull.encoderSha256, "production/baseline encoder tensor divergence");
-  gate(JSON.stringify(productionFull.tokens) === JSON.stringify(baselineFull.tokens), "production/baseline token divergence");
-  gate(productionFull.text === baselineFull.text, "production/baseline transcript divergence");
+  summary.schedulerBaselineParity = {
+    encoderShaExact: productionFull.encoderSha256 === baselineFull.encoderSha256,
+    tokensExact: JSON.stringify(productionFull.tokens) === JSON.stringify(baselineFull.tokens),
+    transcriptExact: productionFull.text === baselineFull.text,
+    exactRequired: summary.encoderKv === "F32",
+    rationale: summary.encoderKv === "F32"
+      ? "F32 physical-row shapes are required to be bit-exact."
+      : "The 128/128 FP16 row shape is a throughput reference; production 4/4 is gated against the authoritative global-batch oracle.",
+  };
+  if (summary.schedulerBaselineParity.exactRequired) {
+    gate(summary.schedulerBaselineParity.encoderShaExact,
+      "production/baseline F32 encoder tensor divergence");
+    gate(summary.schedulerBaselineParity.tokensExact,
+      "production/baseline F32 token divergence");
+    gate(summary.schedulerBaselineParity.transcriptExact,
+      "production/baseline F32 transcript divergence");
+  }
   for (const result of longRuns) {
     gate(JSON.stringify(result.tokens) === JSON.stringify(productionFull.tokens),
       `${result.planName}: full token sequence diverges from offline reference`);

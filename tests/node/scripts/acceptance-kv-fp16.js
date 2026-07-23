@@ -24,7 +24,11 @@ try {
     planName: "session8-kv-fp16",
     mode: "80ms",
     kvParity: true,
-    env: SESSION8_PRODUCTION_ENV,
+    env: {
+      ...SESSION8_PRODUCTION_ENV,
+      VOXTRAL_ENCODER_KV_TYPE: "f16",
+      VOXTRAL_DECODER_KV_TYPE: "f16",
+    },
     timeoutMs: 600_000,
   });
 

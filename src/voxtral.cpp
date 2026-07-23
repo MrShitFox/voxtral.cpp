@@ -79,24 +79,29 @@ static int32_t env_positive_i32(const char * name, int32_t fallback) {
     return (int32_t) parsed;
 }
 
-static ggml_type decoder_kv_type_from_env() {
-    // FP16 is the production default.  F32 remains an explicit numerical oracle
-    // for Session-8 acceptance; it is not a second resident shadow cache.
-    if (const char * value = std::getenv("VOXTRAL_DECODER_KV_TYPE")) {
+static ggml_type kv_type_from_env(const char * name, ggml_type fallback) {
+    if (const char * value = std::getenv(name)) {
+        if (std::strcmp(value, "f16") == 0 || std::strcmp(value, "F16") == 0) {
+            return GGML_TYPE_F16;
+        }
         if (std::strcmp(value, "f32") == 0 || std::strcmp(value, "F32") == 0) {
             return GGML_TYPE_F32;
         }
     }
-    return GGML_TYPE_F16;
+    return fallback;
+}
+
+static ggml_type decoder_kv_type_from_env() {
+    // Session 8.1 production: decoder FP16 is exact on both real fixtures and
+    // retains the dominant KV memory saving. F32 remains the numerical oracle.
+    return kv_type_from_env("VOXTRAL_DECODER_KV_TYPE", GGML_TYPE_F16);
 }
 
 static ggml_type encoder_kv_type_from_env() {
-    if (const char * value = std::getenv("VOXTRAL_ENCODER_KV_TYPE")) {
-        if (std::strcmp(value, "f32") == 0 || std::strcmp(value, "F32") == 0) {
-            return GGML_TYPE_F32;
-        }
-    }
-    return GGML_TYPE_F16;
+    // Session 8.1 production: encoder FP16 caused the only measured real-audio
+    // token drift; F32 is therefore the quality-preserving default. FP16 stays
+    // available for the explicit B/D acceptance variants.
+    return kv_type_from_env("VOXTRAL_ENCODER_KV_TYPE", GGML_TYPE_F32);
 }
 
 static int32_t normalize_physical_rows(int32_t rows) {
@@ -3605,8 +3610,8 @@ struct voxtral_encoder_kv_state {
     voxtral_context * ctx = nullptr;
     bool reusable_stream_graph = false;
 
-    // Persistent device ring, [kv_dim, capacity, enc_layers] FP16 by default
-    // (explicit F32 numerical oracle via VOXTRAL_ENCODER_KV_TYPE=f32).
+    // Persistent device ring, [kv_dim, capacity, enc_layers]. Session 8.1 uses
+    // F32 by default; explicit f16/f32 overrides drive the acceptance matrix.
     ggml_context        * ctx_ring = nullptr;
     ggml_backend_buffer_t buf_ring = nullptr;
     ggml_tensor         * ring_k   = nullptr;
@@ -5427,6 +5432,44 @@ int32_t voxtral_ctx_enc_out_ring_frames(const voxtral_context * ctx) {
 }
 int32_t voxtral_ctx_aemb_ring_frames(const voxtral_context * ctx) {
     return (ctx && ctx->audio_emb_ring) ? (int32_t) ctx->audio_emb_ring->ne[1] : 0;
+}
+
+static bool read_realtime_ring_rows(const ggml_tensor * tensor,
+                                    int64_t absolute_start, int32_t rows,
+                                    int32_t width, float * dst) {
+    if (!tensor || !dst || absolute_start < 0 || rows <= 0 || width <= 0 ||
+        tensor->type != GGML_TYPE_F32) return false;
+    const int32_t capacity = (int32_t) tensor->ne[1];
+    const size_t row_bytes = (size_t) width * sizeof(float);
+    if (rows > capacity || tensor->ne[0] != width ||
+        tensor->nb[0] != sizeof(float) || tensor->nb[1] != row_bytes) {
+        return false;
+    }
+    int32_t done = 0;
+    while (done < rows) {
+        const int32_t slot =
+            (int32_t) ((absolute_start + done) % capacity);
+        const int32_t count = std::min(rows - done, capacity - slot);
+        ggml_backend_tensor_get(
+            tensor,
+            dst + (size_t) done * width,
+            (size_t) slot * tensor->nb[1],
+            (size_t) count * row_bytes);
+        done += count;
+    }
+    return true;
+}
+
+bool voxtral_ctx_read_enc_out_ring_internal(
+    const voxtral_context * ctx, int64_t absolute_start, int32_t rows, float * dst) {
+    return ctx && read_realtime_ring_rows(
+        ctx->enc_out_ring, absolute_start, rows, VOXTRAL_ENC_DIM, dst);
+}
+
+bool voxtral_ctx_read_aemb_ring_internal(
+    const voxtral_context * ctx, int64_t absolute_start, int32_t rows, float * dst) {
+    return ctx && read_realtime_ring_rows(
+        ctx->audio_emb_ring, absolute_start, rows, VOXTRAL_DEC_DIM, dst);
 }
 
 // Offline prefill: prefix tokens + audio embeddings + suffix tokens in one graph.

@@ -1,14 +1,15 @@
 import { loadEnvironment } from "../config/environment.js";
 import { writeArtifactBundle } from "../helpers/artifacts.js";
+import { loadLatestPrecisionMatrix } from "../helpers/precision-cache.js";
 import { runStreamSession } from "../helpers/stream.js";
 import {
-  SESSION8_PRODUCTION_ENV,
   exactTokens,
   gate,
   gateDeviceResident,
   gateKvMemory,
   gateRing,
   prepareSession8,
+  session8PrecisionEnvironment,
   summarizeRun,
 } from "../helpers/session8.js";
 
@@ -42,9 +43,16 @@ function gateEvents(run, label) {
 }
 
 try {
+  const matrix = await loadLatestPrecisionMatrix(config);
+  const selected = matrix.result.productionDecision.selected;
+  gate(selected, "precision matrix has no selected production variant");
+  summary.precisionMatrixArtifact = matrix.directory;
+  summary.selectedPrecision = selected;
+  summary.encoderKv = matrix.result.variants[selected].encoderKv;
+  summary.decoderKv = matrix.result.variants[selected].decoderKv;
   await prepareSession8(summary, { config });
   const common = {
-    ...SESSION8_PRODUCTION_ENV,
+    ...session8PrecisionEnvironment(selected),
     // The accepted spoken fixture reaches absolute decoder position 94. A
     // 64-slot test ring therefore wraps during real lexical tokens, while the
     // production allocation/capacity remains 8192 outside this explicit seam.
@@ -92,7 +100,7 @@ try {
     ["logical ring oracle", logical],
   ]) {
     gateDeviceResident(run, label);
-    gateKvMemory(run, label);
+    gateKvMemory(run, label, { precisionVariant: selected });
     gateRing(run, label, { requireWrap: true });
   }
   gateEvents(reusable, "reusable production ring");

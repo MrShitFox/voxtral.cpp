@@ -223,6 +223,14 @@ void voxtral_ctx_decoder_reset_incremental(voxtral_context * ctx);
 int32_t voxtral_ctx_enc_out_ring_frames(const voxtral_context * ctx);  // ENC_OUT_RING_CAP
 int32_t voxtral_ctx_aemb_ring_frames(const voxtral_context * ctx);     // AEMB_RING_CAP
 
+// Test-only bounded readback used to calculate chunk-plan-invariant SHA-256
+// diagnostics.  The caller reads newly produced rows immediately, before the
+// fixed device ring can wrap; production does not call these entry points.
+bool voxtral_ctx_read_enc_out_ring_internal(
+    const voxtral_context * ctx, int64_t absolute_start, int32_t rows, float * dst);
+bool voxtral_ctx_read_aemb_ring_internal(
+    const voxtral_context * ctx, int64_t absolute_start, int32_t rows, float * dst);
+
 // Enable the per-batch encoder-output ring copy. Off by default so the finish-only
 // reference path does no extra work; the incremental stream turns it on before its
 // first feed so the adapter can read groups from the device ring.

@@ -18,13 +18,12 @@
 //   * a strictly bounded internal event queue (lifecycle + error events);
 //   * finish/reset/cancel/destroy;
 //   * an incremental Mel frontend and per-layer encoder KV scheduler driven by
-//     feed() (production default logical=4 / physical=32);
-//   * finish-only adapter/decoder execution over the accumulated encoder output.
-//     No TOKEN or PARTIAL_TEXT event is produced before finish().
+//     feed() (production default logical=4 / physical=4);
+//   * device-resident incremental adapter/decoder execution that emits TOKEN and
+//     replaceable PARTIAL_TEXT events while audio is fed.
 //
-// The encoder path is low-latency realtime-capable and does not retain full PCM.
-// End-to-end token/partial-text streaming is intentionally still deferred: the
-// adapter and decoder run synchronously at finish().
+// The end-to-end path is low-latency realtime-capable and does not retain full
+// PCM, encoder output, or an utterance-sized event history.
 //
 // ----------------------------------------------------------------------------
 // Ownership model (v1)
@@ -296,6 +295,14 @@ size_t               voxtral_stream_pcm_size         (const voxtral_stream * str
 // invariant to chunk boundaries and does not require retaining the PCM. Empty
 // digest string ("e3b0c4...") for an empty stream.
 std::string          voxtral_stream_pcm_sha256       (const voxtral_stream * stream);
+// Opt-in VOXTRAL_CAPTURE_OUTPUT_SHA diagnostics. These hash newly produced
+// device-ring rows through bounded readback; the byte counter is separate from
+// the production-path transfer counters.
+std::string          voxtral_stream_encoder_output_sha256(const voxtral_stream * stream);
+std::string          voxtral_stream_adapter_output_sha256(const voxtral_stream * stream);
+int64_t              voxtral_stream_encoder_output_sha_rows(const voxtral_stream * stream);
+int64_t              voxtral_stream_adapter_output_sha_rows(const voxtral_stream * stream);
+int64_t              voxtral_stream_output_sha_d2h_bytes(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
 // Incremental Mel frontend introspection. For inference streams these track the
@@ -377,6 +384,12 @@ double  voxtral_stream_first_adapter_commit_ms      (const voxtral_stream * stre
 double  voxtral_stream_first_decoder_step_ms        (const voxtral_stream * stream);
 double  voxtral_stream_first_token_ms               (const voxtral_stream * stream);
 double  voxtral_stream_first_visible_text_ms        (const voxtral_stream * stream);
+double  voxtral_stream_first_decoder_step_eligibility_ms(const voxtral_stream * stream);
+double  voxtral_stream_first_decoder_step_overhead_ms(const voxtral_stream * stream);
+double  voxtral_stream_first_token_eligibility_ms   (const voxtral_stream * stream);
+double  voxtral_stream_first_token_overhead_ms      (const voxtral_stream * stream);
+double  voxtral_stream_first_partial_eligibility_ms (const voxtral_stream * stream);
+double  voxtral_stream_first_partial_overhead_ms    (const voxtral_stream * stream);
 // Device-traffic accounting for the adapter/decoder path (steady-state gates).
 int64_t voxtral_stream_adapter_input_d2h_bytes      (const voxtral_stream * stream);
 int64_t voxtral_stream_adapter_output_d2h_bytes     (const voxtral_stream * stream);

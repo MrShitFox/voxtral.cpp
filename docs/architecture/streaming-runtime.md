@@ -1554,3 +1554,42 @@ evaluated once and emitted in low-latency microbatches. Adapter and decoder stil
 `finish()`; no `TOKEN` or `PARTIAL_TEXT` event is emitted yet. Session 7 must consume groups of
 four encoder frames from the output queue, define decoder-step cadence, and add the first-token
 and partial-text event interfaces.
+
+## Session 8.1 current production status
+
+The earlier “current boundary” paragraphs above are historical session notes.
+The implemented production path is now end-to-end incremental:
+
+- Mel and the encoder run during `feed()`.
+- Adapter groups are consumed on-device as soon as four encoder frames are
+  eligible.
+- The decoder emits token and replaceable partial-text events during `feed()`;
+  `finish()` handles only bounded right-padding/EOS work.
+- Encoder scheduling is logical/physical **4/4**. The 128/128 path remains an
+  explicit throughput/reference mode.
+- Decoder KV is a physical circular ring: absolute RoPE positions remain
+  monotonic, rollover performs no full-buffer copy and does not move KV bytes.
+- Production precision is encoder KV **F32** and decoder KV **FP16**. Runtime
+  test overrides retain independent F32/FP16 selection for both rings.
+
+The precision choice is evidence-driven. On two real Russian recordings
+(121.600 s and 244.821 s), decoder FP16 alone is exact against F32/F32 for all
+4,603 tokens. Encoder FP16 causes the only observed drift: one local
+four-token proper-name spelling change on the shorter recording, with immediate
+re-convergence and no number, negation or sentence change. See
+`docs/session8-findings.md` for the complete matrix and artifacts.
+
+Bounded-memory evidence uses the production decoder/KV path with a reduced
+test-only capacity: 48 wraps were captured, decoder rollover bytes/full-buffer
+moves remained zero, VRAM was flat, graph/allocation counts were constant and
+the last 20-wrap RSS window varied by only 260 KiB. A separate production
+30-minute paced stream measured pipeline RTF 0.767796, final backlog 0,
+non-positive slope, two full-size decoder wraps and peak VRAM 4.319 GB.
+
+Absolute first-token time is diagnostic because audio eligibility depends on
+fixture content. Current hard latency gates measure runtime overhead after the
+required context is available: approximately 60 ms for the first decoder step
+and 62–63 ms for the first lexical token/partial on both real fixtures.
+
+Public streaming APIs, multi-stream scheduling and Q8 remain out of scope; the
+streaming implementation in this section is the internal production runtime.

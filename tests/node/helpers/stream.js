@@ -52,6 +52,9 @@ export async function runStreamSession({
   monitorMemory = false,
   maxEvents = 0,
   backpressure = false,
+  captureRolloverMemory = false,
+  mallocTrimAfter = false,
+  discardEventHistory = false,
   syntheticSeconds = 0,
   maxTotalSamples = 0,
   timeoutMs = 300_000,
@@ -93,6 +96,15 @@ export async function runStreamSession({
   }
   if (backpressure) {
     args.push("--backpressure");
+  }
+  if (captureRolloverMemory) {
+    args.push("--capture-rollover-memory");
+  }
+  if (mallocTrimAfter) {
+    args.push("--malloc-trim-after");
+  }
+  if (discardEventHistory) {
+    args.push("--discard-event-history");
   }
   if (syntheticSeconds > 0) {
     args.push("--synthetic-seconds", String(syntheticSeconds));
@@ -160,6 +172,8 @@ export async function runStreamSession({
   result.planFile = planFile;
   result.commandLine = command;
   result.wallMs = proc.wallMs;
+  result.childExited = true;
+  result.childExitRssKiB = 0;
   result.evidence = detectEvidence(proc.stdout, proc.stderr);
   const memory = proc.stderr.match(
     /\[VOXTRAL_MONITOR\] baselineVramBytes=(\d+) peakVramBytes=(\d+) finalVramBytes=(\d+) peakRssKiB=(\d+)/u,

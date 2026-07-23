@@ -21,8 +21,9 @@ describe("remote helpers", () => {
     const invocation = buildRsyncInvocation(config);
     expect(invocation.args).toContain("--delete");
     expect(invocation.args).toContain("--exclude=build*/");
-    expect(invocation.args).toContain("--exclude=/voxTest2min.m4a");
-    expect(invocation.args).toContain("--exclude=/voxTest2min-16k-mono-pcm16.*");
+    expect(invocation.args).toContain("--exclude=*.m4a");
+    expect(invocation.args).toContain("--exclude=*.wav");
+    expect(invocation.args).toContain("--exclude=*.pcm");
     expect(invocation.args.at(-1)).toBe("root@192.168.2.136:/root/voxtral.cpp/");
     expect(invocation.args.join(" ")).not.toContain("unit-secret");
   });

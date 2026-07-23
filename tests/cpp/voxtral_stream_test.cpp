@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -52,6 +53,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 // ----------------------------------------------------------------------------
 // Minimal SHA-256 (public-domain style) over raw bytes.
@@ -296,6 +301,41 @@ void log_stderr(voxtral_log_level lvl, const std::string & msg) {
 // needs. The stream is created and destroyed by the caller so an --ab run can
 // keep A and B alive together to prove their contexts are distinct.
 // ----------------------------------------------------------------------------
+struct ProcessMemorySnapshot {
+    int64_t rssKiB = 0;
+    int64_t pssKiB = 0;
+    int64_t anonymousRssKiB = 0;
+    int64_t sharedCleanKiB = 0;
+    int64_t sharedDirtyKiB = 0;
+    int64_t privateCleanKiB = 0;
+    int64_t privateDirtyKiB = 0;
+    int64_t fileBackedRssKiB = 0;
+    int64_t sharedLibraryRssKiB = 0;
+    int64_t vulkanDriverRssKiB = 0;
+    int64_t heapMappingRssKiB = 0;
+    int64_t heapUsedBytes = 0;
+    int64_t heapRetainedFreeBytes = 0;
+    int64_t heapArenaBytes = 0;
+    int64_t vramBytes = 0;
+};
+
+struct RolloverMemorySample {
+    int64_t wrap = 0;
+    int64_t absolutePosition = -1;
+    int64_t settledAfterDecoderSteps = 0;
+    ProcessMemorySnapshot before;
+    ProcessMemorySnapshot after;
+    ProcessMemorySnapshot settled;
+    bool settledCaptured = false;
+    uint64_t graphObjects = 0;
+    uint64_t graphAllocations = 0;
+    uint64_t encoderAllocations = 0;
+    uint64_t adapterAllocations = 0;
+    uint64_t decoderAllocations = 0;
+    int64_t decoderKvBytesMoved = 0;
+    int64_t decoderKvFullBufferMoves = 0;
+};
+
 struct StreamRun {
     std::string          state;
     std::string          finishStatus;
@@ -313,6 +353,8 @@ struct StreamRun {
     bool                 warmupApplied = false;
     double               warmupMs = 0.0;
     double               modelLoadMs = 0.0;
+    double               contextCreationMs = 0.0;
+    double               streamStartMs = 0.0;
     double               coldFirstDecoderStepMs = 0.0;
     double               coldFirstTokenMs = 0.0;
     double               coldFirstVisibleTextMs = 0.0;
@@ -348,6 +390,10 @@ struct StreamRun {
     int64_t  encoderStateBytes       = 0;
     int64_t  encoderOutputAccumulatedBytes = 0;
     std::string encoderSha;
+    std::string adapterSha;
+    int64_t  encoderShaRows = 0;
+    int64_t  adapterShaRows = 0;
+    int64_t  outputShaDiagnosticD2hBytes = 0;
     double   encoderMaxAbsDeltaVsBatch = 0.0;
     double   encoderMaxAbsDeltaVsManual = 0.0;
     double   encoderManualMeanAbsDelta   = 0.0;
@@ -419,6 +465,9 @@ struct StreamRun {
     double finalBacklogMs = 0.0;
     double backlogGrowthSlopeMsPerSec = 0.0;
     double postInputDrainMs = 0.0;
+    int64_t terminalPartialChunkSamples = 0;
+    double terminalPartialChunkMs = 0.0;
+    double terminalPartialFinishLatenessMs = 0.0;
     uint64_t deadlineMisses = 0;
     double deadlineMissRate = 0.0;
     voxtral_backlog_metrics encoderBacklog;
@@ -436,6 +485,17 @@ struct StreamRun {
     int64_t streamIdleRssKiB = 0;
     int64_t afterFinishRssKiB = 0;
     int64_t afterDestroyRssKiB = 0;
+    ProcessMemorySnapshot modelLoadedMemory;
+    ProcessMemorySnapshot beforeWarmupMemory;
+    ProcessMemorySnapshot afterWarmupMemory;
+    ProcessMemorySnapshot afterFinishMemory;
+    ProcessMemorySnapshot afterDestroyMemory;
+    ProcessMemorySnapshot afterMallocTrimMemory;
+    bool mallocTrimRequested = false;
+    bool mallocTrimAvailable = false;
+    bool mallocTrimApplied = false;
+    int32_t mallocTrimReturn = -1;
+    std::vector<RolloverMemorySample> rolloverMemory;
     bool parityChecked = true;
     voxtral_runtime_profile steadyRuntimeProfile;
     voxtral_runtime_profile runtimeProfile;
@@ -454,12 +514,22 @@ struct StreamRun {
     double   firstDecoderStepMs = 0.0;
     double   firstTokenMs = 0.0;
     double   firstVisibleTextMs = 0.0;
+    double   firstDecoderStepEligibilityMs = -1.0;
+    double   firstDecoderStepOverheadMs = -1.0;
+    double   firstTokenEligibilityMs = -1.0;
+    double   firstTokenOverheadMs = -1.0;
+    double   firstPartialEligibilityMs = -1.0;
+    double   firstPartialOverheadMs = -1.0;
     int64_t  adapterInputD2hBytes = 0;
     int64_t  adapterOutputD2hBytes = 0;
     int64_t  logitsD2hBytes = 0;
     int64_t  tokenIdD2hBytes = 0;
     int64_t  encoderOutputD2hBytes = 0;
     uint64_t partialTextRevision = 0;
+    bool     eventHistoryRetained = true;
+    uint64_t retainedEventHistoryCount = 0;
+    uint64_t tokenOutputBytes = 0;
+    uint64_t transcriptOutputBytes = 0;
 
     // Session 7.1: decoder mode + event-queue telemetry + backpressure evidence.
     std::string decoderMode = "incremental";
@@ -482,6 +552,8 @@ struct DriveOptions {
     bool check_parity = true;
     bool check_manual_oracle = false;
     bool capture_numerical = false;
+    bool capture_rollover_memory = false;
+    bool retain_event_history = true;
     // Session 7.1 backpressure exercise: shrink the event queue to `max_events`
     // and, when `backpressure` is set, DELIBERATELY stop draining until feed
     // reports queue_full — then drain and continue. Proves mandatory events are
@@ -523,6 +595,80 @@ int64_t read_process_rss_kib() {
         std::getline(in, rest);
     }
     return 0;
+}
+
+int64_t parse_kib_value(const std::string & line) {
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos) return 0;
+    std::istringstream input(line.substr(colon + 1));
+    int64_t value = 0;
+    input >> value;
+    return value;
+}
+
+ProcessMemorySnapshot read_process_memory_snapshot() {
+    ProcessMemorySnapshot out;
+    {
+        std::ifstream in("/proc/self/smaps_rollup");
+        std::string line;
+        while (std::getline(in, line)) {
+            if      (line.rfind("Rss:", 0) == 0)           out.rssKiB = parse_kib_value(line);
+            else if (line.rfind("Pss:", 0) == 0)           out.pssKiB = parse_kib_value(line);
+            else if (line.rfind("Anonymous:", 0) == 0)     out.anonymousRssKiB = parse_kib_value(line);
+            else if (line.rfind("Shared_Clean:", 0) == 0)  out.sharedCleanKiB = parse_kib_value(line);
+            else if (line.rfind("Shared_Dirty:", 0) == 0)  out.sharedDirtyKiB = parse_kib_value(line);
+            else if (line.rfind("Private_Clean:", 0) == 0) out.privateCleanKiB = parse_kib_value(line);
+            else if (line.rfind("Private_Dirty:", 0) == 0) out.privateDirtyKiB = parse_kib_value(line);
+        }
+    }
+    out.fileBackedRssKiB = std::max<int64_t>(0, out.rssKiB - out.anonymousRssKiB);
+
+    // Mapping attribution is diagnostic: a driver shared object can also appear
+    // in the shared-library total.  Keep those categories explicit instead of
+    // pretending they form a disjoint accounting identity.
+    {
+        std::ifstream in("/proc/self/smaps");
+        std::string line;
+        bool mapping_driver = false;
+        bool mapping_library = false;
+        bool mapping_heap = false;
+        while (std::getline(in, line)) {
+            const size_t dash = line.find('-');
+            const size_t space = line.find(' ');
+            const bool header = dash != std::string::npos &&
+                                space != std::string::npos && dash < space;
+            if (header) {
+                std::string lower = line;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return (char) std::tolower(c); });
+                mapping_driver =
+                    lower.find("radv") != std::string::npos ||
+                    lower.find("vulkan") != std::string::npos ||
+                    lower.find("amdgpu") != std::string::npos ||
+                    lower.find("libdrm") != std::string::npos ||
+                    lower.find("mesa") != std::string::npos;
+                mapping_library =
+                    lower.find(".so") != std::string::npos ||
+                    lower.find("/lib/") != std::string::npos ||
+                    lower.find("/lib64/") != std::string::npos;
+                mapping_heap = lower.find("[heap]") != std::string::npos;
+            } else if (line.rfind("Rss:", 0) == 0) {
+                const int64_t value = parse_kib_value(line);
+                if (mapping_driver)  out.vulkanDriverRssKiB += value;
+                if (mapping_library) out.sharedLibraryRssKiB += value;
+                if (mapping_heap)    out.heapMappingRssKiB += value;
+            }
+        }
+    }
+
+#if defined(__GLIBC__)
+    const struct mallinfo2 info = mallinfo2();
+    out.heapUsedBytes = (int64_t) info.uordblks;
+    out.heapRetainedFreeBytes = (int64_t) info.fordblks;
+    out.heapArenaBytes = (int64_t) info.arena + (int64_t) info.hblkhd;
+#endif
+    out.vramBytes = read_vram_used_bytes();
+    return out;
 }
 
 // Direct batch-vs-incremental encoder tensor parity: recompute the batch encoder
@@ -710,6 +856,15 @@ StreamRun drive_stream(voxtral_stream * stream,
                        const DriveOptions & options = {}) {
     StreamRun r;
     r.parityChecked = options.check_parity;
+    r.eventHistoryRetained = options.retain_event_history;
+    auto drain_events = [&]() {
+        voxtral_stream_event event;
+        while (voxtral_stream_poll_event(stream, event)) {
+            if (options.retain_event_history) {
+                r.events.push_back(std::move(event));
+            }
+        }
+    };
     if (options.max_events > 0) {
         voxtral_stream_test_set_max_events(stream, (size_t) options.max_events);
         r.maxEventsBound = options.max_events;
@@ -732,6 +887,21 @@ StreamRun drive_stream(voxtral_stream * stream,
     std::vector<double> backlog_ms;
     std::vector<double> backlog_audio_s;
     uint64_t audio_cursor = 0;
+    bool first_feed_seen = false;
+    const auto * const run_context = static_cast<const voxtral_context *>(
+        voxtral_stream_context_ptr(stream));
+    // Building a full runtime-profile snapshot computes percentiles from the
+    // bounded reservoirs. That is intentionally diagnostic work, not part of
+    // the production feed path: doing it before and after every paced feed
+    // becomes progressively expensive and can manufacture backlog in a long
+    // soak. Per-feed snapshots are needed only by the accelerated rollover
+    // attribution mode; ordinary runs take their complete steady/final
+    // snapshots once below.
+    voxtral_runtime_profile previous_profile{};
+    if (options.capture_rollover_memory) {
+        previous_profile =
+            voxtral_context_runtime_profile_internal(run_context);
+    }
     voxtral_status fst = voxtral_status::ok;
     for (size_t c : counts) {
         // A captured chunk becomes callable only when its final sample has
@@ -741,14 +911,73 @@ StreamRun drive_stream(voxtral_stream * stream,
             (long long) ((double) (audio_cursor + c) * 1'000'000.0 / VOXTRAL_SAMPLE_RATE));
         if (options.paced) std::this_thread::sleep_until(end_deadline);
         const auto before_feed = std::chrono::steady_clock::now();
+        if (!first_feed_seen) {
+            r.streamStartMs =
+                std::chrono::duration<double, std::milli>(before_feed - wall_start).count();
+            first_feed_seen = true;
+        }
         if (options.paced) {
             start_lateness_ms.push_back(std::max(0.0,
                 std::chrono::duration<double, std::milli>(before_feed - end_deadline).count()));
         }
+        voxtral_runtime_profile before_profile{};
+        bool next_step_wraps = false;
+        if (options.capture_rollover_memory) {
+            before_profile =
+                voxtral_context_runtime_profile_internal(run_context);
+            next_step_wraps =
+                before_profile.decoderKvCapacity > 0 &&
+                before_profile.decoderNextAbsolutePosition >= before_profile.decoderKvCapacity &&
+                before_profile.decoderNextAbsolutePosition % before_profile.decoderKvCapacity == 0;
+        }
+        ProcessMemorySnapshot before_wrap_memory;
+        if (next_step_wraps) before_wrap_memory = read_process_memory_snapshot();
         const int16_t * ptr = (c == 0) ? nullptr : (pcm16.data() + off);
         const auto tf0 = before_feed;
         fst = voxtral_stream_feed_pcm16_internal(stream, ptr, c);
         const auto tf1 = std::chrono::steady_clock::now();
+        if (options.capture_rollover_memory) {
+            const voxtral_runtime_profile after_profile =
+                voxtral_context_runtime_profile_internal(run_context);
+            if (after_profile.decoderKvWraps > previous_profile.decoderKvWraps) {
+                const ProcessMemorySnapshot after_memory = read_process_memory_snapshot();
+                for (int64_t wrap = previous_profile.decoderKvWraps + 1;
+                     wrap <= after_profile.decoderKvWraps; ++wrap) {
+                    RolloverMemorySample sample;
+                    sample.wrap = wrap;
+                    sample.absolutePosition =
+                        next_step_wraps && wrap == after_profile.decoderKvWraps
+                            ? before_profile.decoderNextAbsolutePosition
+                            : wrap * after_profile.decoderKvCapacity;
+                    sample.before = next_step_wraps ? before_wrap_memory : after_memory;
+                    sample.after = after_memory;
+                    sample.graphObjects =
+                        after_profile.encoderGraphBuildCount +
+                        after_profile.adapterGraphBuildCount +
+                        after_profile.decoderGraphBuildCount;
+                    sample.graphAllocations = after_profile.graphAllocations;
+                    sample.encoderAllocations = after_profile.encoderAllocations;
+                    sample.adapterAllocations = after_profile.adapterAllocations;
+                    sample.decoderAllocations = after_profile.decoderAllocations;
+                    sample.decoderKvBytesMoved = after_profile.decoderKvBytesMoved;
+                    sample.decoderKvFullBufferMoves =
+                        after_profile.decoderKvFullBufferMoves;
+                    r.rolloverMemory.push_back(std::move(sample));
+                }
+            }
+            for (auto & sample : r.rolloverMemory) {
+                if (!sample.settledCaptured &&
+                    after_profile.decoderNextAbsolutePosition >=
+                        sample.absolutePosition + 11) {
+                    sample.settled = read_process_memory_snapshot();
+                    sample.settledAfterDecoderSteps =
+                        after_profile.decoderNextAbsolutePosition -
+                        (sample.absolutePosition + 1);
+                    sample.settledCaptured = true;
+                }
+            }
+            previous_profile = after_profile;
+        }
         ++feed_calls;
         if (c > 0) feed_ms.push_back(std::chrono::duration<double, std::milli>(tf1 - tf0).count());
         if (options.paced) {
@@ -762,8 +991,27 @@ StreamRun drive_stream(voxtral_stream * stream,
             const double cadence_ms = options.pace_chunk_ms > 0
                 ? (double) options.pace_chunk_ms
                 : (double) c * 1000.0 / VOXTRAL_SAMPLE_RATE;
-            backlog_ms.push_back(std::max(0.0, late - cadence_ms));
-            backlog_audio_s.push_back((double) (audio_cursor + c) / VOXTRAL_SAMPLE_RATE);
+            const int64_t nominal_samples = options.pace_chunk_ms > 0
+                ? (int64_t) options.pace_chunk_ms * VOXTRAL_SAMPLE_RATE / 1000
+                : 0;
+            const bool terminal_partial =
+                options.pace_chunk_ms > 0 &&
+                off + c == pcm16.size() &&
+                (int64_t) c < nominal_samples;
+            if (terminal_partial) {
+                // There is no following full capture interval against which a
+                // terminal short block can accumulate backlog. Keep its actual
+                // completion lateness as post-input drain evidence, but exclude
+                // it from the sustained cadence regression/final queue sample.
+                r.terminalPartialChunkSamples = (int64_t) c;
+                r.terminalPartialChunkMs =
+                    (double) c * 1000.0 / VOXTRAL_SAMPLE_RATE;
+                r.terminalPartialFinishLatenessMs = late;
+            } else {
+                backlog_ms.push_back(std::max(0.0, late - cadence_ms));
+                backlog_audio_s.push_back(
+                    (double) (audio_cursor + c) / VOXTRAL_SAMPLE_RATE);
+            }
         }
         if (fst == voxtral_status::limit_exceeded) {
             // Explicit backpressure (queue_full), NOT a failure: the audio was
@@ -772,7 +1020,7 @@ StreamRun drive_stream(voxtral_stream * stream,
             // the decoder. Mandatory events are never dropped (events_dropped == 0).
             r.backpressureObserved = true;
             r.feedQueueFullReturns++;
-            { voxtral_stream_event dev; while (voxtral_stream_poll_event(stream, dev)) r.events.push_back(dev); }
+            drain_events();
             off += c;
             audio_cursor += c;
             fst = voxtral_status::ok;   // resumed for the next iteration / finish
@@ -789,7 +1037,7 @@ StreamRun drive_stream(voxtral_stream * stream,
         // overflows. The backpressure exercise deliberately withholds draining until
         // feed reports queue_full (above), to prove the mandatory-event contract.
         if (!options.backpressure) {
-            voxtral_stream_event dev; while (voxtral_stream_poll_event(stream, dev)) r.events.push_back(dev);
+            drain_events();
         }
     }
 
@@ -809,6 +1057,45 @@ StreamRun drive_stream(voxtral_stream * stream,
             std::cerr << "finish failed: " << voxtral_stream_status_name(finst)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
         }
+    }
+    if (options.capture_rollover_memory) {
+        const voxtral_runtime_profile final_profile =
+            voxtral_context_runtime_profile_internal(run_context);
+        const ProcessMemorySnapshot final_memory = read_process_memory_snapshot();
+        if (final_profile.decoderKvWraps > previous_profile.decoderKvWraps) {
+            for (int64_t wrap = previous_profile.decoderKvWraps + 1;
+                 wrap <= final_profile.decoderKvWraps; ++wrap) {
+                RolloverMemorySample sample;
+                sample.wrap = wrap;
+                sample.absolutePosition = wrap * final_profile.decoderKvCapacity;
+                sample.before = final_memory;
+                sample.after = final_memory;
+                sample.settled = final_memory;
+                sample.settledCaptured = true;
+                sample.graphObjects =
+                    final_profile.encoderGraphBuildCount +
+                    final_profile.adapterGraphBuildCount +
+                    final_profile.decoderGraphBuildCount;
+                sample.graphAllocations = final_profile.graphAllocations;
+                sample.encoderAllocations = final_profile.encoderAllocations;
+                sample.adapterAllocations = final_profile.adapterAllocations;
+                sample.decoderAllocations = final_profile.decoderAllocations;
+                sample.decoderKvBytesMoved = final_profile.decoderKvBytesMoved;
+                sample.decoderKvFullBufferMoves =
+                    final_profile.decoderKvFullBufferMoves;
+                r.rolloverMemory.push_back(std::move(sample));
+            }
+        }
+        for (auto & sample : r.rolloverMemory) {
+            if (!sample.settledCaptured) {
+                sample.settled = final_memory;
+                sample.settledAfterDecoderSteps = std::max<int64_t>(
+                    0, final_profile.decoderNextAbsolutePosition -
+                       (sample.absolutePosition + 1));
+                sample.settledCaptured = true;
+            }
+        }
+        r.afterFinishMemory = final_memory;
     }
 
     r.dataFeeds = (int64_t) feed_ms.size();
@@ -846,7 +1133,7 @@ StreamRun drive_stream(voxtral_stream * stream,
         r.backlogP95Ms = percentile(backlog_ms, 0.95);
         r.backlogP99Ms = percentile(backlog_ms, 0.99);
         r.backlogMaxMs = percentile(backlog_ms, 1.00);
-        r.finalBacklogMs = backlog_ms.back();
+        r.finalBacklogMs = backlog_ms.empty() ? 0.0 : backlog_ms.back();
         r.deadlineMisses = (uint64_t) std::count_if(
             backlog_ms.begin(), backlog_ms.end(), [](double value) { return value > 0.0; });
         r.deadlineMissRate = backlog_ms.empty()
@@ -960,13 +1247,22 @@ StreamRun drive_stream(voxtral_stream * stream,
 
     const float * inc_enc    = voxtral_stream_encoder_output_data(stream);
     const int32_t inc_enc_frames = voxtral_stream_encoder_output_frames_count(stream);
+    r.encoderShaRows = voxtral_stream_encoder_output_sha_rows(stream);
+    r.adapterShaRows = voxtral_stream_adapter_output_sha_rows(stream);
+    r.outputShaDiagnosticD2hBytes =
+        voxtral_stream_output_sha_d2h_bytes(stream);
+    r.adapterSha = voxtral_stream_adapter_output_sha256(stream);
     {
         Sha256 esha;
-        if (inc_enc && inc_enc_frames > 0) {
+        if (r.encoderShaRows > 0) {
+            r.encoderSha = voxtral_stream_encoder_output_sha256(stream);
+        } else if (inc_enc && inc_enc_frames > 0) {
             const int32_t used = (inc_enc_frames / 4) * 4;
             esha.update(inc_enc, (size_t) used * VOXTRAL_ENC_DIM * sizeof(float));
+            r.encoderSha = esha.hex();
+        } else {
+            r.encoderSha = esha.hex();
         }
-        r.encoderSha = esha.hex();
     }
     if (options.capture_numerical && inc_enc && inc_enc_frames > 0) {
         const int32_t used = (inc_enc_frames / 4) * 4;
@@ -992,9 +1288,8 @@ StreamRun drive_stream(voxtral_stream * stream,
         r.manualOracleChecked = cmp.ok;
     }
 
-    // Drain events (order preserved).
-    voxtral_stream_event ev;
-    while (voxtral_stream_poll_event(stream, ev)) r.events.push_back(ev);
+    // Drain events (order preserved when history capture is enabled).
+    drain_events();
 
     r.state           = voxtral_stream_state_name(voxtral_stream_get_state(stream));
     r.finishStatus    = voxtral_stream_status_name(finst);
@@ -1005,6 +1300,9 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.pcmFloats       = voxtral_stream_samples_received(stream);
     r.tokens          = voxtral_stream_tokens(stream);
     r.text            = voxtral_stream_transcript(stream);
+    r.retainedEventHistoryCount = r.events.size();
+    r.tokenOutputBytes = r.tokens.size() * sizeof(int32_t);
+    r.transcriptOutputBytes = r.text.size();
     r.contextOwned    = voxtral_stream_owns_context(stream);
     r.ok              = (finst == voxtral_status::ok);
 
@@ -1022,6 +1320,18 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.firstDecoderStepMs      = voxtral_stream_first_decoder_step_ms(stream);
     r.firstTokenMs            = voxtral_stream_first_token_ms(stream);
     r.firstVisibleTextMs      = voxtral_stream_first_visible_text_ms(stream);
+    r.firstDecoderStepEligibilityMs =
+        voxtral_stream_first_decoder_step_eligibility_ms(stream);
+    r.firstDecoderStepOverheadMs =
+        voxtral_stream_first_decoder_step_overhead_ms(stream);
+    r.firstTokenEligibilityMs =
+        voxtral_stream_first_token_eligibility_ms(stream);
+    r.firstTokenOverheadMs =
+        voxtral_stream_first_token_overhead_ms(stream);
+    r.firstPartialEligibilityMs =
+        voxtral_stream_first_partial_eligibility_ms(stream);
+    r.firstPartialOverheadMs =
+        voxtral_stream_first_partial_overhead_ms(stream);
     r.adapterInputD2hBytes    = voxtral_stream_adapter_input_d2h_bytes(stream);
     r.adapterOutputD2hBytes   = voxtral_stream_adapter_output_d2h_bytes(stream);
     r.logitsD2hBytes          = voxtral_stream_logits_d2h_bytes(stream);
@@ -1064,6 +1374,27 @@ StreamRun drive_stream(voxtral_stream * stream,
     return r;
 }
 
+void write_memory_snapshot(std::ostringstream & js,
+                           const ProcessMemorySnapshot & memory) {
+    js << "{";
+    js << "\"rssKiB\":" << memory.rssKiB << ",";
+    js << "\"pssKiB\":" << memory.pssKiB << ",";
+    js << "\"anonymousRssKiB\":" << memory.anonymousRssKiB << ",";
+    js << "\"sharedCleanKiB\":" << memory.sharedCleanKiB << ",";
+    js << "\"sharedDirtyKiB\":" << memory.sharedDirtyKiB << ",";
+    js << "\"privateCleanKiB\":" << memory.privateCleanKiB << ",";
+    js << "\"privateDirtyKiB\":" << memory.privateDirtyKiB << ",";
+    js << "\"fileBackedRssKiB\":" << memory.fileBackedRssKiB << ",";
+    js << "\"sharedLibraryRssKiB\":" << memory.sharedLibraryRssKiB << ",";
+    js << "\"vulkanDriverRssKiB\":" << memory.vulkanDriverRssKiB << ",";
+    js << "\"heapMappingRssKiB\":" << memory.heapMappingRssKiB << ",";
+    js << "\"heapUsedBytes\":" << memory.heapUsedBytes << ",";
+    js << "\"heapRetainedFreeBytes\":" << memory.heapRetainedFreeBytes << ",";
+    js << "\"heapArenaBytes\":" << memory.heapArenaBytes << ",";
+    js << "\"vramBytes\":" << memory.vramBytes;
+    js << "}";
+}
+
 // Emit a StreamRun's fields into an open JSON object body (no surrounding braces).
 void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"state\":\"" << r.state << "\",";
@@ -1071,6 +1402,8 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"warmupApplied\":" << (r.warmupApplied ? "true" : "false") << ",";
     js << "\"warmupMs\":" << r.warmupMs << ",";
     js << "\"modelLoadMs\":" << r.modelLoadMs << ",";
+    js << "\"contextCreationMs\":" << r.contextCreationMs << ",";
+    js << "\"streamStartMs\":" << r.streamStartMs << ",";
     js << "\"coldFirstDecoderStepMs\":" << r.coldFirstDecoderStepMs << ",";
     js << "\"coldFirstTokenMs\":" << r.coldFirstTokenMs << ",";
     js << "\"coldFirstVisibleTextMs\":" << r.coldFirstVisibleTextMs << ",";
@@ -1151,6 +1484,11 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"encoderStateBytes\":" << r.encoderStateBytes << ",";
     js << "\"encoderOutputAccumulatedBytes\":" << r.encoderOutputAccumulatedBytes << ",";
     js << "\"encoderSha256\":\"" << r.encoderSha << "\",";
+    js << "\"adapterSha256\":\"" << r.adapterSha << "\",";
+    js << "\"encoderShaRows\":" << r.encoderShaRows << ",";
+    js << "\"adapterShaRows\":" << r.adapterShaRows << ",";
+    js << "\"outputShaDiagnosticD2hBytes\":"
+       << r.outputShaDiagnosticD2hBytes << ",";
     js << "\"encoderMaxAbsDeltaVsBatch\":" << r.encoderMaxAbsDeltaVsBatch << ",";
     js << "\"parityChecked\":" << (r.parityChecked ? "true" : "false") << ",";
     js << "\"encoderMaxAbsDeltaVsManual\":" << r.encoderMaxAbsDeltaVsManual << ",";
@@ -1283,6 +1621,48 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"streamIdleRssKiB\":" << r.streamIdleRssKiB << ",";
     js << "\"afterFinishRssKiB\":" << r.afterFinishRssKiB << ",";
     js << "\"afterDestroyRssKiB\":" << r.afterDestroyRssKiB << ",";
+    js << "\"memoryAttribution\":{";
+    js << "\"mappingCategoriesMayOverlap\":true,";
+    js << "\"vulkanAllocationCountAvailable\":false,";
+    js << "\"hostAllocationCountAvailable\":false,";
+    js << "\"individualBackendBufferCountAvailable\":false},";
+    js << "\"memorySnapshots\":{";
+    js << "\"modelLoaded\":"; write_memory_snapshot(js, r.modelLoadedMemory); js << ",";
+    js << "\"beforeWarmup\":"; write_memory_snapshot(js, r.beforeWarmupMemory); js << ",";
+    js << "\"afterWarmup\":"; write_memory_snapshot(js, r.afterWarmupMemory); js << ",";
+    js << "\"afterFinish\":"; write_memory_snapshot(js, r.afterFinishMemory); js << ",";
+    js << "\"afterDestroy\":"; write_memory_snapshot(js, r.afterDestroyMemory); js << ",";
+    js << "\"afterMallocTrim\":"; write_memory_snapshot(js, r.afterMallocTrimMemory);
+    js << "},";
+    js << "\"mallocTrimRequested\":" << (r.mallocTrimRequested ? "true" : "false") << ",";
+    js << "\"mallocTrimAvailable\":" << (r.mallocTrimAvailable ? "true" : "false") << ",";
+    js << "\"mallocTrimApplied\":" << (r.mallocTrimApplied ? "true" : "false") << ",";
+    js << "\"mallocTrimReturn\":" << r.mallocTrimReturn << ",";
+    js << "\"rolloverMemory\":[";
+    for (size_t i = 0; i < r.rolloverMemory.size(); ++i) {
+        if (i) js << ",";
+        const auto & sample = r.rolloverMemory[i];
+        js << "{";
+        js << "\"wrap\":" << sample.wrap << ",";
+        js << "\"absolutePosition\":" << sample.absolutePosition << ",";
+        js << "\"settledAfterDecoderSteps\":"
+           << sample.settledAfterDecoderSteps << ",";
+        js << "\"settledCaptured\":"
+           << (sample.settledCaptured ? "true" : "false") << ",";
+        js << "\"before\":"; write_memory_snapshot(js, sample.before); js << ",";
+        js << "\"after\":"; write_memory_snapshot(js, sample.after); js << ",";
+        js << "\"settled\":"; write_memory_snapshot(js, sample.settled); js << ",";
+        js << "\"graphObjects\":" << sample.graphObjects << ",";
+        js << "\"graphAllocations\":" << sample.graphAllocations << ",";
+        js << "\"encoderAllocations\":" << sample.encoderAllocations << ",";
+        js << "\"adapterAllocations\":" << sample.adapterAllocations << ",";
+        js << "\"decoderAllocations\":" << sample.decoderAllocations << ",";
+        js << "\"decoderKvBytesMoved\":" << sample.decoderKvBytesMoved << ",";
+        js << "\"decoderKvFullBufferMoves\":"
+           << sample.decoderKvFullBufferMoves;
+        js << "}";
+    }
+    js << "],";
     js << "\"pacedRealtime\":" << (r.pacedRealtime ? "true" : "false") << ",";
     js << "\"paceChunkMs\":" << r.paceChunkMs << ",";
     js << "\"audioDurationMs\":" << r.audioDurationMs << ",";
@@ -1301,6 +1681,11 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"finalBacklogMs\":" << r.finalBacklogMs << ",";
     js << "\"backlogGrowthSlopeMsPerSec\":" << r.backlogGrowthSlopeMsPerSec << ",";
     js << "\"postInputDrainMs\":" << r.postInputDrainMs << ",";
+    js << "\"terminalPartialChunkSamples\":"
+       << r.terminalPartialChunkSamples << ",";
+    js << "\"terminalPartialChunkMs\":" << r.terminalPartialChunkMs << ",";
+    js << "\"terminalPartialFinishLatenessMs\":"
+       << r.terminalPartialFinishLatenessMs << ",";
     js << "\"deadlineMisses\":" << r.deadlineMisses << ",";
     js << "\"deadlineMissRate\":" << r.deadlineMissRate << ",";
     auto write_backlog = [&](const char * name, const voxtral_backlog_metrics & m) {
@@ -1333,12 +1718,26 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"firstDecoderStepMs\":" << r.firstDecoderStepMs << ",";
     js << "\"firstTokenMs\":" << r.firstTokenMs << ",";
     js << "\"firstVisibleTextMs\":" << r.firstVisibleTextMs << ",";
+    js << "\"firstDecoderStepEligibilityMs\":"
+       << r.firstDecoderStepEligibilityMs << ",";
+    js << "\"firstDecoderStepOverheadMs\":"
+       << r.firstDecoderStepOverheadMs << ",";
+    js << "\"firstTokenEligibilityMs\":" << r.firstTokenEligibilityMs << ",";
+    js << "\"firstTokenOverheadMs\":" << r.firstTokenOverheadMs << ",";
+    js << "\"firstPartialEligibilityMs\":" << r.firstPartialEligibilityMs << ",";
+    js << "\"firstPartialOverheadMs\":" << r.firstPartialOverheadMs << ",";
     js << "\"adapterInputD2hBytes\":" << r.adapterInputD2hBytes << ",";
     js << "\"adapterOutputD2hBytes\":" << r.adapterOutputD2hBytes << ",";
     js << "\"logitsD2hBytes\":" << r.logitsD2hBytes << ",";
     js << "\"tokenIdD2hBytes\":" << r.tokenIdD2hBytes << ",";
     js << "\"encoderOutputD2hBytes\":" << r.encoderOutputD2hBytes << ",";
     js << "\"partialTextRevision\":" << r.partialTextRevision << ",";
+    js << "\"eventHistoryRetained\":"
+       << (r.eventHistoryRetained ? "true" : "false") << ",";
+    js << "\"retainedEventHistoryCount\":"
+       << r.retainedEventHistoryCount << ",";
+    js << "\"tokenOutputBytes\":" << r.tokenOutputBytes << ",";
+    js << "\"transcriptOutputBytes\":" << r.transcriptOutputBytes << ",";
     // Session 7.1: decoder mode + event-queue telemetry + backpressure evidence.
     js << "\"decoderMode\":\"" << r.decoderMode << "\",";
     js << "\"eventsEmitted\":" << r.eventsEmitted << ",";
@@ -1366,6 +1765,7 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
         } else if (e.type == voxtral_stream_event_type::token) {
             js << ",\"sequence\":" << e.sequence
                << ",\"token\":" << e.token
+               << ",\"piece\":\"" << json_escape(e.text) << "\""
                << ",\"decoderPosition\":" << e.decoder_position
                << ",\"audioEndSample\":" << e.audio_end_sample
                << ",\"special\":" << (e.special ? "true" : "false");
@@ -1395,6 +1795,9 @@ int main(int argc, char ** argv) {
     bool warmup = false;
     int32_t max_events = 0;
     bool backpressure = false;
+    bool capture_rollover_memory = false;
+    bool malloc_trim_after = false;
+    bool discard_event_history = false;
     int32_t synthetic_seconds = 0;    // >0: generate synthetic audio instead of reading --wav
     uint64_t max_total_samples = 0;   // >0: override the stream's full-buffer sample cap
 
@@ -1417,6 +1820,9 @@ int main(int argc, char ** argv) {
         else if (a == "--warmup")      { warmup = true; }
         else if (a == "--max-events")  { const char * v = val("--max-events"); if (!v) return 2; max_events = int32_t(std::strtol(v, nullptr, 10)); }
         else if (a == "--backpressure") { backpressure = true; }
+        else if (a == "--capture-rollover-memory") { capture_rollover_memory = true; }
+        else if (a == "--malloc-trim-after") { malloc_trim_after = true; }
+        else if (a == "--discard-event-history") { discard_event_history = true; }
         else if (a == "--synthetic-seconds") { const char * v = val("--synthetic-seconds"); if (!v) return 2; synthetic_seconds = int32_t(std::strtol(v, nullptr, 10)); }
         else if (a == "--max-total-samples") { const char * v = val("--max-total-samples"); if (!v) return 2; max_total_samples = std::strtoull(v, nullptr, 10); }
         else if (a == "--gpu") {
@@ -1434,7 +1840,8 @@ int main(int argc, char ** argv) {
     if (model_path.empty() || (wav_path.empty() && synthetic_seconds <= 0)) {
         std::cerr << "usage: voxtral-stream-test --model M.gguf --wav in.wav "
                      "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n] [--realtime-ms n] [--warmup] [--ab] [--kv-parity]\n"
-                     "       [--max-events n] [--backpressure] [--synthetic-seconds n] [--max-total-samples n]\n";
+                     "       [--max-events n] [--backpressure] [--capture-rollover-memory] [--malloc-trim-after] [--discard-event-history]\n"
+                     "       [--synthetic-seconds n] [--max-total-samples n]\n";
         return 2;
     }
     if (synthetic_seconds > 0) skip_parity = true;   // no batch reference for a 10-min soak
@@ -1491,6 +1898,8 @@ int main(int argc, char ** argv) {
     drive_options.max_events = max_events;
     drive_options.backpressure = backpressure;
     drive_options.capture_numerical = kv_parity;
+    drive_options.capture_rollover_memory = capture_rollover_memory;
+    drive_options.retain_event_history = !discard_event_history;
 
     // Load the model ONCE (shared, immutable). Each stream will create and own
     // its own execution context from it via voxtral_stream_create_internal.
@@ -1502,6 +1911,8 @@ int main(int argc, char ** argv) {
         std::chrono::steady_clock::now() - model_load_started_at).count();
     const int64_t model_loaded_vram_bytes = read_vram_used_bytes();
     const int64_t model_loaded_rss_kib = read_process_rss_kib();
+    const ProcessMemorySnapshot model_loaded_memory =
+        read_process_memory_snapshot();
 
     voxtral_context_params cp;
     cp.log_level = voxtral_log_level::info;
@@ -1696,11 +2107,16 @@ int main(int argc, char ** argv) {
         exit_code = (run_a.ok && run_b.ok && distinct) ? 0 : 1;
     } else {
         const auto warm_model_started_at = std::chrono::steady_clock::now();
+        const auto context_create_started_at = std::chrono::steady_clock::now();
         voxtral_stream * stream = voxtral_stream_create_internal(model, cp, sp);
         if (!stream) { std::cerr << "failed to create stream\n"; voxtral_model_free(model); return 7; }
+        const double context_creation_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - context_create_started_at).count();
 
         const int64_t stream_idle_vram_bytes = read_vram_used_bytes();
         const int64_t stream_idle_rss_kib = read_process_rss_kib();
+        const ProcessMemorySnapshot before_warmup_memory =
+            read_process_memory_snapshot();
         StreamRun run;
         if (!apply_warmup(stream, run)) {
             voxtral_stream_destroy_internal(stream);
@@ -1709,6 +2125,8 @@ int main(int argc, char ** argv) {
         }
         const double warmup_ms = run.warmupMs;
         const bool warmup_applied = run.warmupApplied;
+        const ProcessMemorySnapshot after_warmup_memory =
+            read_process_memory_snapshot();
         const double pre_drive_process_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - process_started_at).count();
         const double pre_drive_warm_model_ms = std::chrono::duration<double, std::milli>(
@@ -1717,6 +2135,7 @@ int main(int argc, char ** argv) {
         run.warmupMs = warmup_ms;
         run.warmupApplied = warmup_applied;
         run.modelLoadMs = model_load_ms;
+        run.contextCreationMs = context_creation_ms;
         run.coldFirstDecoderStepMs = pre_drive_process_ms + run.firstDecoderStepMs;
         run.coldFirstTokenMs = pre_drive_process_ms + run.firstTokenMs;
         run.coldFirstVisibleTextMs = pre_drive_process_ms + run.firstVisibleTextMs;
@@ -1729,11 +2148,27 @@ int main(int argc, char ** argv) {
         run.modelLoadedRssKiB = model_loaded_rss_kib;
         run.streamIdleRssKiB = stream_idle_rss_kib;
         run.afterFinishRssKiB = read_process_rss_kib();
+        run.modelLoadedMemory = model_loaded_memory;
+        run.beforeWarmupMemory = before_warmup_memory;
+        run.afterWarmupMemory = after_warmup_memory;
+        run.afterFinishMemory = read_process_memory_snapshot();
+        run.mallocTrimRequested = malloc_trim_after;
 
         // Destroy the stream (frees its owned context), then free the model.
         voxtral_stream_destroy_internal(stream);
         run.afterDestroyVramBytes = read_vram_used_bytes();
         run.afterDestroyRssKiB = read_process_rss_kib();
+        run.afterDestroyMemory = read_process_memory_snapshot();
+#if defined(__GLIBC__)
+        run.mallocTrimAvailable = true;
+        if (malloc_trim_after) {
+            run.mallocTrimReturn = malloc_trim(0);
+            run.mallocTrimApplied = true;
+            run.afterMallocTrimMemory = read_process_memory_snapshot();
+        }
+#else
+        run.mallocTrimAvailable = false;
+#endif
 
         js << "{";
         js << "\"mode\":\"single\",";

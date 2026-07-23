@@ -22,6 +22,11 @@ npm run test:encoder-kv-manual
 npm run acceptance:decoder-kv-ring
 npm run acceptance:kv-fp16
 npm run benchmark:realtime-pipeline
+npm run acceptance:precision-matrix
+npm run acceptance:fp16-quality
+npm run acceptance:real-fixtures
+npm run test:rss-rollover-plateau
+npm run acceptance:latency-eligibility
 npm run acceptance:realtime-sustained
 npm run test:realtime-rollover
 npm run test:realtime-soak-30m
@@ -48,13 +53,45 @@ versus explicit-manual-attention oracle with full token/text and pure-mode runti
 
 The Session 8 commands are strict. `acceptance:decoder-kv-ring` compares the reusable production
 ring, a dynamic physical ring and a logical-order attention oracle while a reduced test-only
-capacity wraps inside the spoken fixture. `acceptance:kv-fp16` runs sequential FP16/F32 plans and
-requires exact token/transcript parity. `benchmark:realtime-pipeline` records the F32, decoder-only
-FP16 and dual-FP16 shape matrix. `acceptance:realtime-sustained` always runs a full 30-minute paced
-80 ms stream; `VOXTRAL_SOAK_SECONDS` may lengthen it but cannot shorten it. Its rollover and soak
-aliases use the same non-relaxed hard gates: RTF below 0.95, zero final backlog, non-positive slope,
-zero full-buffer KV movement, FP16 memory limits, bounded graph allocation, zero dropped events and
-the published latency limits.
+capacity wraps inside the spoken fixture. `acceptance:kv-fp16` retains exact short-fixture
+FP16/F32 coverage, while `acceptance:precision-matrix` evaluates independent encoder/decoder
+F32/FP16 choices at 4/4 on both private real recordings. Every matrix case runs cold and warm full
+feed, paced 80/160/480 ms and deterministic seeded-random plans. It records token pieces and
+timestamps, transcript WER/CER, output SHA-256 diagnostics, backlog, RSS and VRAM. The F32/F32 4/4
+case must match the independent F32 4/32 global-batch oracle exactly.
+
+`acceptance:fp16-quality` and `acceptance:latency-eligibility` consume the latest successful matrix
+artifact. Absolute first-token times remain diagnostics; hard latency gates use runtime overhead
+after the required audio became available. `acceptance:real-fixtures` repeats the selected
+production precision twice at paced 80 ms on each recording and requires exact tokens, transcript,
+encoder SHA and adapter SHA. `test:rss-rollover-plateau` uses the production decoder/KV path with
+a reduced test-only ring capacity, captures at least 20 wraps both without trimming and with one
+diagnostic post-destroy `malloc_trim(0)`, and rejects linear RSS/anonymous-RSS/VRAM growth.
+
+`acceptance:realtime-sustained` reads the selected precision from that matrix artifact and always
+runs a full 30-minute paced 80 ms stream; `VOXTRAL_SOAK_SECONDS` may lengthen it but cannot shorten
+it. Its rollover and soak aliases use the same non-relaxed hard gates: RTF below 0.95, zero final
+backlog, non-positive slope, zero full-buffer KV movement, precision-aware KV accounting, bounded
+graph allocation, zero dropped events and eligibility-based latency limits. Ordinary paced runs
+take the complete profiler percentile snapshot only at the steady/final boundaries; the expensive
+per-feed snapshots are restricted to `--capture-rollover-memory`, where wrap attribution needs
+them. The external process timeout includes a separate lifecycle allowance for deterministic
+synthetic PCM generation, model/context creation and Vulkan warmup; none of that allowance changes
+the required 1800 seconds of paced audio or any realtime gate.
+
+The real-fixture commands expect the source audio outside the remote repository:
+
+```bash
+VOXTRAL_GPU_HOST=192.168.2.136 \
+VOXTRAL_GPU_USER=root \
+VOXTRAL_GPU_PASSWORD=1 \
+VOXTRAL_FIXTURE_2MIN=/root/voxtral-fixtures/voxTest2min.m4a \
+VOXTRAL_FIXTURE_4MIN=/root/voxtral-fixtures/voxTest4min.m4a \
+npm run acceptance:precision-matrix
+```
+
+Source synchronization excludes all M4A, WAV and PCM files. The two recordings and normalized
+derivatives remain local/private fixtures and are never copied into the source repository.
 
 For optional long-form regression tests:
 

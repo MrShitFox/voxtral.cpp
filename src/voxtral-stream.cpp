@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -251,6 +252,19 @@ struct voxtral_stream {
     double   first_decoder_step_ms   = 0.0;
     double   first_token_ms          = 0.0;   // first non-special token
     double   first_visible_text_ms   = 0.0;   // first non-empty partial text
+    // Eligibility-based latency markers.  Absolute stream time is still
+    // reported, but gates use the overhead after the exact audio group needed
+    // by an operation became available to the stream.  The ring mirrors the
+    // fixed audio-embedding ring, so this telemetry cannot grow with duration.
+    std::vector<int64_t> eligibility_absolute_group;
+    std::vector<double>  eligibility_arrival_ms;
+    double   current_audio_availability_ms       = 0.0;
+    double   first_decoder_step_eligibility_ms   = -1.0;
+    double   first_decoder_step_overhead_ms      = -1.0;
+    double   first_token_eligibility_ms          = -1.0;
+    double   first_token_overhead_ms             = -1.0;
+    double   first_partial_eligibility_ms        = -1.0;
+    double   first_partial_overhead_ms           = -1.0;
     int64_t  token_id_d2h_bytes      = 0;      // 4 bytes per decoder step (argmax readback)
 
     // ---- Session 7.1: explicit backpressure --------------------------------
@@ -266,9 +280,20 @@ struct voxtral_stream {
     } pending;
     bool     decoder_backpressured   = false;  // event queue full; caller must drain
     bool     finalizing_flush        = false;  // finish(): terminal events bypass the bound
+    bool     aggressive_partial_coalescing = false; // one large accepted feed
 
     // Rolling SHA-256 of the canonical PCM (chunk-invariant; no retention needed).
     Sha256   pcm_sha;
+    // Opt-in test diagnostics. Newly produced device-ring rows are copied into
+    // one bounded scratch vector and hashed immediately; no utterance-sized
+    // encoder/adapter tensor is retained.
+    bool     capture_output_sha = false;
+    Sha256   encoder_output_sha;
+    Sha256   adapter_output_sha;
+    std::vector<float> output_sha_scratch;
+    int64_t  encoder_sha_rows = 0;
+    int64_t  adapter_sha_rows = 0;
+    int64_t  output_sha_d2h_bytes = 0;
 
     // Even-trimmed Mel matrix [n_mel, n_frames] assembled at finish() (batch path).
     std::vector<float> mel_even;
@@ -498,6 +523,59 @@ bool ensure_encoder(voxtral_stream * s) {
     return true;
 }
 
+bool capture_new_encoder_output_sha(voxtral_stream * s) {
+    if (!s || !s->capture_output_sha || !s->incremental || !s->enc || !s->ctx) {
+        return true;
+    }
+    const int64_t available = voxtral_encoder_stream_output_frames(s->enc);
+    const int64_t count64 = available - s->encoder_sha_rows;
+    if (count64 <= 0) return true;
+    const int32_t capacity = voxtral_ctx_enc_out_ring_frames(s->ctx);
+    if (count64 > capacity || count64 > INT32_MAX) {
+        set_error(s, voxtral_status::backend_error,
+                  "encoder SHA capture fell behind bounded output ring");
+        return false;
+    }
+    const int32_t count = (int32_t) count64;
+    s->output_sha_scratch.resize((size_t) count * VOXTRAL_ENC_DIM);
+    if (!voxtral_ctx_read_enc_out_ring_internal(
+            s->ctx, s->encoder_sha_rows, count,
+            s->output_sha_scratch.data())) {
+        set_error(s, voxtral_status::backend_error,
+                  "encoder SHA diagnostic readback failed");
+        return false;
+    }
+    const size_t bytes = s->output_sha_scratch.size() * sizeof(float);
+    s->encoder_output_sha.update(s->output_sha_scratch.data(), bytes);
+    s->output_sha_d2h_bytes += (int64_t) bytes;
+    s->encoder_sha_rows = available;
+    return true;
+}
+
+bool capture_new_adapter_output_sha(voxtral_stream * s,
+                                    int64_t start, int32_t count) {
+    if (!s || !s->capture_output_sha || !s->incremental || !s->ctx ||
+        count <= 0) return true;
+    const int32_t capacity = voxtral_ctx_aemb_ring_frames(s->ctx);
+    if (count > capacity || start != s->adapter_sha_rows) {
+        set_error(s, voxtral_status::backend_error,
+                  "adapter SHA capture lost monotonic ring position");
+        return false;
+    }
+    s->output_sha_scratch.resize((size_t) count * VOXTRAL_DEC_DIM);
+    if (!voxtral_ctx_read_aemb_ring_internal(
+            s->ctx, start, count, s->output_sha_scratch.data())) {
+        set_error(s, voxtral_status::backend_error,
+                  "adapter SHA diagnostic readback failed");
+        return false;
+    }
+    const size_t bytes = s->output_sha_scratch.size() * sizeof(float);
+    s->adapter_output_sha.update(s->output_sha_scratch.data(), bytes);
+    s->output_sha_d2h_bytes += (int64_t) bytes;
+    s->adapter_sha_rows += count;
+    return true;
+}
+
 // Hand every newly-stable Mel frame from the frontend to the incremental encoder,
 // which runs any encoder chunks that became available. Called after each feed and
 // once more (with the finish-flushed frames) at finish().
@@ -525,7 +603,7 @@ bool drain_mel_to_encoder(voxtral_stream * s, bool final = false) {
         }
         s->enc_pushed_frames = total;
         voxtral_mel_frontend_discard_before(s->mel_fe, total);
-        return true;
+        return capture_new_encoder_output_sha(s);
     }
 
     // Feed the encoder on a fixed absolute Mel cadence: eight Mel frames are
@@ -545,6 +623,7 @@ bool drain_mel_to_encoder(voxtral_stream * s, bool final = false) {
             set_error(s, voxtral_status::backend_error, "incremental encoder rejected Mel frames");
             return false;
         }
+        if (!capture_new_encoder_output_sha(s)) return false;
         base += n;
         s->enc_pushed_frames = base;
         voxtral_mel_frontend_discard_before(s->mel_fe, base);
@@ -599,6 +678,22 @@ int64_t audio_end_sample_for(int64_t position) {
 // can raise explicit backpressure instead of losing the event. The finish()
 // terminal flush (finalizing_flush) bypasses the bound entirely.
 bool push_event_coalesced(voxtral_stream * s, voxtral_stream_event ev) {
+    if (ev.type == voxtral_stream_event_type::partial_text &&
+        s->aggressive_partial_coalescing) {
+        // A multi-minute one-shot feed cannot let replaceable partial snapshots
+        // consume half of the mandatory TOKEN queue. Keep exactly the newest
+        // snapshot, moving it behind the current token so observable ordering
+        // remains coherent. The queue stays fixed-size; token events are never
+        // coalesced or dropped.
+        for (auto it = s->events.begin(); it != s->events.end(); ++it) {
+            if (it->type == voxtral_stream_event_type::partial_text) {
+                s->events.erase(it);
+                s->events.push_back(std::move(ev));
+                s->partial_events_coalesced++;
+                return true;
+            }
+        }
+    }
     if (s->finalizing_flush || s->events.size() < s->max_events) {
         const auto type = ev.type;
         s->events.push_back(std::move(ev));
@@ -626,6 +721,7 @@ bool emit_token_event(voxtral_stream * s, int32_t token, int64_t position, bool 
     voxtral_stream_event ev;
     ev.type                    = voxtral_stream_event_type::token;
     ev.token                   = token;
+    ev.text                    = voxtral_token_piece_internal(s->model, token);
     ev.special                 = special;
     ev.sequence                = s->token_sequence + 1;   // tentative
     ev.decoder_position        = position;
@@ -656,9 +752,43 @@ void append_token_to_partial(voxtral_stream * s, int32_t token) {
     s->partial_stable_bytes = utf8_stable_prefix(s->partial_text);
 }
 
+bool token_piece_has_lexical_content(const voxtral_stream * s, int32_t token) {
+    if (!s || !s->model) return false;
+    const std::string & piece = voxtral_token_piece_internal(s->model, token);
+    return std::any_of(piece.begin(), piece.end(), [](unsigned char c) {
+        return c >= 0x80 || std::isalnum(c) != 0;
+    });
+}
+
 double stream_elapsed_ms(const voxtral_stream * s) {
     return s->timeline_start_ns > 0
         ? (double) (stream_now_ns() - s->timeline_start_ns) / 1e6 : 0.0;
+}
+
+// Record when each committed audio group became available.  Adapter and decoder
+// use the same absolute group index; modulo storage is safe because the decoder
+// cannot consume an entry after the bounded audio-embedding ring overwrote it.
+void note_group_eligibility(voxtral_stream * s, int64_t start, int32_t count,
+                            int32_t capacity) {
+    if (!s || capacity <= 0 || count <= 0) return;
+    if ((int32_t) s->eligibility_absolute_group.size() != capacity) {
+        s->eligibility_absolute_group.assign((size_t) capacity, -1);
+        s->eligibility_arrival_ms.assign((size_t) capacity, 0.0);
+    }
+    for (int32_t i = 0; i < count; ++i) {
+        const int64_t absolute = start + i;
+        const size_t slot = (size_t) (absolute % capacity);
+        s->eligibility_absolute_group[slot] = absolute;
+        s->eligibility_arrival_ms[slot] = s->current_audio_availability_ms;
+    }
+}
+
+double group_eligibility_ms(const voxtral_stream * s, int64_t absolute) {
+    if (!s || absolute < 0 || s->eligibility_absolute_group.empty()) return -1.0;
+    const size_t slot = (size_t) (absolute %
+        (int64_t) s->eligibility_absolute_group.size());
+    return s->eligibility_absolute_group[slot] == absolute
+        ? s->eligibility_arrival_ms[slot] : -1.0;
 }
 
 void sample_stage_backlogs(voxtral_stream * s) {
@@ -714,6 +844,11 @@ voxtral_status pump_incremental(voxtral_stream * s) {
             set_error(s, voxtral_status::backend_error, "incremental adapter commit failed");
             return voxtral_status::backend_error;
         }
+        if (!capture_new_adapter_output_sha(
+                s, s->adapter_groups_committed, n)) {
+            return voxtral_status::backend_error;
+        }
+        note_group_eligibility(s, s->adapter_groups_committed, n, aemb_cap);
         if (s->first_adapter_commit_ms == 0.0) s->first_adapter_commit_ms = stream_elapsed_ms(s);
         s->adapter_groups_committed = committable;
         s->adapter_commit_calls++;
@@ -747,6 +882,8 @@ voxtral_status pump_incremental(voxtral_stream * s) {
         const int32_t tok      = s->pending.token;
         const int64_t position = s->pending.position;
         const bool is_special  = s->pending.special;
+        const bool is_lexical  =
+            !is_special && token_piece_has_lexical_content(s, tok);
         s->pending.valid = false;
         if (tok == VOXTRAL_TOKEN_EOS) {          // terminal: matches finish-path trailing-EOS drop
             s->decoder_eos = true;
@@ -757,9 +894,23 @@ voxtral_status pump_incremental(voxtral_stream * s) {
         append_token_to_partial(s, tok);
         emit_partial_text_event(s, position);    // lossy snapshot; never backpressures
         s->decoder_tokens_emitted++;
-        if (!is_special && s->first_token_ms == 0.0)  s->first_token_ms = stream_elapsed_ms(s);
-        if (!s->partial_text.empty() && s->first_visible_text_ms == 0.0)
+        if (is_lexical && s->first_token_ms == 0.0) {
+            s->first_token_ms = stream_elapsed_ms(s);
+            s->first_token_eligibility_ms = group_eligibility_ms(s, position);
+            if (s->first_token_eligibility_ms >= 0.0) {
+                s->first_token_overhead_ms =
+                    s->first_token_ms - s->first_token_eligibility_ms;
+            }
+        }
+        if (is_lexical && !s->partial_text.empty() &&
+            s->first_visible_text_ms == 0.0) {
             s->first_visible_text_ms = stream_elapsed_ms(s);
+            s->first_partial_eligibility_ms = group_eligibility_ms(s, position);
+            if (s->first_partial_eligibility_ms >= 0.0) {
+                s->first_partial_overhead_ms =
+                    s->first_visible_text_ms - s->first_partial_eligibility_ms;
+            }
+        }
         s->decoder_prev_token = tok;
         s->decoder_position++;
         return true;
@@ -785,7 +936,16 @@ voxtral_status pump_incremental(voxtral_stream * s) {
             }
             s->decoder_steps++;
             s->token_id_d2h_bytes += (int64_t) sizeof(int32_t);   // 4-byte argmax readback
-            if (s->first_decoder_step_ms == 0.0) s->first_decoder_step_ms = stream_elapsed_ms(s);
+            if (s->first_decoder_step_ms == 0.0) {
+                s->first_decoder_step_ms = stream_elapsed_ms(s);
+                s->first_decoder_step_eligibility_ms =
+                    group_eligibility_ms(s, s->decoder_position);
+                if (s->first_decoder_step_eligibility_ms >= 0.0) {
+                    s->first_decoder_step_overhead_ms =
+                        s->first_decoder_step_ms -
+                        s->first_decoder_step_eligibility_ms;
+                }
+            }
 
             s->pending.valid    = true;
             s->pending.token    = tok;
@@ -869,6 +1029,23 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
     // timestamping after conversion would make the metric systematically low.
     const int64_t arrival_ns = stream_now_ns();
     if (s->timeline_start_ns == 0) s->timeline_start_ns = arrival_ns;
+    s->current_audio_availability_ms =
+        (double) (arrival_ns - s->timeline_start_ns) / 1e6;
+    const bool previous_partial_mode = s->aggressive_partial_coalescing;
+    const uint64_t estimated_token_events =
+        ((uint64_t) count + VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK - 1) /
+        VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK +
+        VOXTRAL_N_RIGHT_PAD_TOKENS + 2;
+    s->aggressive_partial_coalescing =
+        s->events.size() + 2 * estimated_token_events > s->max_events &&
+        s->events.size() + estimated_token_events + 1 <= s->max_events;
+    struct partial_mode_guard {
+        voxtral_stream * stream;
+        bool previous;
+        ~partial_mode_guard() {
+            stream->aggressive_partial_coalescing = previous;
+        }
+    } restore_partial_mode{s, previous_partial_mode};
     context_profile_scope pipeline_profile(s->ctx, voxtral_profile_stage::pipeline_feed);
 
     // Lazily bring up the incremental Mel frontend (inference streams). Done
@@ -1036,6 +1213,11 @@ voxtral_stream * voxtral_stream_create_internal(
         if (m == "reference" || m == "finish-only" || m == "finish_only" || m == "oracle") {
             s->incremental = false;
         }
+    }
+    if (const char * capture = std::getenv("VOXTRAL_CAPTURE_OUTPUT_SHA")) {
+        const std::string value = capture;
+        s->capture_output_sha =
+            value == "1" || value == "true" || value == "yes";
     }
 
     if (model != nullptr) {
@@ -1350,11 +1532,29 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     stream->first_decoder_step_ms    = 0.0;
     stream->first_token_ms           = 0.0;
     stream->first_visible_text_ms    = 0.0;
+    std::fill(stream->eligibility_absolute_group.begin(),
+              stream->eligibility_absolute_group.end(), -1);
+    std::fill(stream->eligibility_arrival_ms.begin(),
+              stream->eligibility_arrival_ms.end(), 0.0);
+    stream->current_audio_availability_ms       = 0.0;
+    stream->first_decoder_step_eligibility_ms   = -1.0;
+    stream->first_decoder_step_overhead_ms      = -1.0;
+    stream->first_token_eligibility_ms          = -1.0;
+    stream->first_token_overhead_ms             = -1.0;
+    stream->first_partial_eligibility_ms        = -1.0;
+    stream->first_partial_overhead_ms           = -1.0;
     stream->token_id_d2h_bytes       = 0;
     stream->pending                  = {};      // no token in flight
     stream->decoder_backpressured    = false;
     stream->finalizing_flush         = false;
+    stream->aggressive_partial_coalescing = false;
     stream->pcm_sha.reset();
+    stream->encoder_output_sha.reset();
+    stream->adapter_output_sha.reset();
+    stream->output_sha_scratch.clear();
+    stream->encoder_sha_rows = 0;
+    stream->adapter_sha_rows = 0;
+    stream->output_sha_d2h_bytes = 0;
     stream->mel_even.clear();
     stream->mel_even_frames        = 0;
     stream->total_samples_received = 0;
@@ -1477,6 +1677,21 @@ size_t voxtral_stream_pcm_size(const voxtral_stream * s) {
 }
 std::string voxtral_stream_pcm_sha256(const voxtral_stream * s) {
     return s ? s->pcm_sha.hex() : Sha256{}.hex();
+}
+std::string voxtral_stream_encoder_output_sha256(const voxtral_stream * s) {
+    return s ? s->encoder_output_sha.hex() : Sha256{}.hex();
+}
+std::string voxtral_stream_adapter_output_sha256(const voxtral_stream * s) {
+    return s ? s->adapter_output_sha.hex() : Sha256{}.hex();
+}
+int64_t voxtral_stream_encoder_output_sha_rows(const voxtral_stream * s) {
+    return s ? s->encoder_sha_rows : 0;
+}
+int64_t voxtral_stream_adapter_output_sha_rows(const voxtral_stream * s) {
+    return s ? s->adapter_sha_rows : 0;
+}
+int64_t voxtral_stream_output_sha_d2h_bytes(const voxtral_stream * s) {
+    return s ? s->output_sha_d2h_bytes : 0;
 }
 
 // --- Incremental Mel frontend introspection --------------------------------
@@ -1618,6 +1833,24 @@ double voxtral_stream_first_token_ms(const voxtral_stream * s) {
 }
 double voxtral_stream_first_visible_text_ms(const voxtral_stream * s) {
     return s ? s->first_visible_text_ms : 0.0;
+}
+double voxtral_stream_first_decoder_step_eligibility_ms(const voxtral_stream * s) {
+    return s ? s->first_decoder_step_eligibility_ms : -1.0;
+}
+double voxtral_stream_first_decoder_step_overhead_ms(const voxtral_stream * s) {
+    return s ? s->first_decoder_step_overhead_ms : -1.0;
+}
+double voxtral_stream_first_token_eligibility_ms(const voxtral_stream * s) {
+    return s ? s->first_token_eligibility_ms : -1.0;
+}
+double voxtral_stream_first_token_overhead_ms(const voxtral_stream * s) {
+    return s ? s->first_token_overhead_ms : -1.0;
+}
+double voxtral_stream_first_partial_eligibility_ms(const voxtral_stream * s) {
+    return s ? s->first_partial_eligibility_ms : -1.0;
+}
+double voxtral_stream_first_partial_overhead_ms(const voxtral_stream * s) {
+    return s ? s->first_partial_overhead_ms : -1.0;
 }
 int64_t voxtral_stream_adapter_input_d2h_bytes(const voxtral_stream * s) {
     (void) s; return 0;   // adapter reads the encoder-output ring on-device

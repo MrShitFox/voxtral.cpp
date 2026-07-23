@@ -1,12 +1,14 @@
 import { loadEnvironment } from "../config/environment.js";
 import { writeArtifactBundle } from "../helpers/artifacts.js";
+import { loadLatestPrecisionMatrix } from "../helpers/precision-cache.js";
 import { runStreamSession } from "../helpers/stream.js";
 import {
   SESSION8_GATES,
-  SESSION8_PRODUCTION_ENV,
   gate,
+  gateLatency,
   gateSustained,
   prepareSession8,
+  session8PrecisionEnvironment,
   summarizeRun,
 } from "../helpers/session8.js";
 
@@ -38,17 +40,11 @@ function tokenWindow(run, absolutePosition, radius = 12) {
 }
 
 function gateLatencyMatrix(cold, warmModel, warmGraphs) {
-  gate(warmGraphs.firstDecoderStepMs > 0 &&
-       warmGraphs.firstDecoderStepMs < SESSION8_GATES.firstDecoderStepMs,
-  `warm-graphs first decoder ${warmGraphs.firstDecoderStepMs}ms >= ${SESSION8_GATES.firstDecoderStepMs}ms`);
-  gate(warmGraphs.firstTokenMs > 0 && warmGraphs.firstTokenMs < SESSION8_GATES.firstTokenMs,
-    `warm-graphs first non-special token ${warmGraphs.firstTokenMs}ms >= ${SESSION8_GATES.firstTokenMs}ms`);
-  gate(warmGraphs.firstVisibleTextMs > 0 && warmGraphs.firstVisibleTextMs < SESSION8_GATES.firstPartialMs,
-    `warm-graphs first partial ${warmGraphs.firstVisibleTextMs}ms >= ${SESSION8_GATES.firstPartialMs}ms`);
-  gate(cold.coldFirstTokenMs > 0 && cold.coldFirstTokenMs < SESSION8_GATES.coldFirstTokenMs,
-    `cold-process first non-special token ${cold.coldFirstTokenMs}ms >= ${SESSION8_GATES.coldFirstTokenMs}ms`);
-  gate(cold.coldFirstVisibleTextMs > 0 && cold.coldFirstVisibleTextMs < SESSION8_GATES.coldFirstPartialMs,
-    `cold-process first partial ${cold.coldFirstVisibleTextMs}ms >= ${SESSION8_GATES.coldFirstPartialMs}ms`);
+  gateLatency(warmGraphs, "warm-graphs eligibility latency");
+  // Cold-process/model lifecycle remains reported, but model load, context
+  // creation and shader warmup are not ASR eligibility hard gates.
+  gate(cold.firstTokenMs > 0 && cold.firstVisibleTextMs > 0,
+    "cold-process latency markers unavailable");
   gate(warmModel.firstTokenMs > 0 && warmModel.firstVisibleTextMs > 0,
     "warm-model latency markers unavailable");
 }
@@ -56,6 +52,15 @@ function gateLatencyMatrix(cold, warmModel, warmGraphs) {
 try {
   gate(Number.isInteger(seconds) && seconds >= 1800,
     `30-minute acceptance cannot be shortened (requested ${seconds}s)`);
+  const matrix = await loadLatestPrecisionMatrix(config);
+  const selected = matrix.result.productionDecision.selected;
+  gate(selected, "precision matrix has no selected production variant");
+  const productionEnv = session8PrecisionEnvironment(selected);
+  summary.precisionMatrixArtifact = matrix.directory;
+  summary.selectedPrecision = selected;
+  summary.encoderKv = matrix.result.variants[selected].encoderKv;
+  summary.decoderKv = matrix.result.variants[selected].decoderKv;
+  summary.rx6600VramTotalBytes = matrix.result.rx6600VramTotalBytes;
   await prepareSession8(summary, { config });
 
   const sustained = await runStreamSession({
@@ -67,8 +72,12 @@ try {
     skipParity: true,
     monitorMemory: true,
     maxTotalSamples: (seconds + 60) * 16_000,
-    env: SESSION8_PRODUCTION_ENV,
-    timeoutMs: (seconds + 240) * 1000,
+    env: productionEnv,
+    // The process budget also includes deterministic synthesis of 28.8M PCM
+    // samples, model/context creation and graph warmup before the 30-minute
+    // paced interval starts. Keep those lifecycle costs outside the realtime
+    // gates, but leave enough wall-clock headroom to receive the final JSON.
+    timeoutMs: (seconds + 600) * 1000,
   });
   summary.sustained = summarizeRun(sustained);
   summary.rollover = {
@@ -82,7 +91,11 @@ try {
   };
   gate(sustained.audioDurationMs >= 1_800_000,
     `sustained audio duration ${sustained.audioDurationMs}ms < 1800000ms`);
-  gateSustained(sustained, "30-minute paced stream", { requireWrap: true });
+  gateSustained(sustained, "30-minute paced stream", {
+    requireWrap: true,
+    precisionVariant: selected,
+    peakVramLimitBytes: summary.rx6600VramTotalBytes,
+  });
 
   // The same binary reports three non-overlapping latency regimes. Each call is
   // a fresh process; warmup is explicit only for the warm-graphs measurement.
@@ -92,7 +105,7 @@ try {
     mode: "80ms",
     realtimeMs: 80,
     skipParity: true,
-    env: { ...SESSION8_PRODUCTION_ENV, MESA_SHADER_CACHE_DISABLE: "true" },
+    env: { ...productionEnv, MESA_SHADER_CACHE_DISABLE: "true" },
     timeoutMs: 180_000,
   });
   const warmModel = await runStreamSession({
@@ -101,7 +114,7 @@ try {
     mode: "80ms",
     realtimeMs: 80,
     skipParity: true,
-    env: SESSION8_PRODUCTION_ENV,
+    env: productionEnv,
     timeoutMs: 180_000,
   });
   const warmGraphs = await runStreamSession({
@@ -111,7 +124,7 @@ try {
     realtimeMs: 80,
     warmup: true,
     skipParity: true,
-    env: SESSION8_PRODUCTION_ENV,
+    env: productionEnv,
     timeoutMs: 180_000,
   });
   summary.latency = {

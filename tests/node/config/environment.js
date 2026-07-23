@@ -10,6 +10,8 @@ export const ENVIRONMENT_KEYS = Object.freeze([
   "VOXTRAL_REMOTE_REPO",
   "VOXTRAL_REMOTE_MODEL",
   "VOXTRAL_REMOTE_BUILD",
+  "VOXTRAL_FIXTURE_2MIN",
+  "VOXTRAL_FIXTURE_4MIN",
   "VOXTRAL_ARTIFACT_DIR",
 ]);
 
@@ -22,6 +24,8 @@ export const DEFAULT_ENVIRONMENT = Object.freeze({
   VOXTRAL_REMOTE_MODEL:
     "/root/models/Voxtral-Mini-4B-Realtime-2602/Voxtral-Mini-4B-Realtime-2602-Q4_K_M.gguf",
   VOXTRAL_REMOTE_BUILD: "/root/voxtral.cpp/build-vulkan",
+  VOXTRAL_FIXTURE_2MIN: "/root/voxtral-fixtures/voxTest2min.m4a",
+  VOXTRAL_FIXTURE_4MIN: "/root/voxtral-fixtures/voxTest4min.m4a",
   VOXTRAL_ARTIFACT_DIR: path.join(DEFAULT_LOCAL_REPO, "tests/node/.artifacts"),
 });
 
@@ -62,6 +66,8 @@ export function loadEnvironment(env = process.env, overrides = {}) {
     remoteModel: path.posix.normalize(values.VOXTRAL_REMOTE_MODEL),
     remoteBuild,
     remoteBinary: path.posix.join(remoteBuild, "voxtral"),
+    remoteFixture2min: path.posix.normalize(values.VOXTRAL_FIXTURE_2MIN),
+    remoteFixture4min: path.posix.normalize(values.VOXTRAL_FIXTURE_4MIN),
     remoteSmokeAudio: path.posix.join(remoteRepo, "samples/8297-275156-0000.wav"),
     localSmokeAudio: path.join(localRepo, "samples/8297-275156-0000.wav"),
     artifactDir,

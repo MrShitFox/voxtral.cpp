@@ -29,24 +29,29 @@ const run = await runStreamSession({
 const sr = run.sampleRate ?? 16000;
 const arrMs = (s) => (s * 1000) / sr; // audioEndSample -> real-time arrival ms
 const tokenEvents = (run.events ?? []).filter((e) => e.type === "token");
-const firstLexical = tokenEvents.find((e) => !e.special);
+const firstLexical = tokenEvents.find((e) =>
+  !e.special && /[\p{L}\p{N}]/u.test(e.piece ?? ""));
 
 const out = {
   gates: {
-    firstDecoderStepMs: SESSION8_GATES.firstDecoderStepMs,
-    firstTokenMs: SESSION8_GATES.firstTokenMs,
-    firstPartialMs: SESSION8_GATES.firstPartialMs,
-    coldFirstTokenMs: SESSION8_GATES.coldFirstTokenMs,
+    firstDecoderStepOverheadMs: SESSION8_GATES.firstDecoderStepOverheadMs,
+    firstTokenOverheadMs: SESSION8_GATES.firstTokenOverheadMs,
+    firstPartialOverheadMs: SESSION8_GATES.firstPartialOverheadMs,
   },
   measured: {
     modelLoadMs: run.modelLoadMs,
+    contextCreationMs: run.contextCreationMs,
     warmupMs: run.warmupMs,
+    streamStartMs: run.streamStartMs,
     firstDecoderStepMs: run.firstDecoderStepMs,
+    firstDecoderStepEligibilityMs: run.firstDecoderStepEligibilityMs,
+    firstDecoderStepOverheadMs: run.firstDecoderStepOverheadMs,
     firstTokenMs: run.firstTokenMs,
+    firstTokenEligibilityMs: run.firstTokenEligibilityMs,
+    firstTokenOverheadMs: run.firstTokenOverheadMs,
     firstVisibleTextMs: run.firstVisibleTextMs,
-    warmModelFirstTokenMs: run.warmModelFirstTokenMs,
-    coldFirstTokenMs: run.coldFirstTokenMs,
-    coldFirstVisibleTextMs: run.coldFirstVisibleTextMs,
+    firstPartialEligibilityMs: run.firstPartialEligibilityMs,
+    firstPartialOverheadMs: run.firstPartialOverheadMs,
   },
   firstLexical: firstLexical
     ? {
