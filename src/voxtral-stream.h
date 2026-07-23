@@ -177,11 +177,11 @@ struct voxtral_stream_params {
     int32_t  max_tokens  = 0;                       // 0 = decode whole buffer
     // Bounded utterance limit retained for the finish-only decoder. This is an
     // internal compatibility guard, not a public streaming contract: it keeps
-    // the final decode safely below the
-    // decoder KV window so it never reaches the (Vulkan-unsafe) kv_cache_shift_left
-    // path. 9.6M samples = 10 minutes @ 16 kHz. Exceeding it returns
-    // voxtral_status::limit_exceeded (NOT out_of_memory).
-    uint64_t max_total_samples = 9'600'000ull;
+    // Admission limit only; inference streams do not retain full PCM. The
+    // decoder now has a fixed circular KV, so the default safely admits the
+    // required 30-minute acceptance run (57.6M = 60 minutes @ 16 kHz).
+    // Exceeding it returns limit_exceeded (NOT out_of_memory).
+    uint64_t max_total_samples = 57'600'000ull;
     // Keep complete Mel history only for tensor-parity/debug inspection.
     // Production realtime streams consume and discard stable frames promptly.
     bool retain_mel_history = false;
@@ -221,6 +221,11 @@ voxtral_stream * voxtral_stream_create_internal(
     voxtral_model                * model,
     const voxtral_context_params & ctx_params,
     const voxtral_stream_params  & params);
+
+// Explicit production-graph warmup. Valid only before the first feed (and
+// idempotent). Compiles shaders and retains reusable buffers without changing
+// audio/token/transcript/event state.
+voxtral_status voxtral_stream_warmup_internal(voxtral_stream * stream);
 
 // Incremental feeds. The input buffer is copied into the stream; the caller may
 // free or reuse it immediately after return. `samples == nullptr` is only valid
@@ -400,6 +405,26 @@ uint64_t voxtral_stream_partial_events_coalesced    (const voxtral_stream * stre
 uint64_t voxtral_stream_event_queue_high_watermark  (const voxtral_stream * stream);
 uint64_t voxtral_stream_event_queue_overflow_attempts(const voxtral_stream * stream);
 uint64_t voxtral_stream_events_dropped              (const voxtral_stream * stream);
+
+// Fixed-memory stage backlog telemetry. Backlog is work that remains after the
+// next 80 ms capture deadline; slope is least-squares ms/s over the paced
+// timeline. The runtime stores at most 32,768 samples per stage (more than a
+// 30-minute run) and never allocates per event.
+struct voxtral_backlog_metrics {
+    uint64_t count = 0;
+    double p50Ms = 0.0;
+    double p95Ms = 0.0;
+    double p99Ms = 0.0;
+    double maxMs = 0.0;
+    double finalMs = 0.0;
+    double slopeMsPerSec = 0.0;
+    uint64_t deadlineMisses = 0;
+    double deadlineMissRate = 0.0;
+};
+
+voxtral_backlog_metrics voxtral_stream_encoder_backlog(const voxtral_stream * stream);
+voxtral_backlog_metrics voxtral_stream_adapter_backlog(const voxtral_stream * stream);
+voxtral_backlog_metrics voxtral_stream_decoder_backlog(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
 // Explicit backpressure state. feed()/finish() still return voxtral_status; this

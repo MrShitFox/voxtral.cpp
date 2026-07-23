@@ -10,6 +10,7 @@
 #include "voxtral-stream.h"
 #include "voxtral-internal.h"   // voxtral_transcribe_mel_internal (Mel -> text path)
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -38,6 +39,7 @@ constexpr uint64_t kMaxFeedSamples = 64ull * 1024 * 1024;   // 64M samples / fee
 // against a future decoder emitting unboundedly. It is a TRUE maximum: a push
 // into a full queue is dropped and recorded, never grown past.
 constexpr size_t kMaxEvents = 4096;
+constexpr size_t kBacklogSamples = 32768;
 
 // ----------------------------------------------------------------------------
 // Context factory / free — indirected through file-local pointers so the
@@ -170,6 +172,7 @@ struct voxtral_stream {
 
     bool cancel_requested = false;
     bool cancelled_emitted = false;
+    bool warmup_complete = false;
 
     // Canonical PCM buffer. Used ONLY by lifecycle-only streams (no context):
     // inference streams route samples straight into the incremental Mel frontend
@@ -190,9 +193,45 @@ struct voxtral_stream {
     voxtral_encoder_stream * enc = nullptr;
     int64_t  enc_pushed_frames   = 0;  // stable Mel frames already handed to the encoder
 
+    struct stage_backlog_series {
+        std::array<double, kBacklogSamples> values{};
+        std::array<double, kBacklogSamples> audio_seconds{};
+        size_t stored = 0;
+        uint64_t seen = 0;
+        uint64_t deadline_misses = 0;
+        double final_ms = 0.0;
+
+        void reset() {
+            stored = 0;
+            seen = 0;
+            deadline_misses = 0;
+            final_ms = 0.0;
+        }
+        void add(double audio_s, double backlog_ms) {
+            ++seen;
+            final_ms = backlog_ms;
+            if (backlog_ms > 0.0) ++deadline_misses;
+            if (stored < values.size()) {
+                values[stored] = backlog_ms;
+                audio_seconds[stored] = audio_s;
+                ++stored;
+            } else {
+                // Deterministic bounded reservoir for streams longer than the
+                // required 30-minute matrix. The 30-minute run fits exactly and
+                // therefore remains lossless.
+                const uint64_t mixed = seen * 0x9e3779b97f4a7c15ULL;
+                const uint64_t slot = (mixed ^ (mixed >> 29)) % seen;
+                if (slot < values.size()) {
+                    values[(size_t) slot] = backlog_ms;
+                    audio_seconds[(size_t) slot] = audio_s;
+                }
+            }
+        }
+    } encoder_backlog, adapter_backlog, decoder_backlog;
+
     // ---- Session 7: device-resident incremental adapter + decoder ----------
-    // Selected once at create from VOXTRAL_STREAM_DECODER=incremental (default is
-    // the finish-only reference path, which keeps the existing acceptance green).
+    // Selected once at create. Incremental is the production default;
+    // VOXTRAL_STREAM_DECODER=reference selects the finish-only oracle.
     bool     incremental          = false;
     std::vector<int32_t> prompt_ids;          // BOS + left-pad + delay STREAMING_PADs
     int64_t  adapter_groups_committed = 0;    // audio embeddings written == next group
@@ -296,6 +335,21 @@ int64_t stream_now_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+struct context_profile_scope {
+    voxtral_context * ctx = nullptr;
+    voxtral_profile_stage stage = voxtral_profile_stage::pipeline_feed;
+    int64_t start_ns = 0;
+
+    context_profile_scope(voxtral_context * c, voxtral_profile_stage s)
+        : ctx(c), stage(s), start_ns(stream_now_ns()) {}
+    ~context_profile_scope() {
+        if (ctx) {
+            voxtral_context_profile_record_internal(
+                ctx, stage, (double) (stream_now_ns() - start_ns) / 1e6);
+        }
+    }
+};
+
 // Non-blocking reentrancy guard. On construction it tries to engage; if another
 // operation is already in progress on the same stream, engage() fails and the
 // caller must return `busy`. Never blocks, so cancel()/reset() cannot create a
@@ -344,6 +398,7 @@ bool push_event(voxtral_stream * s, voxtral_stream_event ev) {
 }
 
 void emit_final_and_completed(voxtral_stream * s) {
+    context_profile_scope profile(s ? s->ctx : nullptr, voxtral_profile_stage::event_processing);
     const double t_ms = samples_to_ms(s->total_samples_received, s->params.sample_rate);
     {
         voxtral_stream_event ev;
@@ -401,6 +456,7 @@ bool ensure_frontend(voxtral_stream * s) {
 void ensure_left_pad(voxtral_stream * s) {
     if (s->mel_fe && !s->left_pad_injected) {
         s->left_pad_injected = true;
+        context_profile_scope profile(s->ctx, voxtral_profile_stage::mel_compute);
         voxtral_mel_frontend_feed_silence(s->mel_fe, (size_t) kStreamLeftPad);
     }
 }
@@ -445,7 +501,7 @@ bool ensure_encoder(voxtral_stream * s) {
 // Hand every newly-stable Mel frame from the frontend to the incremental encoder,
 // which runs any encoder chunks that became available. Called after each feed and
 // once more (with the finish-flushed frames) at finish().
-bool drain_mel_to_encoder(voxtral_stream * s) {
+bool drain_mel_to_encoder(voxtral_stream * s, bool final = false) {
     if (!s->enc || !s->mel_fe) return true;
     const int64_t total = voxtral_mel_frontend_frame_count(s->mel_fe);
     if (total <= s->enc_pushed_frames) return true;
@@ -454,6 +510,24 @@ bool drain_mel_to_encoder(voxtral_stream * s) {
         set_error(s, voxtral_status::backend_error, "incremental Mel history base advanced past encoder cursor");
         return false;
     }
+    // The terminal frontend flush is already a bounded suffix. Preserve it as
+    // one push so the encoder can batch right-padding work; ordinary feed keeps
+    // the fixed absolute cadence below for feed-plan invariance.
+    if (final) {
+        const int64_t remaining = total - base;
+        const float * frames = voxtral_mel_frontend_frame_data(s->mel_fe, base);
+        if (!frames || remaining > INT32_MAX ||
+            !voxtral_encoder_stream_push_mel_final(
+                s->enc, frames, base, (int32_t) remaining)) {
+            set_error(s, voxtral_status::backend_error,
+                      "incremental encoder rejected terminal Mel frames");
+            return false;
+        }
+        s->enc_pushed_frames = total;
+        voxtral_mel_frontend_discard_before(s->mel_fe, total);
+        return true;
+    }
+
     // Feed the encoder on a fixed absolute Mel cadence: eight Mel frames are
     // exactly four encoder frames, i.e. one future adapter group. A one-shot
     // feed and an 80/160 ms feed therefore expose identical graph-ready
@@ -587,6 +661,38 @@ double stream_elapsed_ms(const voxtral_stream * s) {
         ? (double) (stream_now_ns() - s->timeline_start_ns) / 1e6 : 0.0;
 }
 
+void sample_stage_backlogs(voxtral_stream * s) {
+    if (!s || !s->incremental || !s->enc || !s->mel_fe ||
+        s->total_samples_received == 0) return;
+    constexpr double group_ms =
+        (double) VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK * 1000.0 / VOXTRAL_SAMPLE_RATE;
+    const double audio_s =
+        (double) s->total_samples_received / (double) VOXTRAL_SAMPLE_RATE;
+
+    // A group is backlog only after all Mel needed for its four encoder frames
+    // exists. Fixed causal/model latency is residence, not queued work.
+    const int64_t stable_mel = voxtral_mel_frontend_frame_count(s->mel_fe);
+    const int64_t realizable_frames = stable_mel < 2 ? 0 : (stable_mel - 2) / 2 + 1;
+    const int64_t encoder_ready_groups = realizable_frames / VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int64_t encoder_done_groups =
+        voxtral_encoder_stream_output_frames(s->enc) / VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int64_t encoder_queued =
+        std::max<int64_t>(0, encoder_ready_groups - encoder_done_groups);
+    const int64_t adapter_queued =
+        std::max<int64_t>(0, encoder_done_groups - s->adapter_groups_committed);
+
+    const int64_t prompt_prefix = (int64_t) s->prompt_ids.size() - 1;
+    const int64_t decoder_ready = s->adapter_groups_committed > prompt_prefix
+        ? s->adapter_groups_committed - prompt_prefix : 0;
+    const int64_t decoder_done = s->decoder_prefill_done
+        ? std::max<int64_t>(0, s->decoder_position - prompt_prefix) : 0;
+    const int64_t decoder_queued = std::max<int64_t>(0, decoder_ready - decoder_done);
+
+    s->encoder_backlog.add(audio_s, (double) encoder_queued * group_ms);
+    s->adapter_backlog.add(audio_s, (double) adapter_queued * group_ms);
+    s->decoder_backlog.add(audio_s, (double) decoder_queued * group_ms);
+}
+
 // One scheduler pass: commit every ready adapter group, then run every ready
 // decoder step, emitting TOKEN + PARTIAL_TEXT. Called after each feed slice and at
 // finish. All three stages stay bounded because they are drained here every slice.
@@ -633,6 +739,7 @@ voxtral_status pump_incremental(voxtral_stream * s) {
     // not advance, and the step is never re-run — that is the backpressure point.
     auto commit_pending = [&]() -> bool {
         if (!s->pending.valid) return true;
+        context_profile_scope profile(s->ctx, voxtral_profile_stage::event_processing);
         if (!emit_token_event(s, s->pending.token, s->pending.position, s->pending.special)) {
             s->decoder_backpressured = true;
             return false;
@@ -747,14 +854,13 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
     }
 
     const uint64_t received = s->total_samples_received;
-    // Overflow-safe cumulative bound check. This is the temporary full-buffer
-    // compatibility limit, not an allocation failure -> limit_exceeded.
+    // Overflow-safe cumulative admission bound, not an allocation failure.
+    // Production inference retains only bounded frontend/encoder state, and
+    // decoder rollover is handled by the fixed circular KV.
     if (count > s->params.max_total_samples ||
         received > s->params.max_total_samples - static_cast<uint64_t>(count)) {
         set_error(s, voxtral_status::limit_exceeded,
-                  "accumulated PCM exceeds max_total_samples: temporary full-buffer "
-                  "compatibility limit that keeps decode below the decoder KV window "
-                  "(prevents reaching the unsafe kv_cache_shift_left rollover path)");
+                  "stream duration exceeds max_total_samples admission limit");
         return voxtral_status::limit_exceeded;
     }
 
@@ -763,6 +869,7 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
     // timestamping after conversion would make the metric systematically low.
     const int64_t arrival_ns = stream_now_ns();
     if (s->timeline_start_ns == 0) s->timeline_start_ns = arrival_ns;
+    context_profile_scope pipeline_profile(s->ctx, voxtral_profile_stage::pipeline_feed);
 
     // Lazily bring up the incremental Mel frontend (inference streams). Done
     // before any state mutation so a failure leaves the stream untouched.
@@ -805,7 +912,13 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
         constexpr size_t kAudioDrainSlice = 16'000;
         for (size_t audio_off = 0; audio_off < s->feed_scratch.size(); audio_off += kAudioDrainSlice) {
             const size_t audio_n = std::min(kAudioDrainSlice, s->feed_scratch.size() - audio_off);
-            if (!voxtral_mel_frontend_feed(s->mel_fe, s->feed_scratch.data() + audio_off, audio_n)) {
+            const int64_t mel_start_ns = stream_now_ns();
+            const bool mel_ok = voxtral_mel_frontend_feed(
+                s->mel_fe, s->feed_scratch.data() + audio_off, audio_n);
+            voxtral_context_profile_record_internal(
+                s->ctx, voxtral_profile_stage::mel_compute,
+                (double) (stream_now_ns() - mel_start_ns) / 1e6);
+            if (!mel_ok) {
                 set_error(s, voxtral_status::backend_error, "incremental Mel frontend rejected feed");
                 s->feed_scratch.clear();
                 return voxtral_status::backend_error;
@@ -857,6 +970,7 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
 
     s->total_samples_received += static_cast<uint64_t>(count);
     s->feed_calls++;
+    sample_stage_backlogs(s);
     if (s->state == voxtral_stream_state::created) {
         s->state = voxtral_stream_state::running;
     }
@@ -961,6 +1075,35 @@ void voxtral_stream_destroy_internal(voxtral_stream * stream) {
         g_context_free(stream->ctx);
     }
     delete stream;
+}
+
+voxtral_status voxtral_stream_warmup_internal(voxtral_stream * stream) {
+    if (!stream) return voxtral_status::invalid_argument;
+    op_guard guard(stream);
+    if (!guard.engage()) return voxtral_status::busy;
+    if (stream->warmup_complete) return voxtral_status::ok;
+    if (stream->state != voxtral_stream_state::created ||
+        stream->total_samples_received != 0 || !stream->ctx || !stream->incremental) {
+        set_error(stream, voxtral_status::invalid_state,
+                  "warmup requires a fresh production incremental stream");
+        return voxtral_status::invalid_state;
+    }
+    if (!ensure_frontend(stream) || !ensure_encoder(stream) || !stream->enc) {
+        if (stream->last_status == voxtral_status::ok) {
+            set_error(stream, voxtral_status::backend_error,
+                      "failed to initialize production warmup state");
+        }
+        return stream->last_status;
+    }
+    if (!voxtral_encoder_stream_warmup(stream->enc)) {
+        set_error(stream, voxtral_status::backend_error,
+                  "production graph warmup failed");
+        return voxtral_status::backend_error;
+    }
+    stream->enc_pushed_frames = 0;
+    stream->warmup_complete = true;
+    clear_error(stream);
+    return voxtral_status::ok;
 }
 
 voxtral_status voxtral_stream_feed_pcm16_internal(
@@ -1078,6 +1221,8 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
         voxtral_mel_frontend_assemble_even(stream->mel_fe, stream->mel_even, stream->mel_even_frames);
         stream->full_pcm_buffered_at_finish = false;
         stream->finish_frontend_ms = (double) (stream_now_ns() - finish_front_start_ns) / 1e6;
+        voxtral_context_profile_record_internal(stream->ctx, voxtral_profile_stage::mel_compute,
+                                                stream->finish_frontend_ms);
 
         if (!ensure_encoder(stream)) {
             throw std::runtime_error(stream->last_error);
@@ -1092,7 +1237,7 @@ voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream) {
                                               stream->timeline_start_ns,
                                               kStreamLeftPad);
             const int64_t finish_encoder_start_ns = stream_now_ns();
-            if (!drain_mel_to_encoder(stream)) {
+            if (!drain_mel_to_encoder(stream, /*final=*/true)) {
                 throw std::runtime_error(stream->last_error);
             }
             if (!voxtral_encoder_stream_finish(stream->enc)) {
@@ -1176,12 +1321,18 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
         voxtral_encoder_stream_reset(stream->enc);    // clears Mel window, accumulated output, counters
     }
     stream->enc_pushed_frames            = 0;
+    stream->encoder_backlog.reset();
+    stream->adapter_backlog.reset();
+    stream->decoder_backlog.reset();
     stream->left_pad_injected            = false;
     stream->full_pcm_buffered_at_finish  = false;
     // Session 7 incremental adapter/decoder state. The device rings are append-only
     // and only ever read at written positions, so resetting the counters is enough;
     // detach the shared decoder from this stream's audio ring and clear its KV.
-    if (stream->ctx) voxtral_ctx_decoder_reset_incremental(stream->ctx);
+    if (stream->ctx) {
+        voxtral_ctx_decoder_reset_incremental(stream->ctx);
+        voxtral_context_profile_reset_internal(stream->ctx);
+    }
     stream->adapter_groups_committed = 0;
     stream->adapter_commit_calls     = 0;
     stream->decoder_prefill_done     = false;
@@ -1518,6 +1669,54 @@ uint64_t voxtral_stream_event_queue_overflow_attempts(const voxtral_stream * s) 
 }
 uint64_t voxtral_stream_events_dropped(const voxtral_stream * s) {
     return s ? s->events_dropped : 0;
+}
+
+static voxtral_backlog_metrics backlog_metrics_from(
+    const voxtral_stream::stage_backlog_series & series) {
+    voxtral_backlog_metrics out;
+    out.count = series.seen;
+    out.finalMs = series.final_ms;
+    out.deadlineMisses = series.deadline_misses;
+    out.deadlineMissRate = series.seen
+        ? (double) series.deadline_misses / (double) series.seen : 0.0;
+    if (series.stored == 0) return out;
+
+    std::vector<double> sorted(
+        series.values.begin(), series.values.begin() + (std::ptrdiff_t) series.stored);
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double p) {
+        const double x = p * (double) (sorted.size() - 1);
+        const size_t lo = (size_t) x;
+        const size_t hi = std::min(lo + 1, sorted.size() - 1);
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * (x - (double) lo);
+    };
+    out.p50Ms = pct(0.50);
+    out.p95Ms = pct(0.95);
+    out.p99Ms = pct(0.99);
+    out.maxMs = sorted.back();
+
+    if (series.stored > 1) {
+        double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+        for (size_t i = 0; i < series.stored; ++i) {
+            const double x = series.audio_seconds[i];
+            const double y = series.values[i];
+            sx += x; sy += y; sxx += x * x; sxy += x * y;
+        }
+        const double n = (double) series.stored;
+        const double denom = n * sxx - sx * sx;
+        if (denom > 0.0) out.slopeMsPerSec = (n * sxy - sx * sy) / denom;
+    }
+    return out;
+}
+
+voxtral_backlog_metrics voxtral_stream_encoder_backlog(const voxtral_stream * s) {
+    return s ? backlog_metrics_from(s->encoder_backlog) : voxtral_backlog_metrics{};
+}
+voxtral_backlog_metrics voxtral_stream_adapter_backlog(const voxtral_stream * s) {
+    return s ? backlog_metrics_from(s->adapter_backlog) : voxtral_backlog_metrics{};
+}
+voxtral_backlog_metrics voxtral_stream_decoder_backlog(const voxtral_stream * s) {
+    return s ? backlog_metrics_from(s->decoder_backlog) : voxtral_backlog_metrics{};
 }
 
 // Explicit backpressure state (maps the most recent operation's status onto the

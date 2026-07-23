@@ -8,6 +8,8 @@
 
 #include "voxtral.h"
 
+#include <array>
+
 // Realtime inference from a precomputed, even-trimmed log-Mel matrix in the
 // canonical channel-major [n_mel, n_frames] layout (exactly what
 // compute_mel_even / voxtral_mel_frontend_assemble_even produce). Runs the
@@ -47,6 +49,150 @@ bool voxtral_encode_mel_batch_internal(
 
 // Fixed decoder self-attention K/V allocation owned by one inference context.
 int64_t voxtral_context_decoder_kv_bytes_internal(const voxtral_context * ctx);
+
+// First-step numerical diagnostics. Empty unless
+// VOXTRAL_NUMERICAL_DIAGNOSTICS=1 was set before context creation.
+const std::vector<float> & voxtral_context_diagnostic_first_hidden_internal(
+    const voxtral_context * ctx);
+const std::vector<float> & voxtral_context_diagnostic_first_logits_internal(
+    const voxtral_context * ctx);
+const std::vector<float> & voxtral_context_diagnostic_encoder_output_internal(
+    const voxtral_context * ctx);
+const std::vector<float> & voxtral_context_diagnostic_adapter_output_internal(
+    const voxtral_context * ctx);
+
+// ============================================================================
+// Session 8: bounded production-pipeline profiler.
+//
+// VOXTRAL_PROFILE=1 enables exact aggregate counters plus a fixed-capacity,
+// allocation-free sample reservoir for percentiles.  The reservoir is allocated
+// with the context (never per feed/graph/decoder step), so profiling cannot turn
+// a sustained stream into unbounded host accumulation.  Execute timings include
+// the synchronous backend wait; backend_synchronize is also reported separately
+// as a subset so command submission vs GPU completion can be diagnosed.
+// ============================================================================
+
+enum class voxtral_profile_stage : size_t {
+    mel_compute = 0,
+    encoder_graph_build,
+    encoder_graph_execute,
+    encoder_device_copy,
+    adapter_graph_build,
+    adapter_graph_execute,
+    decoder_prefill_graph_build,
+    decoder_prefill_graph_execute,
+    decoder_step_graph_build,
+    decoder_step_graph_execute,
+    argmax,
+    token_readback,
+    backend_synchronize,
+    event_processing,
+    pipeline_feed,
+    count,
+};
+
+struct voxtral_stage_profile {
+    uint64_t count   = 0;
+    double   totalMs = 0.0;
+    double   meanMs  = 0.0;
+    double   p50Ms   = 0.0;
+    double   p95Ms   = 0.0;
+    double   p99Ms   = 0.0;
+    double   maxMs   = 0.0;
+};
+
+struct voxtral_runtime_profile {
+    bool enabled = false;
+    std::array<voxtral_stage_profile,
+               static_cast<size_t>(voxtral_profile_stage::count)> stages{};
+
+    uint64_t encoderGraphBuildCount = 0;
+    uint64_t adapterGraphBuildCount = 0;
+    uint64_t decoderGraphBuildCount = 0;
+
+    // Scheduler allocation passes.  GGML may allocate several transient tensors
+    // inside one pass; these counters intentionally measure the hot-path calls
+    // whose growth/reuse is under this runtime's control.
+    uint64_t encoderAllocations = 0;
+    uint64_t adapterAllocations = 0;
+    uint64_t decoderAllocations = 0;
+    uint64_t graphAllocations   = 0;
+
+    uint64_t backendSyncCount   = 0;
+    uint64_t commandSubmitCount = 0;
+    uint64_t tensorSetCount     = 0;
+    uint64_t tensorGetCount     = 0;
+
+    double totalGpuComputeMs      = 0.0;
+    double totalPipelineComputeMs = 0.0;
+
+    // Filled by the KV implementations.  A production FP16 plan must report no
+    // full-size F32 shadow cache here.
+    int64_t kvF16Bytes            = 0;
+    int64_t temporaryF32KvBytes   = 0;
+
+    int64_t decoderKvCapacity                = 0;
+    int64_t decoderKvUsed                    = 0;
+    int64_t decoderKvWraps                   = 0;
+    int64_t decoderKvEvictions               = 0;
+    int64_t decoderKvBytesMoved              = 0;
+    int64_t decoderKvFullBufferMoves         = 0;
+    int64_t decoderOldestAbsolutePosition    = 0;
+    int64_t decoderNextAbsolutePosition      = 0;
+    int32_t decoderKvElementSize             = 0;
+    int64_t decoderFirstWrapAbsolutePosition = -1;
+    double  decoderPreWrapP99Ms              = 0.0;
+    double  decoderWrapStepMs                = 0.0;
+    double  decoderPostWrapP99Ms             = 0.0;
+};
+
+const char * voxtral_profile_stage_name(voxtral_profile_stage stage);
+voxtral_runtime_profile voxtral_context_runtime_profile_internal(const voxtral_context * ctx);
+void voxtral_context_profile_record_internal(voxtral_context * ctx,
+                                             voxtral_profile_stage stage,
+                                             double milliseconds);
+void voxtral_context_profile_note_allocation_internal(voxtral_context * ctx,
+                                                      voxtral_profile_stage stage);
+void voxtral_context_profile_note_submit_internal(voxtral_context * ctx);
+void voxtral_context_profile_note_tensor_set_internal(voxtral_context * ctx);
+void voxtral_context_profile_note_tensor_get_internal(voxtral_context * ctx);
+void voxtral_context_profile_reset_internal(voxtral_context * ctx);
+
+// Decoder self-attention cache metadata.  RoPE and token/event positions are
+// always absolute; only storage addressing is modulo `capacity`.
+struct voxtral_decoder_kv_ring {
+    int64_t capacity = 0;
+    int64_t used = 0;
+    int64_t oldest_absolute_position = 0;
+    int64_t next_absolute_position = 0;
+    int64_t wraps = 0;
+    int64_t evictions = 0;
+    int64_t bytes_moved = 0;       // rollover-only movement; new K/V writes excluded
+    int64_t full_buffer_moves = 0;
+};
+
+struct voxtral_decoder_kv_seg {
+    int32_t slot = 0;
+    int32_t len  = 0;
+};
+
+struct voxtral_decoder_kv_plan_t {
+    int64_t absolute_start = 0;
+    int32_t n_new = 0;
+    voxtral_decoder_kv_seg write_seg[2];
+    int32_t write_nseg = 0;
+    voxtral_decoder_kv_seg read_seg[2];  // oldest -> newest logical order
+    int32_t read_nseg = 0;
+    int64_t used_after = 0;
+    int64_t oldest_after = 0;
+    int64_t next_after = 0;
+    int64_t evicted = 0;
+    bool wrapped = false;
+};
+
+bool voxtral_decoder_kv_plan(const voxtral_decoder_kv_ring & ring,
+                             int64_t absolute_start, int32_t n_new,
+                             voxtral_decoder_kv_plan_t & out);
 
 // ============================================================================
 // Session 7: device-resident incremental adapter + decoder. The encoder writes
@@ -253,6 +399,10 @@ bool voxtral_enc_kv_mask_allows(int64_t kv_abs, int64_t q_abs, int32_t window);
 voxtral_encoder_stream * voxtral_encoder_stream_create(voxtral_context * ctx);
 void    voxtral_encoder_stream_destroy(voxtral_encoder_stream * es);
 void    voxtral_encoder_stream_reset  (voxtral_encoder_stream * es);
+// Compile/allocate the exact production encoder, adapter and decoder graph
+// families against scratch state, then restore a fresh logical stream. Device
+// caches and reusable buffers remain hot; no token/transcript state is created.
+bool    voxtral_encoder_stream_warmup(voxtral_encoder_stream * es);
 
 // Push newly-stable frame-major Mel frames [base_frame, base_frame+n) (each n_mel
 // contiguous). base_frame must equal the running stable count (contiguous). Runs
@@ -260,6 +410,13 @@ void    voxtral_encoder_stream_reset  (voxtral_encoder_stream * es);
 // a contiguity violation or a backend failure.
 bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
                                      const float * frames, int64_t base_frame, int32_t n);
+// Push the complete terminal Mel suffix and evaluate it as bounded finish work.
+// Unlike ordinary push_mel(), this preserves the terminal batch boundary so the
+// encoder can amortise graph submission without replaying prior frames.
+bool voxtral_encoder_stream_push_mel_final(voxtral_encoder_stream * es,
+                                           const float * frames,
+                                           int64_t base_frame,
+                                           int32_t n);
 
 // Attach the wall-clock/audio timeline used by the optional residence collector.
 // `sample_count` is the number of real PCM samples available at this feed;

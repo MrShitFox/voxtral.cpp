@@ -1,4 +1,4 @@
-// Acceptance gate for the selected realtime encoder scheduler (4 logical / 32
+// Acceptance gate for the selected realtime encoder scheduler (4 logical / 4
 // physical) against the retained 128/128 throughput baseline.
 import path from "node:path";
 
@@ -23,7 +23,7 @@ const longFixture = process.env.VOXTRAL_LONG_AUDIO
 const summary = {
   startedAt: new Date().toISOString(),
   command: "npm run acceptance:encoder-realtime",
-  production: { logical: 4, physical: 32 },
+  production: { logical: 4, physical: 4 },
   baseline: { logical: 128, physical: 128 },
   steps: [],
   short: [],
@@ -163,7 +163,7 @@ async function main() {
       planName: `realtime-short-${mode.replaceAll(":", "-")}`,
       mode,
       maxTokens: 0,
-      env: envFor(4, 32),
+      env: envFor(4, 4),
       timeoutMs: 300_000,
     });
     gate(result.state === "completed", `${mode}: short stream failed`);
@@ -207,7 +207,7 @@ async function main() {
       // is proved for every paced chunk plan, not inferred from one token.
       maxTokens: 0,
       skipParity: true,
-      env: envFor(4, 32),
+      env: envFor(4, 4),
       monitorMemory: pace === 80,
       timeoutMs: 360_000,
     });
@@ -241,7 +241,7 @@ async function main() {
     audioPath: fixture.wavPath,
     maxTokens: 0,
     skipParity: true,
-    env: envFor(4, 32),
+    env: envFor(4, 4),
     timeoutMs: 360_000,
   });
   longRuns.push(randomResult);
@@ -268,7 +268,7 @@ async function main() {
     config, planName: "spoken-production-full", mode: "full", audioPath: fixture.wavPath,
     // This run retains Mel only inside the test process and executes the
     // independent global batch encoder for the long-form tensor hard gate.
-    maxTokens: 0, skipParity: false, monitorMemory: true, env: envFor(4, 32), timeoutMs: 420_000,
+    maxTokens: 0, skipParity: false, monitorMemory: true, env: envFor(4, 4), timeoutMs: 420_000,
   });
   const baselineFull = await runStreamSession({
     config, planName: "spoken-baseline-128-128", mode: "full", audioPath: fixture.wavPath,

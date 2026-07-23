@@ -163,7 +163,14 @@ void test_scheduler_configuration() {
     }
 
     CHECK(voxtral_enc_kv_logical_batch_internal() == 4);
-    CHECK(voxtral_enc_kv_physical_rows_internal() == 32);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 4);
+    setenv("VOXTRAL_ENC_KV_PHYSICAL_ROWS", "4", 1);
+    CHECK(voxtral_enc_kv_logical_batch_internal() == 4);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 4);
+    setenv("VOXTRAL_ENC_KV_PHYSICAL_ROWS", "8", 1);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 8);
+    setenv("VOXTRAL_ENC_KV_PHYSICAL_ROWS", "16", 1);
+    CHECK(voxtral_enc_kv_physical_rows_internal() == 16);
     setenv("VOXTRAL_ENC_KV_LOGICAL_BATCH", "8", 1);
     setenv("VOXTRAL_ENC_KV_PHYSICAL_ROWS", "64", 1);
     CHECK(voxtral_enc_kv_logical_batch_internal() == 8);

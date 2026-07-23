@@ -42,7 +42,15 @@ else()
     endif()
     FetchContent_Declare(ggml
         GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-        GIT_TAG        5cecdad692d868e28dbd2f7c468504770108f30c)
+        GIT_TAG        5cecdad692d868e28dbd2f7c468504770108f30c
+        # This pinned revision already ships an FP16 Vulkan CONCAT pipeline,
+        # but its supports_op() filter only admits four-byte elements.  Encoder
+        # FP16 KV therefore falls back to the CPU for every layer.  Apply the
+        # narrow, locally tested capability fix while retaining the otherwise-
+        # proven dependency revision.
+        PATCH_COMMAND  ${CMAKE_COMMAND}
+                       -DGGML_SOURCE_DIR=<SOURCE_DIR>
+                       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-ggml-vulkan-f16-concat.cmake)
     FetchContent_MakeAvailable(ggml)
     set(VOXTRAL_GGML_TARGETS ggml)
     set(VOXTRAL_GGML_INCLUDES "")
@@ -180,6 +188,13 @@ if(BUILD_TESTING)
     target_link_libraries(voxtral_encoder_kv_unit PRIVATE voxtral_lib)
     target_include_directories(voxtral_encoder_kv_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_encoder_kv_unit COMMAND voxtral_encoder_kv_unit)
+
+    # Model-free decoder KV ring arithmetic: absolute positions, modulo writes,
+    # logical read ordering, wrap and fully-sliding eviction without movement.
+    add_executable(voxtral_decoder_kv_unit tests/cpp/test_decoder_kv.cpp)
+    target_link_libraries(voxtral_decoder_kv_unit PRIVATE voxtral_lib)
+    target_include_directories(voxtral_decoder_kv_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME voxtral_decoder_kv_unit COMMAND voxtral_decoder_kv_unit)
 
     # Model-driven harness used by the Node.js acceptance suite. Not a CLI/server.
     add_executable(voxtral-stream-test tests/cpp/voxtral_stream_test.cpp)

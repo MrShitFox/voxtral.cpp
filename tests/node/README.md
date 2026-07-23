@@ -1,9 +1,9 @@
 # Node.js acceptance harness
 
-This directory is the reproducible acceptance layer for the batch CLI and the incremental Mel /
-per-layer encoder-KV runtime. The scheduler harness drives one native process per
-case; that process owns PCM pacing and no SSH round-trip occurs per chunk. Adapter/decoder
-streaming and network transports remain future runtime/API work.
+This directory is the reproducible acceptance layer for the batch CLI and the production
+incremental Mel / encoder-KV / adapter / decoder runtime. The scheduler harness drives one native
+process per case; that process owns PCM pacing and no SSH round-trip occurs per chunk. It is a test
+harness, not a public Node.js or network API.
 
 ## Commands
 
@@ -19,6 +19,12 @@ npm run acceptance:baseline
 npm run benchmark:encoder-scheduler
 npm run acceptance:encoder-realtime
 npm run test:encoder-kv-manual
+npm run acceptance:decoder-kv-ring
+npm run acceptance:kv-fp16
+npm run benchmark:realtime-pipeline
+npm run acceptance:realtime-sustained
+npm run test:realtime-rollover
+npm run test:realtime-soak-30m
 ```
 
 The first two commands are local and deterministic. `npm test` discovers the whole suite but
@@ -34,11 +40,21 @@ and the optional two-minute spoken fixture. Set
 `VOXTRAL_LONG_AUDIO` to the private M4A to enable the spoken stage. The fixture is transferred
 to `/root/voxtral-test-data` separately, normalized once, and never enters source rsync or Git.
 The helper compares local, transferred and normalized source SHA-256 values before any run.
-`acceptance:encoder-realtime` gates the selected 4/32 default against 128/128 on short plans and,
+`acceptance:encoder-realtime` gates the selected low-query default against 128/128 on short plans and,
 when the fixture is available, 80/160/480 ms plus seeded-random paced long-form input. Every
 long plan decodes the complete token sequence/transcript, and the compute run also executes the
 independent global-batch encoder tensor oracle. `test:encoder-kv-manual` is an opt-in fused-flash
 versus explicit-manual-attention oracle with full token/text and pure-mode runtime comparison.
+
+The Session 8 commands are strict. `acceptance:decoder-kv-ring` compares the reusable production
+ring, a dynamic physical ring and a logical-order attention oracle while a reduced test-only
+capacity wraps inside the spoken fixture. `acceptance:kv-fp16` runs sequential FP16/F32 plans and
+requires exact token/transcript parity. `benchmark:realtime-pipeline` records the F32, decoder-only
+FP16 and dual-FP16 shape matrix. `acceptance:realtime-sustained` always runs a full 30-minute paced
+80 ms stream; `VOXTRAL_SOAK_SECONDS` may lengthen it but cannot shorten it. Its rollover and soak
+aliases use the same non-relaxed hard gates: RTF below 0.95, zero final backlog, non-positive slope,
+zero full-buffer KV movement, FP16 memory limits, bounded graph allocation, zero dropped events and
+the published latency limits.
 
 For optional long-form regression tests:
 

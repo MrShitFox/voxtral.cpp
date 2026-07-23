@@ -34,7 +34,8 @@ static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens pe
 // realtime scheduling uses an independent logical microbatch and fixed physical query shape.
 // Absolute physical blocks preserve feed-plan-invariant reduction order while allowing
 // adapter-aligned 4-frame launches. The ring capacity is window + MAX_NEW so a full
-// physical block's K/V write never clobbers a still-live window frame. K/V are F32.
+// physical block's K/V write never clobbers a still-live window frame. K/V are
+// FP16 in production, with an explicit F32 numerical-oracle override.
 static constexpr int32_t VOXTRAL_ENC_KV_MAX_NEW = 128;
 static constexpr int32_t VOXTRAL_ENC_KV_CAP     = VOXTRAL_ENC_WINDOW + VOXTRAL_ENC_KV_MAX_NEW; // 878
 
@@ -53,12 +54,13 @@ static_assert(VOXTRAL_ENC_OUT_RING_CAP % VOXTRAL_DOWNSAMPLE_FACTOR == 0,
 static_assert(VOXTRAL_ENC_OUT_RING_CAP >= VOXTRAL_ENC_KV_MAX_NEW + 64,
               "enc-output ring must absorb the startup burst plus a drain slice");
 // Logical scheduling and physical graph shape are deliberately independent.
-// The realtime default is adapter-aligned 4/32; 128/128 remains the explicit
-// throughput/reference mode. Physical rows are capped by the ring headroom.
+// The realtime default is the profiled low-query 4/4 segmented graph; 32-row
+// flash and 128/128 remain benchmark/reference families. Physical rows are
+// capped by the ring headroom.
 static constexpr int32_t VOXTRAL_ENC_KV_DEFAULT_LOGICAL  = 4;
-static constexpr int32_t VOXTRAL_ENC_KV_DEFAULT_PHYSICAL = 32;
-// Minimum supported Vulkan flash shape. Physical query rows are normalized to 32/64/128;
-// dummy rows are masked and sliced, while logical rows remain independent.
+static constexpr int32_t VOXTRAL_ENC_KV_DEFAULT_PHYSICAL = 4;
+// Below 32 rows the production graph uses segmented explicit attention. At 32+
+// the fused Vulkan flash family remains available for throughput/reference work.
 static constexpr int32_t VOXTRAL_ENC_KV_ATTN_MIN_ROWS = 32;
 
 struct encoder_kv_schedule {
@@ -77,10 +79,42 @@ static int32_t env_positive_i32(const char * name, int32_t fallback) {
     return (int32_t) parsed;
 }
 
+static ggml_type decoder_kv_type_from_env() {
+    // FP16 is the production default.  F32 remains an explicit numerical oracle
+    // for Session-8 acceptance; it is not a second resident shadow cache.
+    if (const char * value = std::getenv("VOXTRAL_DECODER_KV_TYPE")) {
+        if (std::strcmp(value, "f32") == 0 || std::strcmp(value, "F32") == 0) {
+            return GGML_TYPE_F32;
+        }
+    }
+    return GGML_TYPE_F16;
+}
+
+static ggml_type encoder_kv_type_from_env() {
+    if (const char * value = std::getenv("VOXTRAL_ENCODER_KV_TYPE")) {
+        if (std::strcmp(value, "f32") == 0 || std::strcmp(value, "F32") == 0) {
+            return GGML_TYPE_F32;
+        }
+    }
+    return GGML_TYPE_F16;
+}
+
 static int32_t normalize_physical_rows(int32_t rows) {
+    if (rows <= 4)  return 4;
+    if (rows <= 8)  return 8;
+    if (rows <= 16) return 16;
     if (rows <= 32) return 32;
     if (rows <= 64) return 64;
     return 128;
+}
+
+static bool encoder_kv_uses_segmented_attention(int32_t physical_rows) {
+    // Vulkan flash attention remains the throughput/reference graph family.
+    // Small fixed query shapes use explicit attention so a wrapped FP16 ring can
+    // be consumed as logical segments without materializing a contiguous K/V
+    // window.  The env knob keeps the same path available as an oracle at 32+.
+    return physical_rows < VOXTRAL_ENC_KV_ATTN_MIN_ROWS ||
+           std::getenv("VOXTRAL_ENC_KV_MANUAL") != nullptr;
 }
 
 static encoder_kv_schedule encoder_kv_schedule_from_env() {
@@ -259,6 +293,48 @@ struct voxtral_model {
 // Context structure
 // ============================================================================
 
+// Enough for every 80 ms stage invocation in a 30-minute run (22,500 samples)
+// with headroom.  Once full, deterministic reservoir replacement keeps the
+// percentile sample representative without allocating or growing.
+static constexpr size_t VOXTRAL_PROFILE_RESERVOIR = 32768;
+
+struct voxtral_profile_series_internal {
+    uint64_t seen   = 0;
+    size_t   stored = 0;
+    double   total_ms = 0.0;
+    double   max_ms   = 0.0;
+    std::vector<double> samples;
+};
+
+struct voxtral_runtime_profile_internal_state {
+    bool enabled = false;
+    std::array<voxtral_profile_series_internal,
+               static_cast<size_t>(voxtral_profile_stage::count)> stages;
+    uint64_t encoder_graph_build_count = 0;
+    uint64_t adapter_graph_build_count = 0;
+    uint64_t decoder_graph_build_count = 0;
+    uint64_t encoder_allocations = 0;
+    uint64_t adapter_allocations = 0;
+    uint64_t decoder_allocations = 0;
+    uint64_t graph_allocations   = 0;
+    uint64_t backend_sync_count   = 0;
+    uint64_t command_submit_count = 0;
+    uint64_t tensor_set_count     = 0;
+    uint64_t tensor_get_count     = 0;
+    int64_t kv_f16_bytes          = 0;
+    int64_t temporary_f32_kv_bytes= 0;
+};
+
+struct voxtral_adapter_graph_cache {
+    int32_t groups = 0;
+    std::vector<uint8_t> meta;
+    ggml_context * gctx = nullptr;
+    ggml_cgraph * graph = nullptr;
+    bool allocated = false;
+    std::vector<int32_t> encoder_rows;
+    std::vector<int32_t> audio_rows;
+};
+
 struct voxtral_context {
     voxtral_model        * model     = nullptr;
     voxtral_log_level      log_level = voxtral_log_level::info;
@@ -279,6 +355,7 @@ struct voxtral_context {
     ggml_tensor * encoder_chunk_output = nullptr;  // [enc_dim, MAX_ENC_CHUNK]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
     ggml_tensor * decoder_argmax  = nullptr;  // [1] i32 — greedy token, computed on device
+    ggml_tensor * decoder_hidden_diagnostic = nullptr; // [dec_dim] F32, opt-in test capture
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
@@ -318,21 +395,298 @@ struct voxtral_context {
     int32_t enc_seq_len  = 0;  // after conv, before left-trunc
     int32_t enc_seq_used = 0;  // after left-trunc (multiple of downsample_factor)
     int32_t dec_seq_len  = 0;  // adapter output length
+    int64_t encoder_kv_allocated_bytes = 0;
+    ggml_type encoder_kv_storage_type = GGML_TYPE_COUNT;
 
-    // KV ring buffer state
-    int32_t kv_used      = 0;  // tokens currently in KV cache
+    // Decoder KV is a true fixed-size ring. The previous shift-left path evicted
+    // position zero along with every other oldest row, so the accepted semantics
+    // are fully sliding: there is no pinned prompt prefix or attention sink.
+    // Absolute positions drive RoPE and eviction; physical slots are
+    // absolute_position % capacity. No rollover path shifts or clears K/V.
+    voxtral_decoder_kv_ring decoder_kv = {
+        /*capacity=*/ VOXTRAL_DEC_WINDOW,
+        /*used=*/ 0,
+        /*oldest_absolute_position=*/ 0,
+        /*next_absolute_position=*/ 0,
+    };
+    // Production is always the model window. A smaller value is accepted only
+    // through the explicitly named test seam so rollover kernels can be
+    // exercised quickly without changing the backing allocation.
+    int32_t decoder_kv_configured_capacity = VOXTRAL_DEC_WINDOW;
+
+    struct decoder_rollover_profile {
+        static constexpr size_t span = 63; // 5.04 s at the 80 ms decoder cadence
+        std::array<double, span> recent{};
+        size_t recent_count = 0;
+        size_t recent_next = 0;
+        std::array<double, span> post{};
+        size_t post_count = 0;
+        int64_t first_wrap_position = -1;
+        double pre_wrap_p99_ms = 0.0;
+        double wrap_step_ms = 0.0;
+    } decoder_rollover;
 
     // Schedulers
     ggml_backend_sched_t sched_encoder  = nullptr;
+    ggml_backend_sched_t sched_encoder_steady = nullptr;
     ggml_backend_sched_t sched_adapter  = nullptr;
+    ggml_backend_sched_t sched_adapter_group = nullptr;
+    ggml_backend_sched_t sched_adapter_batch = nullptr;
     ggml_backend_sched_t sched_dec_pre  = nullptr;
     ggml_backend_sched_t sched_dec_step = nullptr;
+
+    // Reusable single-token decoder graph. Slot selection is data (I32 inputs),
+    // not graph topology: SET_ROWS appends K/V at the current physical slot and
+    // GET_ROWS selects the audio ring slot. One bounded masked-to-unmasked graph
+    // transition occurs when the cache fills; neither topology grows per step.
+    std::vector<uint8_t> decoder_step_graph_meta;
+    ggml_context       * decoder_step_graph_ctx = nullptr;
+    ggml_cgraph        * decoder_step_graph = nullptr;
+    bool                 decoder_step_graph_allocated = false;
+    bool                 decoder_step_graph_full = false;
+    std::vector<float>   decoder_step_mask;
+    int32_t              decoder_step_mask_valid = -1;
+    voxtral_adapter_graph_cache adapter_group_graph;
+    voxtral_adapter_graph_cache adapter_batch_graph;
+    std::vector<uint8_t> encoder_steady_graph_meta;
+    ggml_context       * encoder_steady_graph_ctx = nullptr;
+    ggml_cgraph        * encoder_steady_graph = nullptr;
+    bool                 encoder_steady_graph_allocated = false;
+    std::vector<float>   encoder_steady_mask;
+    std::array<int32_t, 4> encoder_steady_positions{};
+    std::array<int32_t, 4> encoder_steady_kv_rows{};
+    std::array<int32_t, 4> encoder_steady_output_rows{};
 
     // CPU scratch
     std::vector<float> hann_window;     // [window_size]
     std::vector<float> mel_filters_cpu; // [n_freq * n_mel]
     std::vector<float> time_emb_cpu;    // [dec_dim]
+
+    // Optional, fixed-capacity Session-8 stage profiler.  No hot-path sample
+    // recording allocates after context initialization.
+    voxtral_runtime_profile_internal_state profile;
+
+    // Explicit numerical-acceptance mode. Production never reads these tensors
+    // back; the first decoder step only is captured when the env flag is set.
+    bool numerical_diagnostics = false;
+    bool capture_encoder_diagnostics = false;
+    bool capture_adapter_diagnostics = false;
+    bool capture_decoder_diagnostics = false;
+    std::vector<float> diagnostic_encoder_output;
+    std::vector<float> diagnostic_first_hidden;
+    std::vector<float> diagnostic_first_logits;
+    std::vector<float> diagnostic_adapter_output;
 };
+
+static size_t profile_index(voxtral_profile_stage stage) {
+    return static_cast<size_t>(stage);
+}
+
+const char * voxtral_profile_stage_name(voxtral_profile_stage stage) {
+    switch (stage) {
+        case voxtral_profile_stage::mel_compute:                    return "mel_compute";
+        case voxtral_profile_stage::encoder_graph_build:            return "encoder_graph_build";
+        case voxtral_profile_stage::encoder_graph_execute:          return "encoder_graph_execute";
+        case voxtral_profile_stage::encoder_device_copy:            return "encoder_device_copy";
+        case voxtral_profile_stage::adapter_graph_build:             return "adapter_graph_build";
+        case voxtral_profile_stage::adapter_graph_execute:           return "adapter_graph_execute";
+        case voxtral_profile_stage::decoder_prefill_graph_build:     return "decoder_prefill_graph_build";
+        case voxtral_profile_stage::decoder_prefill_graph_execute:   return "decoder_prefill_graph_execute";
+        case voxtral_profile_stage::decoder_step_graph_build:        return "decoder_step_graph_build";
+        case voxtral_profile_stage::decoder_step_graph_execute:      return "decoder_step_graph_execute";
+        case voxtral_profile_stage::argmax:                          return "argmax";
+        case voxtral_profile_stage::token_readback:                  return "token_readback";
+        case voxtral_profile_stage::backend_synchronize:             return "backend_synchronize";
+        case voxtral_profile_stage::event_processing:                return "event_processing";
+        case voxtral_profile_stage::pipeline_feed:                   return "pipeline_feed";
+        case voxtral_profile_stage::count:                           break;
+    }
+    return "unknown";
+}
+
+static uint64_t profile_mix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+void voxtral_context_profile_record_internal(voxtral_context * ctx,
+                                             voxtral_profile_stage stage,
+                                             double milliseconds) {
+    if (!ctx || !ctx->profile.enabled || stage == voxtral_profile_stage::count) return;
+    if (!std::isfinite(milliseconds) || milliseconds < 0.0) return;
+    auto & s = ctx->profile.stages[profile_index(stage)];
+    ++s.seen;
+    s.total_ms += milliseconds;
+    s.max_ms = std::max(s.max_ms, milliseconds);
+    if (s.stored < s.samples.size()) {
+        s.samples[s.stored++] = milliseconds;
+    } else if (!s.samples.empty()) {
+        const uint64_t slot = profile_mix64(s.seen) % s.seen;
+        if (slot < s.samples.size()) s.samples[(size_t) slot] = milliseconds;
+    }
+
+    switch (stage) {
+        case voxtral_profile_stage::encoder_graph_build:
+            ++ctx->profile.encoder_graph_build_count; break;
+        case voxtral_profile_stage::adapter_graph_build:
+            ++ctx->profile.adapter_graph_build_count; break;
+        case voxtral_profile_stage::decoder_prefill_graph_build:
+        case voxtral_profile_stage::decoder_step_graph_build:
+            ++ctx->profile.decoder_graph_build_count; break;
+        case voxtral_profile_stage::backend_synchronize:
+            ++ctx->profile.backend_sync_count; break;
+        default: break;
+    }
+}
+
+void voxtral_context_profile_note_allocation_internal(voxtral_context * ctx,
+                                                      voxtral_profile_stage stage) {
+    if (!ctx || !ctx->profile.enabled) return;
+    ++ctx->profile.graph_allocations;
+    switch (stage) {
+        case voxtral_profile_stage::encoder_graph_execute:
+        case voxtral_profile_stage::encoder_device_copy:
+            ++ctx->profile.encoder_allocations; break;
+        case voxtral_profile_stage::adapter_graph_execute:
+            ++ctx->profile.adapter_allocations; break;
+        case voxtral_profile_stage::decoder_prefill_graph_execute:
+        case voxtral_profile_stage::decoder_step_graph_execute:
+            ++ctx->profile.decoder_allocations; break;
+        default: break;
+    }
+}
+
+void voxtral_context_profile_note_submit_internal(voxtral_context * ctx) {
+    if (ctx && ctx->profile.enabled) ++ctx->profile.command_submit_count;
+}
+
+void voxtral_context_profile_note_tensor_set_internal(voxtral_context * ctx) {
+    if (ctx && ctx->profile.enabled) ++ctx->profile.tensor_set_count;
+}
+
+void voxtral_context_profile_note_tensor_get_internal(voxtral_context * ctx) {
+    if (ctx && ctx->profile.enabled) ++ctx->profile.tensor_get_count;
+}
+
+void voxtral_context_profile_reset_internal(voxtral_context * ctx) {
+    if (!ctx) return;
+    auto & p = ctx->profile;
+    p.encoder_graph_build_count = 0;
+    p.adapter_graph_build_count = 0;
+    p.decoder_graph_build_count = 0;
+    p.encoder_allocations = p.adapter_allocations = p.decoder_allocations = 0;
+    p.graph_allocations = p.backend_sync_count = p.command_submit_count = 0;
+    p.tensor_set_count = p.tensor_get_count = 0;
+    p.kv_f16_bytes = 0;
+    p.temporary_f32_kv_bytes = 0;
+    for (auto & s : p.stages) {
+        s.seen = 0;
+        s.stored = 0;
+        s.total_ms = 0.0;
+        s.max_ms = 0.0;
+        if (p.enabled) {
+            if (s.samples.size() != VOXTRAL_PROFILE_RESERVOIR) {
+                s.samples.assign(VOXTRAL_PROFILE_RESERVOIR, 0.0);
+            } else {
+                std::fill(s.samples.begin(), s.samples.end(), 0.0);
+            }
+        } else {
+            s.samples.clear();
+        }
+    }
+}
+
+static double profile_percentile(const voxtral_profile_series_internal & s, double p) {
+    if (s.stored == 0) return 0.0;
+    std::vector<double> values(s.samples.begin(), s.samples.begin() + (std::ptrdiff_t) s.stored);
+    std::sort(values.begin(), values.end());
+    const double x = p * (double) (values.size() - 1);
+    const size_t lo = (size_t) x;
+    const size_t hi = std::min(lo + 1, values.size() - 1);
+    return values[lo] + (values[hi] - values[lo]) * (x - (double) lo);
+}
+
+template <size_t N>
+static double fixed_percentile(const std::array<double, N> & source,
+                               size_t count, double p) {
+    count = std::min(count, N);
+    if (count == 0) return 0.0;
+    std::vector<double> values(source.begin(), source.begin() + (std::ptrdiff_t) count);
+    std::sort(values.begin(), values.end());
+    const double x = p * (double) (values.size() - 1);
+    const size_t lo = (size_t) x;
+    const size_t hi = std::min(lo + 1, values.size() - 1);
+    return values[lo] + (values[hi] - values[lo]) * (x - (double) lo);
+}
+
+voxtral_runtime_profile voxtral_context_runtime_profile_internal(const voxtral_context * ctx) {
+    voxtral_runtime_profile out;
+    if (!ctx) return out;
+    const auto & p = ctx->profile;
+    out.enabled = p.enabled;
+    for (size_t i = 0; i < p.stages.size(); ++i) {
+        const auto & src = p.stages[i];
+        auto & dst = out.stages[i];
+        dst.count = src.seen;
+        dst.totalMs = src.total_ms;
+        dst.meanMs = src.seen ? src.total_ms / (double) src.seen : 0.0;
+        dst.p50Ms = profile_percentile(src, 0.50);
+        dst.p95Ms = profile_percentile(src, 0.95);
+        dst.p99Ms = profile_percentile(src, 0.99);
+        dst.maxMs = src.max_ms;
+    }
+    out.encoderGraphBuildCount = p.encoder_graph_build_count;
+    out.adapterGraphBuildCount = p.adapter_graph_build_count;
+    out.decoderGraphBuildCount = p.decoder_graph_build_count;
+    out.encoderAllocations = p.encoder_allocations;
+    out.adapterAllocations = p.adapter_allocations;
+    out.decoderAllocations = p.decoder_allocations;
+    out.graphAllocations = p.graph_allocations;
+    out.backendSyncCount = p.backend_sync_count;
+    out.commandSubmitCount = p.command_submit_count;
+    out.tensorSetCount = p.tensor_set_count;
+    out.tensorGetCount = p.tensor_get_count;
+    out.kvF16Bytes = p.kv_f16_bytes;
+    if (ctx->kv_self_k && ctx->kv_self_v &&
+        ctx->kv_self_k->type == GGML_TYPE_F16 &&
+        ctx->kv_self_v->type == GGML_TYPE_F16) {
+        out.kvF16Bytes += (int64_t) ggml_nbytes(ctx->kv_self_k) +
+                          (int64_t) ggml_nbytes(ctx->kv_self_v);
+    }
+    if (ctx->encoder_kv_storage_type == GGML_TYPE_F16) {
+        out.kvF16Bytes += ctx->encoder_kv_allocated_bytes;
+    }
+    out.temporaryF32KvBytes = p.temporary_f32_kv_bytes;
+    out.decoderKvCapacity = ctx->decoder_kv.capacity;
+    out.decoderKvUsed = ctx->decoder_kv.used;
+    out.decoderKvWraps = ctx->decoder_kv.wraps;
+    out.decoderKvEvictions = ctx->decoder_kv.evictions;
+    out.decoderKvBytesMoved = ctx->decoder_kv.bytes_moved;
+    out.decoderKvFullBufferMoves = ctx->decoder_kv.full_buffer_moves;
+    out.decoderOldestAbsolutePosition = ctx->decoder_kv.oldest_absolute_position;
+    out.decoderNextAbsolutePosition = ctx->decoder_kv.next_absolute_position;
+    out.decoderKvElementSize = ctx->kv_self_k
+        ? (int32_t) ggml_type_size(ctx->kv_self_k->type) : 0;
+    out.decoderFirstWrapAbsolutePosition =
+        ctx->decoder_rollover.first_wrap_position;
+    out.decoderPreWrapP99Ms = ctx->decoder_rollover.pre_wrap_p99_ms;
+    out.decoderWrapStepMs = ctx->decoder_rollover.wrap_step_ms;
+    out.decoderPostWrapP99Ms = fixed_percentile(
+        ctx->decoder_rollover.post, ctx->decoder_rollover.post_count, 0.99);
+    const auto stage_total = [&](voxtral_profile_stage stage) {
+        return p.stages[profile_index(stage)].total_ms;
+    };
+    out.totalGpuComputeMs =
+        stage_total(voxtral_profile_stage::encoder_graph_execute) +
+        stage_total(voxtral_profile_stage::encoder_device_copy) +
+        stage_total(voxtral_profile_stage::adapter_graph_execute) +
+        stage_total(voxtral_profile_stage::decoder_prefill_graph_execute) +
+        stage_total(voxtral_profile_stage::decoder_step_graph_execute);
+    out.totalPipelineComputeMs = stage_total(voxtral_profile_stage::pipeline_feed);
+    return out;
+}
 
 // ============================================================================
 // Time embedding (sinusoidal, matches Python compute_time_embedding)
@@ -947,6 +1301,11 @@ voxtral_context * voxtral_init_from_model(
     ctx->model     = model;
     ctx->log_level = params.log_level;
     ctx->logger    = params.logger;
+    ctx->profile.enabled = std::getenv("VOXTRAL_PROFILE") != nullptr;
+    ctx->numerical_diagnostics = std::getenv("VOXTRAL_NUMERICAL_DIAGNOSTICS") != nullptr;
+    ctx->capture_encoder_diagnostics = ctx->numerical_diagnostics;
+    ctx->capture_adapter_diagnostics = ctx->numerical_diagnostics;
+    voxtral_context_profile_reset_internal(ctx);
     if (params.n_threads > 0) {
         ctx->n_threads = params.n_threads;
     } else {
@@ -1004,7 +1363,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
-        constexpr size_t n_tensors = 5;
+        constexpr size_t n_tensors = 6;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -1027,15 +1386,22 @@ voxtral_context * voxtral_init_from_model(
         ctx->decoder_argmax = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_I32, 1);
         ggml_set_name(ctx->decoder_argmax, "decoder_argmax");
 
+        // A tiny persistent destination for the opt-in numerical suite. It is
+        // never copied to by ordinary graphs and adds no F32 KV shadow.
+        ctx->decoder_hidden_diagnostic = ggml_new_tensor_1d(
+            ctx->ctx_persistent, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
+        ggml_set_name(ctx->decoder_hidden_diagnostic, "decoder_hidden_diagnostic");
+
         // KV cache: [kv_dim, dec_window, dec_layers] — layer count is model-dependent
         // (realtime 26, offline 30); window is the physical cache capacity for both.
         const int32_t kv_dim = ctx->model->hp.dec_kv_heads * ctx->model->hp.dec_head_dim;  // 1024
         const int32_t kv_layers = ctx->model->hp.dec_layers;
-        ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
+        const ggml_type decoder_kv_type = decoder_kv_type_from_env();
+        ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, decoder_kv_type,
             kv_dim, VOXTRAL_DEC_WINDOW, kv_layers);
         ggml_set_name(ctx->kv_self_k, "kv_self_k");
 
-        ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
+        ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, decoder_kv_type,
             kv_dim, VOXTRAL_DEC_WINDOW, kv_layers);
         ggml_set_name(ctx->kv_self_v, "kv_self_v");
 
@@ -1074,8 +1440,8 @@ voxtral_context * voxtral_init_from_model(
     {
         const double chunk_mb = (double) ggml_nbytes(ctx->encoder_chunk_output) / 1e6;
         const double kv_mb  = (double) (ggml_nbytes(ctx->kv_self_k) + ggml_nbytes(ctx->kv_self_v)) / 1e6;
-        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB kv_cache=%.2f MB",
-            chunk_mb, kv_mb);
+        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB kv_cache=%.2f MB (%s)",
+            chunk_mb, kv_mb, ctx->kv_self_k->type == GGML_TYPE_F16 ? "F16" : "F32");
     }
 
     // Schedulers — ggml requires the last backend to be CPU.
@@ -1098,7 +1464,10 @@ voxtral_context * voxtral_init_from_model(
     // per-layer KV graph (whose wrap-gather adds concat nodes per layer), so it is
     // sized generously to fit the KV graph's node+leaf count across a ring wrap.
     ctx->sched_encoder  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE * 8, false, op_offload);
+    ctx->sched_encoder_steady = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE * 8, false, op_offload);
     ctx->sched_adapter  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
+    ctx->sched_adapter_group = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
+    ctx->sched_adapter_batch = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
     ctx->sched_dec_pre  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
     ctx->sched_dec_step = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
 
@@ -1117,6 +1486,16 @@ voxtral_context * voxtral_init_from_model(
     // Time embedding for t = N_DELAY_TOKENS
     compute_time_embedding(ctx->time_emb_cpu, (float)VOXTRAL_N_DELAY_TOKENS, VOXTRAL_DEC_DIM);
 
+    if (const char * value = std::getenv("VOXTRAL_DECODER_KV_TEST_CAPACITY")) {
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed >= 64 && parsed <= VOXTRAL_DEC_WINDOW) {
+            ctx->decoder_kv_configured_capacity = (int32_t) parsed;
+            ctx->decoder_kv.capacity = parsed;
+            LOG_WARN(ctx, "decoder KV: TEST-ONLY logical capacity=%ld (backing=%d)",
+                     parsed, VOXTRAL_DEC_WINDOW);
+        }
+    }
+
     LOG_INFO(ctx, "context initialized");
     return ctx;
 }
@@ -1132,9 +1511,16 @@ const float * voxtral_ctx_mel_filters(const voxtral_context * ctx) {
 void voxtral_free(voxtral_context * ctx) {
     if (!ctx) return;
     if (ctx->sched_encoder)  ggml_backend_sched_free(ctx->sched_encoder);
+    if (ctx->sched_encoder_steady) ggml_backend_sched_free(ctx->sched_encoder_steady);
     if (ctx->sched_adapter)  ggml_backend_sched_free(ctx->sched_adapter);
+    if (ctx->sched_adapter_group) ggml_backend_sched_free(ctx->sched_adapter_group);
+    if (ctx->sched_adapter_batch) ggml_backend_sched_free(ctx->sched_adapter_batch);
     if (ctx->sched_dec_pre)  ggml_backend_sched_free(ctx->sched_dec_pre);
     if (ctx->sched_dec_step) ggml_backend_sched_free(ctx->sched_dec_step);
+    if (ctx->decoder_step_graph_ctx) ggml_free(ctx->decoder_step_graph_ctx);
+    if (ctx->adapter_group_graph.gctx) ggml_free(ctx->adapter_group_graph.gctx);
+    if (ctx->adapter_batch_graph.gctx) ggml_free(ctx->adapter_batch_graph.gctx);
+    if (ctx->encoder_steady_graph_ctx) ggml_free(ctx->encoder_steady_graph_ctx);
     if (ctx->buf_enc_full)   ggml_backend_buffer_free(ctx->buf_enc_full);
     if (ctx->ctx_enc_full)   ggml_free(ctx->ctx_enc_full);
     if (ctx->buf_dec_mem)    ggml_backend_buffer_free(ctx->buf_dec_mem);
@@ -1154,44 +1540,71 @@ void voxtral_free(voxtral_context * ctx) {
 // ============================================================================
 
 static void clear_kv_cache(voxtral_context * ctx) {
-    if (!ctx || !ctx->buf_persistent || !ctx->kv_self_k || !ctx->kv_self_v) {
-        return;
-    }
-    // Persistent tensors may live in device memory. Clearing their backend
-    // buffer is valid for both CPU and GPU allocations; host memset is not.
-    ggml_backend_buffer_clear(ctx->buf_persistent, 0);
-    ctx->kv_used = 0;
+    if (!ctx) return;
+    // Logical invalidation only.  Every subsequent read is bounded by `used`, so
+    // stale device slots are unreachable.  The backing tensors are cleared once
+    // at allocation, never per stream and never at rollover.
+    ctx->decoder_kv = voxtral_decoder_kv_ring{};
+    ctx->decoder_kv.capacity = ctx->decoder_kv_configured_capacity;
+    ctx->decoder_rollover = {};
+    ctx->decoder_step_mask_valid = -1;
+    ctx->diagnostic_first_hidden.clear();
+    ctx->diagnostic_first_logits.clear();
+    ctx->capture_decoder_diagnostics = ctx->numerical_diagnostics;
 }
 
-static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
-    if (!ctx || shift <= 0 || !ctx->kv_self_k || !ctx->kv_self_v) {
-        return;
+static int32_t decoder_kv_segments(int64_t absolute_start, int32_t len, int32_t capacity,
+                                   voxtral_decoder_kv_seg out[2]) {
+    if (len <= 0) return 0;
+    const int32_t slot = (int32_t) (absolute_start % capacity);
+    const int32_t first = std::min(len, capacity - slot);
+    out[0] = { slot, first };
+    if (first == len) return 1;
+    out[1] = { 0, len - first };
+    return 2;
+}
+
+bool voxtral_decoder_kv_plan(const voxtral_decoder_kv_ring & ring,
+                             int64_t absolute_start, int32_t n_new,
+                             voxtral_decoder_kv_plan_t & out) {
+    out = voxtral_decoder_kv_plan_t{};
+    if (ring.capacity <= 0 || ring.used < 0 || ring.used > ring.capacity ||
+        ring.oldest_absolute_position < 0 || ring.next_absolute_position < 0 ||
+        ring.oldest_absolute_position + ring.used != ring.next_absolute_position ||
+        absolute_start != ring.next_absolute_position || n_new <= 0 ||
+        n_new > ring.capacity) {
+        return false;
     }
-    const int32_t window = VOXTRAL_DEC_WINDOW;
-    if (shift >= window) {
-        clear_kv_cache(ctx);
-        return;
-    }
 
-    uint8_t * k_data = (uint8_t *) ggml_get_data(ctx->kv_self_k);
-    uint8_t * v_data = (uint8_t *) ggml_get_data(ctx->kv_self_v);
-    if (!k_data || !v_data) {
-        return;
-    }
+    out.absolute_start = absolute_start;
+    out.n_new = n_new;
+    out.write_nseg = decoder_kv_segments(absolute_start, n_new, (int32_t) ring.capacity,
+                                         out.write_seg);
+    out.next_after = absolute_start + n_new;
+    out.used_after = std::min<int64_t>(ring.capacity, ring.used + n_new);
+    out.oldest_after = out.next_after - out.used_after;
+    out.evicted = std::max<int64_t>(0, ring.used + n_new - ring.capacity);
+    out.read_nseg = decoder_kv_segments(out.oldest_after, (int32_t) out.used_after,
+                                        (int32_t) ring.capacity, out.read_seg);
 
-    const size_t row_bytes = ctx->kv_self_k->nb[1];
-    const size_t layer_stride = ctx->kv_self_k->nb[2];
+    // A physical wrap occurs when the appended absolute span crosses a capacity
+    // cycle boundary, including the single-token write exactly at slot zero.
+    const int64_t previous_cycle = absolute_start == 0 ? 0 : (absolute_start - 1) / ring.capacity;
+    const int64_t newest_cycle = (out.next_after - 1) / ring.capacity;
+    out.wrapped = newest_cycle > previous_cycle;
+    return true;
+}
 
-    for (int32_t l = 0; l < ctx->model->hp.dec_layers; ++l) {
-        uint8_t * k_base = k_data + (size_t) l * layer_stride;
-        uint8_t * v_base = v_data + (size_t) l * layer_stride;
-
-        memmove(k_base, k_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
-        memmove(v_base, v_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
-
-        memset(k_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
-        memset(v_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
-    }
+static void decoder_kv_commit_plan(voxtral_context * ctx,
+                                   const voxtral_decoder_kv_plan_t & plan) {
+    auto & ring = ctx->decoder_kv;
+    ring.used = plan.used_after;
+    ring.oldest_absolute_position = plan.oldest_after;
+    ring.next_absolute_position = plan.next_after;
+    ring.evictions += plan.evicted;
+    if (plan.wrapped) ++ring.wraps;
+    // bytes_moved/full_buffer_moves deliberately remain zero: only the newly
+    // projected K/V columns are written by the graph.
 }
 
 // ============================================================================
@@ -1606,8 +2019,8 @@ static ggml_cgraph * build_encoder_graph(
 // ============================================================================
 static ggml_cgraph * build_encoder_kv_graph(
     voxtral_context * ctx,
-    ggml_tensor * ring_k,          // [kv_dim, capacity, enc_layers] F32, persistent
-    ggml_tensor * ring_v,          // [kv_dim, capacity, enc_layers] F32, persistent
+    ggml_tensor * ring_k,          // [kv_dim, capacity, enc_layers] FP16/F32, persistent
+    ggml_tensor * ring_v,          // [kv_dim, capacity, enc_layers] FP16/F32, persistent
     ggml_context * gctx,
     const voxtral_enc_kv_plan_t & plan,
     int32_t physical_rows,         // fixed query rows for this physical block
@@ -1678,7 +2091,7 @@ static ggml_cgraph * build_encoder_kv_graph(
     const float scale = 1.0f / sqrtf((float) e_hd);
     const size_t k_layer_stride = ring_k->nb[2];
     const size_t v_layer_stride = ring_v->nb[2];
-    const size_t k_col = ring_k->nb[1];   // == kv_dim * sizeof(float)
+    const size_t k_col = ring_k->nb[1];   // kv_dim * storage element size
     const size_t v_col = ring_v->nb[1];
 
     for (int32_t i = 0; i < hp.enc_layers; i++) {
@@ -1702,6 +2115,11 @@ static ggml_cgraph * build_encoder_kv_graph(
         // committed; dummy rows never enter the persistent ring.
         ggml_tensor * k_store = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, P));
         ggml_tensor * v_store = ggml_reshape_2d(gctx, v, kv_dim, P);   // V has no RoPE
+        // Quantize each new column exactly once into the cache storage type.  The
+        // same FP16 values feed current attention and the persistent write, so
+        // old/new columns never mix precisions and no F32 shadow cache exists.
+        if (ring_k->type != k_store->type) k_store = ggml_cast(gctx, k_store, ring_k->type);
+        if (ring_v->type != v_store->type) v_store = ggml_cast(gctx, v_store, ring_v->type);
 
         // WRITE new K/V into the ring at the plan's physical slots (<=2 segments).
         // Expanded now so the window read below sees the new frames.
@@ -1718,77 +2136,166 @@ static ggml_cgraph * build_encoder_kv_graph(
             src_off += seg_len;
         }
 
-        // Assemble the physical block key window [key_start, key_end) as a
-        // contiguous [kv_dim, L]. The physical block has a few headroom columns
-        // before the real causal window; those columns are zero-filled rather
-        // than read from evicted ring slots and are masked for every real query.
+        // Describe the logical physical-block window [key_start, key_end).  The
+        // low-query graph consumes these segments directly; the 32+ throughput
+        // graph retains its fused contiguous-window implementation below.
         const int64_t valid_old_start = std::max<int64_t>(key_start,
             std::max<int64_t>(0, plan.q_start - (int64_t) (VOXTRAL_ENC_WINDOW - 1)));
         const int32_t prefix_len = (int32_t) (valid_old_start - key_start);
         const int32_t old_len = (int32_t) (plan.q_start - valid_old_start);
         const int32_t future_len = (int32_t) (key_end - (plan.q_start + N));
-        ggml_tensor * k_win;
-        ggml_tensor * v_win;
         ggml_tensor * k_real = ggml_view_2d(gctx, k_store, kv_dim, N, k_store->nb[1],
                                             (size_t) q_offset * k_store->nb[1]);
         ggml_tensor * v_real = ggml_view_2d(gctx, v_store, kv_dim, N, v_store->nb[1],
                                             (size_t) q_offset * v_store->nb[1]);
-        if (old_len <= 0) {
-            k_win = k_real;
-            v_win = v_real;
-        } else {
-            const int32_t cap = VOXTRAL_ENC_KV_CAP;
-            const int32_t os0 = (int32_t) (valid_old_start % cap);
-            const int32_t of0 = std::min(old_len, cap - os0);
-            ggml_tensor * k_old;
-            ggml_tensor * v_old;
-            if (of0 >= old_len) {
-                k_old = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, old_len, k_col, (size_t) i * k_layer_stride + (size_t) os0 * k_col));
-                v_old = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, old_len, v_col, (size_t) i * v_layer_stride + (size_t) os0 * v_col));
-            } else {
-                const int32_t l1 = old_len - of0;
-                ggml_tensor * k0 = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, of0, k_col, (size_t) i * k_layer_stride + (size_t) os0 * k_col));
-                ggml_tensor * k1 = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, l1,  k_col, (size_t) i * k_layer_stride));
-                ggml_tensor * v0 = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, of0, v_col, (size_t) i * v_layer_stride + (size_t) os0 * v_col));
-                ggml_tensor * v1 = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, l1,  v_col, (size_t) i * v_layer_stride));
-                k_old = ggml_concat(gctx, k0, k1, 1);
-                v_old = ggml_concat(gctx, v0, v1, 1);
-            }
-            k_win = ggml_concat(gctx, k_old, k_real, 1);
-            v_win = ggml_concat(gctx, v_old, v_real, 1);
-            if (i == 0 && out_materialized_frames) *out_materialized_frames += old_len;
-        }
-
-        if (prefix_len > 0) {
-            k_win = ggml_pad_ext(gctx, k_win, 0, 0, prefix_len, 0, 0, 0, 0, 0);
-            v_win = ggml_pad_ext(gctx, v_win, 0, 0, prefix_len, 0, 0, 0, 0, 0);
-        }
-
-        if (future_len > 0) {
-            k_win = ggml_pad_ext(gctx, k_win, 0, 0, 0, future_len, 0, 0, 0, 0);
-            v_win = ggml_pad_ext(gctx, v_win, 0, 0, 0, future_len, 0, 0, 0, 0);
-        }
-
-        // Attention of all P physical queries over the L-frame causal window;
-        // only the N real rows are copied out after the final layer.
         ggml_tensor * q3 = ggml_permute(gctx, q, 0, 2, 1, 3);                               // [hd, P, heads]
-        ggml_tensor * k3 = ggml_permute(gctx, ggml_reshape_3d(gctx, k_win, e_hd, e_kv_heads, L), 0, 2, 1, 3); // [hd, L, heads]
-        ggml_tensor * v3 = ggml_permute(gctx, ggml_reshape_3d(gctx, v_win, e_hd, e_kv_heads, L), 0, 2, 1, 3);
-        // Production default: fused flash attention. It is bit-exact across every
-        // feed-chunk plan because the driver's grid-aligned batching gives each frame
-        // a fixed causal-window shape (win_start, L) — without that, the Vulkan flash
-        // kernel's sensitivity to the masked-head shape would break feed-plan
-        // invariance. VOXTRAL_ENC_KV_MANUAL selects the non-fused reference attention
-        // (softmax(scale·QKᵀ+mask)·V), which is window-shape-invariant on its own.
         ggml_tensor * attn;
-        if (getenv("VOXTRAL_ENC_KV_MANUAL")) {
-            ggml_tensor * kq = ggml_mul_mat(gctx, k3, ggml_cont(gctx, q3));                 // [L, P, heads]
-            kq = ggml_soft_max_ext(gctx, kq, enc_mask, scale, 0.0f);
-            ggml_tensor * v_t = ggml_cont(gctx, ggml_transpose(gctx, v3));                  // [L, hd, heads]
-            attn = ggml_mul_mat(gctx, v_t, kq);                                             // [hd, P, heads]
-            attn = ggml_permute(gctx, attn, 0, 2, 1, 3);                                   // [hd, heads, P]
+        if (encoder_kv_uses_segmented_attention(P)) {
+            // Logical order is prefix-mask, old ring (one or two physical
+            // views), new rows, future-mask.  Concatenate only QK scores; K/V
+            // themselves remain fixed-size FP16 cache views.  The weighted V
+            // reductions are summed after splitting the common softmax back at
+            // the same segment boundaries.
+            struct attention_segment {
+                ggml_tensor * k = nullptr;
+                ggml_tensor * v = nullptr;
+                int32_t len = 0;
+            };
+            std::array<attention_segment, 5> segments;
+            int32_t n_segments = 0;
+            auto append_segment = [&](ggml_tensor * sk, ggml_tensor * sv, int32_t len) {
+                if (len > 0) segments[(size_t) n_segments++] = { sk, sv, len };
+            };
+
+            if (prefix_len > 0) {
+                GGML_ASSERT(prefix_len <= q_offset);
+                append_segment(
+                    ggml_view_2d(gctx, k_store, kv_dim, prefix_len, k_store->nb[1], 0),
+                    ggml_view_2d(gctx, v_store, kv_dim, prefix_len, v_store->nb[1], 0),
+                    prefix_len);
+            }
+            if (old_len > 0) {
+                const int32_t cap = VOXTRAL_ENC_KV_CAP;
+                const int32_t slot0 = (int32_t) (valid_old_start % cap);
+                const int32_t len0 = std::min(old_len, cap - slot0);
+                append_segment(
+                    ggml_view_2d(gctx, ring_k, kv_dim, len0, k_col,
+                        (size_t) i * k_layer_stride + (size_t) slot0 * k_col),
+                    ggml_view_2d(gctx, ring_v, kv_dim, len0, v_col,
+                        (size_t) i * v_layer_stride + (size_t) slot0 * v_col),
+                    len0);
+                const int32_t len1 = old_len - len0;
+                if (len1 > 0) {
+                    append_segment(
+                        ggml_view_2d(gctx, ring_k, kv_dim, len1, k_col,
+                            (size_t) i * k_layer_stride),
+                        ggml_view_2d(gctx, ring_v, kv_dim, len1, v_col,
+                            (size_t) i * v_layer_stride),
+                        len1);
+                }
+            }
+            append_segment(k_real, v_real, N);
+            if (future_len > 0) {
+                const int32_t future_col = q_offset + N;
+                GGML_ASSERT(future_col + future_len <= P);
+                append_segment(
+                    ggml_view_2d(gctx, k_store, kv_dim, future_len, k_store->nb[1],
+                        (size_t) future_col * k_store->nb[1]),
+                    ggml_view_2d(gctx, v_store, kv_dim, future_len, v_store->nb[1],
+                        (size_t) future_col * v_store->nb[1]),
+                    future_len);
+            }
+            int32_t logical_len = 0;
+            ggml_tensor * scores = nullptr;
+            ggml_tensor * q_cont = ggml_cont(gctx, q3);
+            for (int32_t s = 0; s < n_segments; ++s) {
+                const auto & seg = segments[(size_t) s];
+                ggml_tensor * k3 = ggml_permute(gctx,
+                    ggml_reshape_3d(gctx, seg.k, e_hd, e_kv_heads, seg.len), 0, 2, 1, 3);
+                ggml_tensor * part = ggml_mul_mat(gctx, k3, q_cont);
+                scores = scores ? ggml_concat(gctx, scores, part, 0) : part;
+                logical_len += seg.len;
+            }
+            GGML_ASSERT(logical_len == L && scores != nullptr);
+            ggml_tensor * probs = ggml_soft_max_ext(gctx, scores, enc_mask, scale, 0.0f);
+
+            ggml_tensor * weighted = nullptr;
+            int32_t prob_offset = 0;
+            for (int32_t s = 0; s < n_segments; ++s) {
+                const auto & seg = segments[(size_t) s];
+                ggml_tensor * weights = ggml_view_3d(gctx, probs, seg.len, P, e_heads,
+                    probs->nb[1], probs->nb[2], (size_t) prob_offset * probs->nb[0]);
+                ggml_tensor * v3 = ggml_permute(gctx,
+                    ggml_reshape_3d(gctx, seg.v, e_hd, e_kv_heads, seg.len), 0, 2, 1, 3);
+                ggml_tensor * v_t = ggml_cont(gctx, ggml_transpose(gctx, v3));
+                ggml_tensor * part = ggml_mul_mat(gctx, v_t, weights);
+                weighted = weighted ? ggml_add(gctx, weighted, part) : part;
+                prob_offset += seg.len;
+            }
+            attn = ggml_permute(gctx, weighted, 0, 2, 1, 3);
             attn = ggml_reshape_2d(gctx, ggml_cont(gctx, attn), e_heads * e_hd, P);
         } else {
+            // Throughput/reference family: preserve the proven fused flash graph.
+            ggml_tensor * k_win = k_real;
+            ggml_tensor * v_win = v_real;
+            if (old_len > 0) {
+                const int32_t cap = VOXTRAL_ENC_KV_CAP;
+                const int32_t os0 = (int32_t) (valid_old_start % cap);
+                const int32_t of0 = std::min(old_len, cap - os0);
+                ggml_tensor * k_old;
+                ggml_tensor * v_old;
+                if (of0 >= old_len) {
+                    k_old = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, old_len, k_col, (size_t) i * k_layer_stride + (size_t) os0 * k_col));
+                    v_old = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, old_len, v_col, (size_t) i * v_layer_stride + (size_t) os0 * v_col));
+                } else {
+                    const int32_t l1 = old_len - of0;
+                    ggml_tensor * k0 = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, of0, k_col, (size_t) i * k_layer_stride + (size_t) os0 * k_col));
+                    ggml_tensor * k1 = ggml_cont(gctx, ggml_view_2d(gctx, ring_k, kv_dim, l1, k_col, (size_t) i * k_layer_stride));
+                    ggml_tensor * v0 = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, of0, v_col, (size_t) i * v_layer_stride + (size_t) os0 * v_col));
+                    ggml_tensor * v1 = ggml_cont(gctx, ggml_view_2d(gctx, ring_v, kv_dim, l1, v_col, (size_t) i * v_layer_stride));
+                    k_old = ggml_concat(gctx, k0, k1, 1);
+                    v_old = ggml_concat(gctx, v0, v1, 1);
+                }
+                k_win = ggml_concat(gctx, k_old, k_win, 1);
+                v_win = ggml_concat(gctx, v_old, v_win, 1);
+                if (i == 0 && out_materialized_frames) *out_materialized_frames += old_len;
+            }
+            if (ring_k->type == GGML_TYPE_F16) {
+                // PAD is F32-only in the pinned backend. Fully-masked headroom
+                // can use same-typed dummy block columns without changing the
+                // fused attention result.
+                if (prefix_len > 0) {
+                    GGML_ASSERT(prefix_len <= q_offset);
+                    k_win = ggml_concat(gctx,
+                        ggml_view_2d(gctx, k_store, kv_dim, prefix_len, k_store->nb[1], 0),
+                        k_win, 1);
+                    v_win = ggml_concat(gctx,
+                        ggml_view_2d(gctx, v_store, kv_dim, prefix_len, v_store->nb[1], 0),
+                        v_win, 1);
+                }
+                if (future_len > 0) {
+                    const int32_t future_col = q_offset + N;
+                    k_win = ggml_concat(gctx, k_win,
+                        ggml_view_2d(gctx, k_store, kv_dim, future_len, k_store->nb[1],
+                            (size_t) future_col * k_store->nb[1]), 1);
+                    v_win = ggml_concat(gctx, v_win,
+                        ggml_view_2d(gctx, v_store, kv_dim, future_len, v_store->nb[1],
+                            (size_t) future_col * v_store->nb[1]), 1);
+                }
+            } else {
+                if (prefix_len > 0) {
+                    k_win = ggml_pad_ext(gctx, k_win, 0, 0, prefix_len, 0, 0, 0, 0, 0);
+                    v_win = ggml_pad_ext(gctx, v_win, 0, 0, prefix_len, 0, 0, 0, 0, 0);
+                }
+                if (future_len > 0) {
+                    k_win = ggml_pad_ext(gctx, k_win, 0, 0, 0, future_len, 0, 0, 0, 0);
+                    v_win = ggml_pad_ext(gctx, v_win, 0, 0, 0, future_len, 0, 0, 0, 0);
+                }
+            }
+            ggml_tensor * k3 = ggml_permute(gctx,
+                ggml_reshape_3d(gctx, k_win, e_hd, e_kv_heads, L), 0, 2, 1, 3);
+            ggml_tensor * v3 = ggml_permute(gctx,
+                ggml_reshape_3d(gctx, v_win, e_hd, e_kv_heads, L), 0, 2, 1, 3);
             ggml_tensor * mask_f16 = ggml_cast(gctx, enc_mask, GGML_TYPE_F16);
             attn = ggml_flash_attn_ext(gctx, q3, k3, v3, mask_f16, scale, 0.0f, 0.0f);
             ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
@@ -1820,6 +2327,138 @@ static ggml_cgraph * build_encoder_kv_graph(
     // (see copy_chunk_to_enc_out_ring). Folding a second cpy from `x` into this
     // graph is unsafe: ggml_backend_sched can reuse x's buffer after the first
     // consumer, corrupting the ring copy.
+    return gf;
+}
+
+// Fixed 4-row production encoder graph. Absolute positions, physical KV slots,
+// output-ring slots and the causal mask are inputs; graph topology is invariant
+// for every steady 80 ms audio quantum. Attention reads the 878-slot physical
+// ring directly and masks the exact 750-frame logical window, so no K/V gather,
+// concat or rollover copy is required.
+static ggml_cgraph * build_encoder_steady_graph(
+    voxtral_context * ctx, ggml_tensor * ring_k, ggml_tensor * ring_v,
+    ggml_context * gctx) {
+    constexpr int32_t P = 4;
+    constexpr int32_t conv_len = 2 * P + 4;
+    voxtral_model * model = ctx->model;
+    const auto & hp = model->hp;
+    const int32_t e_heads = hp.enc_heads;
+    const int32_t e_kv_heads = hp.enc_kv_heads;
+    const int32_t e_hd = hp.enc_head_dim;
+    const int32_t kv_dim = e_kv_heads * e_hd;
+    const int32_t cap = VOXTRAL_ENC_KV_CAP;
+    const float scale = 1.0f / sqrtf((float) e_hd);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(
+        gctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
+    ggml_tensor * mel_input = ggml_new_tensor_3d(
+        gctx, GGML_TYPE_F32, conv_len, VOXTRAL_NUM_MEL_BINS, 1);
+    ggml_set_name(mel_input, "mel_input");
+    ggml_backend_sched_set_tensor_backend(
+        ctx->sched_encoder_steady, mel_input, ctx->backend);
+    int32_t conv0_len = 0;
+    ggml_tensor * conv0 = causal_conv1d_graph(
+        gctx, mel_input, conv_len, model->enc_conv0_weight,
+        model->enc_conv0_bias, hp.enc_dim, 3, 1, conv0_len, false);
+    conv0 = ggml_gelu_erf(gctx, conv0);
+    int32_t conv1_len = 0;
+    ggml_tensor * conv1 = causal_conv1d_graph(
+        gctx, conv0, conv0_len, model->enc_conv1_weight,
+        model->enc_conv1_bias, hp.enc_dim, 3, 2, conv1_len, false);
+    conv1 = ggml_gelu_erf(gctx, conv1);
+    ggml_tensor * x_local = ggml_view_3d(
+        gctx, conv1, P, hp.enc_dim, 1, conv1->nb[1], conv1->nb[2],
+        (size_t) 2 * conv1->nb[0]);
+    ggml_tensor * x = ggml_cont(
+        gctx, ggml_permute(gctx, x_local, 1, 0, 2, 3));
+    x = ggml_reshape_2d(gctx, x, hp.enc_dim, P);
+
+    ggml_tensor * positions = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, P);
+    ggml_set_name(positions, "enc_positions");
+    ggml_backend_sched_set_tensor_backend(
+        ctx->sched_encoder_steady, positions, ctx->backend);
+    ggml_tensor * kv_rows = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, P);
+    ggml_set_name(kv_rows, "enc_kv_rows");
+    ggml_backend_sched_set_tensor_backend(
+        ctx->sched_encoder_steady, kv_rows, ctx->backend);
+    ggml_tensor * output_rows = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, P);
+    ggml_set_name(output_rows, "enc_output_rows");
+    ggml_backend_sched_set_tensor_backend(
+        ctx->sched_encoder_steady, output_rows, ctx->backend);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        gctx, GGML_TYPE_F32, cap, P);
+    ggml_set_name(mask, "enc_kv_mask");
+    ggml_backend_sched_set_tensor_backend(
+        ctx->sched_encoder_steady, mask, ctx->backend);
+
+    for (int32_t layer = 0; layer < hp.enc_layers; ++layer) {
+        auto & L = model->enc_layers[layer];
+        ggml_tensor * residual = x;
+        ggml_tensor * norm = enc_apply_norm(
+            gctx, x, L.attn_norm_weight, L.attn_norm_bias,
+            hp.enc_norm_eps, false);
+        ggml_tensor * q = ggml_add(
+            gctx, ggml_mul_mat(gctx, L.attn_q_weight, norm), L.attn_q_bias);
+        ggml_tensor * k = ggml_mul_mat(gctx, L.attn_k_weight, norm);
+        ggml_tensor * v = ggml_add(
+            gctx, ggml_mul_mat(gctx, L.attn_v_weight, norm), L.attn_v_bias);
+        q = ggml_reshape_3d(gctx, q, e_hd, e_heads, P);
+        k = ggml_reshape_3d(gctx, k, e_hd, e_kv_heads, P);
+        q = ggml_rope_ext(gctx, q, positions, nullptr,
+            e_hd, 0, 0, hp.enc_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(gctx, k, positions, nullptr,
+            e_hd, 0, 0, hp.enc_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * k_new = ggml_cont(
+            gctx, ggml_reshape_2d(gctx, k, kv_dim, P));
+        ggml_tensor * v_new = ggml_reshape_2d(gctx, v, kv_dim, P);
+        ggml_tensor * k_layer = ggml_view_2d(
+            gctx, ring_k, kv_dim, cap, ring_k->nb[1],
+            (size_t) layer * ring_k->nb[2]);
+        ggml_tensor * v_layer = ggml_view_2d(
+            gctx, ring_v, kv_dim, cap, ring_v->nb[1],
+            (size_t) layer * ring_v->nb[2]);
+        ggml_tensor * k_cache = ggml_set_rows(
+            gctx, k_layer, k_new, kv_rows);
+        ggml_tensor * v_cache = ggml_set_rows(
+            gctx, v_layer, v_new, kv_rows);
+
+        ggml_tensor * q3 = ggml_permute(gctx, q, 0, 2, 1, 3);
+        ggml_tensor * k3 = ggml_permute(
+            gctx, ggml_reshape_3d(
+                gctx, k_cache, e_hd, e_kv_heads, cap), 0, 2, 1, 3);
+        ggml_tensor * scores = ggml_mul_mat(gctx, k3, ggml_cont(gctx, q3));
+        ggml_tensor * probs = ggml_soft_max_ext(
+            gctx, scores, mask, scale, 0.0f);
+        ggml_tensor * v3 = ggml_permute(
+            gctx, ggml_reshape_3d(
+                gctx, v_cache, e_hd, e_kv_heads, cap), 0, 2, 1, 3);
+        ggml_tensor * weighted = ggml_mul_mat(
+            gctx, ggml_cont(gctx, ggml_transpose(gctx, v3)), probs);
+        ggml_tensor * attn = ggml_permute(gctx, weighted, 0, 2, 1, 3);
+        attn = ggml_reshape_2d(
+            gctx, ggml_cont(gctx, attn), e_heads * e_hd, P);
+        ggml_tensor * projected = ggml_add(
+            gctx, ggml_mul_mat(gctx, L.attn_o_weight, attn), L.attn_o_bias);
+        x = ggml_add(gctx, residual, projected);
+
+        residual = x;
+        norm = enc_apply_norm(
+            gctx, x, L.ffn_norm_weight, L.ffn_norm_bias,
+            hp.enc_norm_eps, false);
+        ggml_tensor * gate = ggml_silu(
+            gctx, ggml_mul_mat(gctx, L.ffn_w1_weight, norm));
+        ggml_tensor * up = ggml_mul_mat(gctx, L.ffn_w3_weight, norm);
+        ggml_tensor * ffn = ggml_mul_mat(
+            gctx, L.ffn_w2_weight, ggml_mul(gctx, gate, up));
+        if (L.ffn_w2_bias) ffn = ggml_add(gctx, ffn, L.ffn_w2_bias);
+        x = ggml_add(gctx, residual, ffn);
+    }
+    x = enc_apply_norm(
+        gctx, x, model->enc_norm_weight, model->enc_norm_bias,
+        hp.enc_norm_eps, false);
+    ggml_tensor * stored = ggml_set_rows(
+        gctx, ctx->enc_out_ring, x, output_rows);
+    ggml_build_forward_expand(gf, stored);
     return gf;
 }
 
@@ -1899,6 +2538,39 @@ static ggml_cgraph * build_adapter_ring_graph(voxtral_context * ctx, ggml_contex
     return gf;
 }
 
+static ggml_cgraph * build_adapter_ring_graph_reusable(
+    voxtral_context * ctx, ggml_context * gctx, int32_t n_groups) {
+    voxtral_model * model = ctx->model;
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+
+    ggml_tensor * encoder_rows = ggml_new_tensor_1d(
+        gctx, GGML_TYPE_I32,
+        n_groups * VOXTRAL_DOWNSAMPLE_FACTOR);
+    ggml_set_name(encoder_rows, "adapter_encoder_rows");
+    ggml_backend_sched_set_tensor_backend(
+        n_groups == 1 ? ctx->sched_adapter_group : ctx->sched_adapter_batch,
+        encoder_rows, ctx->backend);
+    ggml_tensor * audio_rows = ggml_new_tensor_1d(
+        gctx, GGML_TYPE_I32, n_groups);
+    ggml_set_name(audio_rows, "adapter_audio_rows");
+    ggml_backend_sched_set_tensor_backend(
+        n_groups == 1 ? ctx->sched_adapter_group : ctx->sched_adapter_batch,
+        audio_rows, ctx->backend);
+
+    ggml_tensor * enc_out = ggml_get_rows(
+        gctx, ctx->enc_out_ring, encoder_rows);
+    ggml_tensor * x = ggml_reshape_2d(
+        gctx, enc_out,
+        VOXTRAL_ENC_DIM * VOXTRAL_DOWNSAMPLE_FACTOR, n_groups);
+    x = ggml_mul_mat(gctx, model->adapter_0_weight, x);
+    x = ggml_gelu_erf(gctx, x);
+    x = ggml_mul_mat(gctx, model->adapter_2_weight, x);
+    ggml_tensor * stored = ggml_set_rows(
+        gctx, ctx->audio_emb_ring, x, audio_rows);
+    ggml_build_forward_expand(gf, stored);
+    return gf;
+}
+
 // ============================================================================
 // Graph Building: Decoder (common layer forward)
 // ============================================================================
@@ -1915,8 +2587,9 @@ static ggml_tensor * build_decoder_layer(
     ggml_tensor  * time_emb,   // [dec_dim]
     int32_t layer_idx,
     int32_t n_tokens,
-    int32_t kv_offset,                // starting position in KV cache
-    ggml_tensor  * attn_mask)  // [n_kv, n_tokens] or nullptr
+    const voxtral_decoder_kv_plan_t & kv_plan,
+    ggml_tensor  * attn_mask,  // [n_kv, n_tokens] or nullptr
+    ggml_tensor  * dynamic_kv_slot = nullptr) // [1] I32 for reusable step graph
 {
     voxtral_model * model = ctx->model;
     const auto & hp = model->hp;
@@ -1953,57 +2626,184 @@ static ggml_tensor * build_decoder_layer(
     q = ggml_cont(gctx, ggml_reshape_2d(gctx, q, n_heads * head_dim, n_tokens));
     k = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, n_tokens));
 
-    // Store K, V in KV cache at positions [kv_offset .. kv_offset+n_tokens-1]
-    // KV cache layout: [kv_dim, dec_window, dec_layers]
-    // Layer slice: offset = layer_idx * kv_dim * dec_window * sizeof(float)
-    {
-        ggml_tensor * k_cache_slice = ggml_view_2d(gctx, ctx->kv_self_k,
-            kv_dim, n_tokens,
-            ctx->kv_self_k->nb[1],
-            layer_idx * ctx->kv_self_k->nb[2] + (size_t)kv_offset * ctx->kv_self_k->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(gctx, k, k_cache_slice));
-
-        ggml_tensor * v_cache_slice = ggml_view_2d(gctx, ctx->kv_self_v,
-            kv_dim, n_tokens,
-            ctx->kv_self_v->nb[1],
-            layer_idx * ctx->kv_self_v->nb[2] + (size_t)kv_offset * ctx->kv_self_v->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(gctx, v, v_cache_slice));
+    // Store only the newly projected K/V columns at absolute_position % capacity.
+    // A write can straddle slot zero, so source and destination are split into at
+    // most two views.  This is the only cache traffic at rollover.
+    ggml_tensor * dynamic_k_layer = nullptr;
+    ggml_tensor * dynamic_v_layer = nullptr;
+    if (dynamic_kv_slot) {
+        assert(n_tokens == 1);
+        const int32_t capacity = ctx->decoder_kv_configured_capacity;
+        ggml_tensor * k_layer_view = ggml_view_2d(
+            gctx, ctx->kv_self_k, kv_dim, capacity, ctx->kv_self_k->nb[1],
+            (size_t) layer_idx * ctx->kv_self_k->nb[2]);
+        ggml_tensor * v_layer_view = ggml_view_2d(
+            gctx, ctx->kv_self_v, kv_dim, capacity, ctx->kv_self_v->nb[1],
+            (size_t) layer_idx * ctx->kv_self_v->nb[2]);
+        // SET_ROWS converts the projected F32 row directly into the FP16 cache
+        // and returns a dependency-carrying view of the full layer cache.
+        dynamic_k_layer = ggml_set_rows(gctx, k_layer_view, k, dynamic_kv_slot);
+        dynamic_v_layer = ggml_set_rows(gctx, v_layer_view, v, dynamic_kv_slot);
+    } else {
+        int32_t src_col = 0;
+        for (int32_t s = 0; s < kv_plan.write_nseg; ++s) {
+            const int32_t slot = kv_plan.write_seg[s].slot;
+            const int32_t len  = kv_plan.write_seg[s].len;
+            ggml_tensor * k_src = ggml_view_2d(gctx, k, kv_dim, len, k->nb[1],
+                                                (size_t) src_col * k->nb[1]);
+            ggml_tensor * v_src = ggml_view_2d(gctx, v, kv_dim, len, v->nb[1],
+                                                (size_t) src_col * v->nb[1]);
+            ggml_tensor * k_dst = ggml_view_2d(gctx, ctx->kv_self_k, kv_dim, len,
+                ctx->kv_self_k->nb[1], (size_t) layer_idx * ctx->kv_self_k->nb[2] +
+                (size_t) slot * ctx->kv_self_k->nb[1]);
+            ggml_tensor * v_dst = ggml_view_2d(gctx, ctx->kv_self_v, kv_dim, len,
+                ctx->kv_self_v->nb[1], (size_t) layer_idx * ctx->kv_self_v->nb[2] +
+                (size_t) slot * ctx->kv_self_v->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(gctx, k_src, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(gctx, v_src, v_dst));
+            src_col += len;
+        }
     }
 
-    // Read full KV from cache: [kv_dim, n_kv] where n_kv = kv_offset + n_tokens
-    const int32_t n_kv = kv_offset + n_tokens;
-    ggml_tensor * k_full = ggml_view_2d(gctx, ctx->kv_self_k,
-        kv_dim, n_kv,
-        ctx->kv_self_k->nb[1],
-        layer_idx * ctx->kv_self_k->nb[2]); // [kv_dim, n_kv]
-    ggml_tensor * v_full = ggml_view_2d(gctx, ctx->kv_self_v,
-        kv_dim, n_kv,
-        ctx->kv_self_v->nb[1],
-        layer_idx * ctx->kv_self_v->nb[2]); // [kv_dim, n_kv]
+    const int32_t n_kv = (int32_t) kv_plan.used_after;
 
     // Flash attention with GQA
     // Q: [n_heads*head_dim, n_tokens] -> [head_dim, n_heads, n_tokens] -> [head_dim, n_tokens, n_heads]
     ggml_tensor * q3 = ggml_reshape_3d(gctx, q, head_dim, n_heads, n_tokens);
     q3 = ggml_permute(gctx, q3, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads]
 
-    // K: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
-    ggml_tensor * k3 = ggml_reshape_3d(gctx, k_full, head_dim, n_kv_heads, n_kv);
-    k3 = ggml_permute(gctx, k3, 0, 2, 1, 3); // [head_dim, n_kv, n_kv_heads]
-
-    // V: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
-    ggml_tensor * v3 = ggml_reshape_3d(gctx, v_full, head_dim, n_kv_heads, n_kv);
-    v3 = ggml_permute(gctx, v3, 0, 2, 1, 3); // [head_dim, n_kv, n_kv_heads]
-
     const float scale = 1.0f / sqrtf((float) head_dim);
+    const size_t k_layer = (size_t) layer_idx * ctx->kv_self_k->nb[2];
+    const size_t v_layer = (size_t) layer_idx * ctx->kv_self_v->nb[2];
 
-    // ggml_flash_attn_ext fuses Q@K^T, scale, mask, softmax, @V in one op
-    // GQA broadcast is built-in (n_heads % n_kv_heads == 0)
-    // Mask is cast to F16 inside the graph if provided
-    ggml_tensor * attn_mask_f16 = attn_mask ? ggml_cast(gctx, attn_mask, GGML_TYPE_F16) : nullptr;
-    ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask_f16, scale, 0.0f, 0.0f);
-    // Output: [head_dim, n_heads, n_tokens] (already permuted by flash_attn_ext)
-    attn_out = ggml_cont(gctx, attn_out);
-    attn_out = ggml_reshape_2d(gctx, attn_out, n_heads * head_dim, n_tokens);
+    auto cache_view = [&](ggml_tensor * cache, size_t layer_offset,
+                          const voxtral_decoder_kv_seg & seg) {
+        return ggml_view_2d(gctx, cache, kv_dim, seg.len, cache->nb[1],
+                            layer_offset + (size_t) seg.slot * cache->nb[1]);
+    };
+    auto key_3d = [&](const voxtral_decoder_kv_seg & seg) {
+        ggml_tensor * view = cache_view(ctx->kv_self_k, k_layer, seg);
+        return ggml_permute(gctx,
+            ggml_reshape_3d(gctx, view, head_dim, n_kv_heads, seg.len), 0, 2, 1, 3);
+    };
+    auto value_3d = [&](const voxtral_decoder_kv_seg & seg) {
+        ggml_tensor * view = cache_view(ctx->kv_self_v, v_layer, seg);
+        return ggml_permute(gctx,
+            ggml_reshape_3d(gctx, view, head_dim, n_kv_heads, seg.len), 0, 2, 1, 3);
+    };
+
+    ggml_tensor * attn_out = nullptr;
+    const char * ring_attention_mode = std::getenv("VOXTRAL_DECODER_RING_ATTENTION");
+    const bool logical_concat_oracle = ring_attention_mode &&
+        std::strcmp(ring_attention_mode, "logical") == 0;
+    const bool logical_manual_oracle = ring_attention_mode &&
+        std::strcmp(ring_attention_mode, "manual") == 0;
+    if (dynamic_kv_slot) {
+        const int32_t capacity = ctx->decoder_kv_configured_capacity;
+        ggml_tensor * k3 = ggml_permute(gctx,
+            ggml_reshape_3d(gctx, dynamic_k_layer,
+                            head_dim, n_kv_heads, capacity), 0, 2, 1, 3);
+        ggml_tensor * v3 = ggml_permute(gctx,
+            ggml_reshape_3d(gctx, dynamic_v_layer,
+                            head_dim, n_kv_heads, capacity), 0, 2, 1, 3);
+        ggml_tensor * attn_mask_f16 = attn_mask
+            ? ggml_cast(gctx, attn_mask, GGML_TYPE_F16) : nullptr;
+        attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask_f16,
+                                       scale, 0.0f, 0.0f);
+        attn_out = ggml_reshape_2d(gctx, ggml_cont(gctx, attn_out),
+                                   n_heads * head_dim, 1);
+    } else if (kv_plan.read_nseg == 1) {
+        // The common pre-wrap path is byte-for-byte the old fused attention: one
+        // logically ordered contiguous cache view and the same reduction shape.
+        ggml_tensor * k3 = key_3d(kv_plan.read_seg[0]);
+        ggml_tensor * v3 = value_3d(kv_plan.read_seg[0]);
+        ggml_tensor * attn_mask_f16 = attn_mask
+            ? ggml_cast(gctx, attn_mask, GGML_TYPE_F16) : nullptr;
+        attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask_f16,
+                                       scale, 0.0f, 0.0f);
+        attn_out = ggml_reshape_2d(gctx, ggml_cont(gctx, attn_out),
+                                   n_heads * head_dim, n_tokens);
+    } else if (logical_concat_oracle) {
+        // Test-only bounded reference: materialize the reduced-capacity logical
+        // window and feed it through the SAME fused attention kernel. This is
+        // intentionally unavailable at the 8192-slot production capacity; it
+        // exists only to validate physical permutation/eviction semantics
+        // without conflating ordering with a different manual attention kernel.
+        assert(ctx->decoder_kv_configured_capacity < VOXTRAL_DEC_WINDOW &&
+               kv_plan.read_nseg == 2 && n_tokens == 1 && attn_mask == nullptr);
+        ggml_tensor * k_logical = ggml_concat(
+            gctx,
+            cache_view(ctx->kv_self_k, k_layer, kv_plan.read_seg[0]),
+            cache_view(ctx->kv_self_k, k_layer, kv_plan.read_seg[1]), 1);
+        ggml_tensor * v_logical = ggml_concat(
+            gctx,
+            cache_view(ctx->kv_self_v, v_layer, kv_plan.read_seg[0]),
+            cache_view(ctx->kv_self_v, v_layer, kv_plan.read_seg[1]), 1);
+        ggml_tensor * k3 = ggml_permute(gctx,
+            ggml_reshape_3d(gctx, k_logical, head_dim, n_kv_heads, n_kv),
+            0, 2, 1, 3);
+        ggml_tensor * v3 = ggml_permute(gctx,
+            ggml_reshape_3d(gctx, v_logical, head_dim, n_kv_heads, n_kv),
+            0, 2, 1, 3);
+        attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, nullptr,
+                                       scale, 0.0f, 0.0f);
+        attn_out = ggml_reshape_2d(gctx, ggml_cont(gctx, attn_out),
+                                   n_heads * head_dim, 1);
+    } else if (!logical_manual_oracle) {
+        // Once full, the physical ring [0, capacity) contains exactly the same
+        // (K,V) pairs as the logical [oldest, newest] window, only cyclically
+        // permuted. Single-query attention has no position-dependent mask and is
+        // permutation-equivariant when K and V are permuted together; absolute
+        // RoPE is already embedded in every K. Therefore one full physical view
+        // is wrap-aware without materialising or moving any cache bytes, and it
+        // retains the fast fused Vulkan attention path. The test-only concat
+        // branch above keeps oldest-to-newest order with the same fused kernel.
+        assert(kv_plan.read_nseg == 2 && n_tokens == 1 && attn_mask == nullptr &&
+               kv_plan.used_after == ctx->decoder_kv.capacity);
+        const voxtral_decoder_kv_seg physical = {
+            /*slot=*/0, /*len=*/(int32_t) kv_plan.used_after
+        };
+        ggml_tensor * k3 = key_3d(physical);
+        ggml_tensor * v3 = value_3d(physical);
+        attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, nullptr,
+                                       scale, 0.0f, 0.0f);
+        attn_out = ggml_reshape_2d(gctx, ggml_cont(gctx, attn_out),
+                                   n_heads * head_dim, 1);
+    } else {
+        // Optional manual diagnostic: concatenate only attention SCORES
+        // (kilobytes), never
+        // the multi-gigabyte K/V cache.  Softmax sees [oldest..newest] in logical
+        // order; its weights are split back across the two V views and reduced.
+        // Decoder rollover occurs only on single-token steps, so no causal mask is
+        // required here.  Absolute RoPE positions are already embedded in K/Q.
+        assert(kv_plan.read_nseg == 2 && n_tokens == 1 && attn_mask == nullptr);
+        ggml_tensor * q_cont = ggml_cont(gctx, q3);
+        ggml_tensor * k0 = key_3d(kv_plan.read_seg[0]);
+        ggml_tensor * k1 = key_3d(kv_plan.read_seg[1]);
+        ggml_tensor * score0 = ggml_mul_mat(gctx, k0, q_cont);
+        ggml_tensor * score1 = ggml_mul_mat(gctx, k1, q_cont);
+        ggml_tensor * scores = ggml_concat(gctx, score0, score1, 0);
+        ggml_tensor * probs = ggml_soft_max_ext(gctx, scores, nullptr, scale, 0.0f);
+
+        const int32_t n0 = kv_plan.read_seg[0].len;
+        const int32_t n1 = kv_plan.read_seg[1].len;
+        ggml_tensor * p0 = ggml_view_3d(gctx, probs, n0, 1, n_heads,
+                                        probs->nb[1], probs->nb[2], 0);
+        ggml_tensor * p1 = ggml_view_3d(gctx, probs, n1, 1, n_heads,
+                                        probs->nb[1], probs->nb[2],
+                                        (size_t) n0 * probs->nb[0]);
+        auto weighted_value = [&](const voxtral_decoder_kv_seg & seg, ggml_tensor * weights) {
+            ggml_tensor * v3 = value_3d(seg);
+            ggml_tensor * vt = ggml_cont(gctx, ggml_transpose(gctx, v3));
+            return ggml_mul_mat(gctx, vt, weights); // [head_dim, 1, n_heads]
+        };
+        ggml_tensor * out0 = weighted_value(kv_plan.read_seg[0], p0);
+        ggml_tensor * out1 = weighted_value(kv_plan.read_seg[1], p1);
+        ggml_tensor * summed = ggml_add(gctx, out0, out1);
+        summed = ggml_permute(gctx, summed, 0, 2, 1, 3);
+        attn_out = ggml_reshape_2d(gctx, ggml_cont(gctx, summed),
+                                   n_heads * head_dim, 1);
+    }
 
     // Output projection + residual
     ggml_tensor * attn_proj = ggml_mul_mat(gctx, L.attn_o_weight, attn_out); // [dec_dim, n_tokens]
@@ -2048,6 +2848,10 @@ static ggml_cgraph * build_decoder_prefill_graph(
     int32_t               n_tokens)  // number of prompt tokens
 {
     voxtral_model * model = ctx->model;
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv,
+                                 ctx->decoder_kv.next_absolute_position,
+                                 n_tokens, kv_plan)) return nullptr;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
 
     // Token IDs input: [n_tokens] int32
@@ -2089,7 +2893,7 @@ static ggml_cgraph * build_decoder_prefill_graph(
     // Decoder layers
     for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         x = build_decoder_layer(ctx, gctx, gf, x, positions, time_emb,
-            i, n_tokens, /*kv_offset=*/0, causal_mask);
+            i, n_tokens, kv_plan, causal_mask);
     }
 
     // Final norm
@@ -2123,6 +2927,9 @@ static void emit_logits_argmax(voxtral_context * ctx, ggml_context * gctx, ggml_
 // Graph Building: Decoder Step (single token)
 // ============================================================================
 
+static ggml_context * init_graph_ctx(std::vector<uint8_t> & buf,
+                                     int32_t graph_mult);
+
 static ggml_cgraph * build_decoder_step_graph(
     voxtral_context     * ctx,
     ggml_context * gctx,
@@ -2130,9 +2937,9 @@ static ggml_cgraph * build_decoder_step_graph(
     int32_t               audio_pos)   // position in audio embeddings (may differ)
 {
     voxtral_model * model = ctx->model;
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv, position, 1, kv_plan)) return nullptr;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
-
-    const int32_t kv_used = ctx->kv_used;  // tokens already in KV cache
 
     // Token ID input: [1] int32
     ggml_tensor * token_id = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
@@ -2166,7 +2973,7 @@ static ggml_cgraph * build_decoder_step_graph(
     // Decoder layers (no mask needed for single token - all KV positions are valid)
     for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         x = build_decoder_layer(ctx, gctx, gf, x, pos_tensor, time_emb,
-            i, 1, /*kv_offset=*/kv_used, /*attn_mask=*/nullptr);
+            i, 1, kv_plan, /*attn_mask=*/nullptr);
     }
 
     // Final norm
@@ -2175,9 +2982,125 @@ static ggml_cgraph * build_decoder_step_graph(
 
     // Logits (tied to token embeddings) + on-device argmax.
     ggml_tensor * x_flat = ggml_reshape_1d(gctx, x, VOXTRAL_DEC_DIM); // [dec_dim]
+    if (ctx->capture_decoder_diagnostics) {
+        ggml_build_forward_expand(gf,
+            ggml_cpy(gctx, x_flat, ctx->decoder_hidden_diagnostic));
+    }
     emit_logits_argmax(ctx, gctx, gf, x_flat, model->tok_embeddings_weight);
 
     return gf;
+}
+
+// Fixed-topology production step graph. Every dynamic address is supplied as a
+// small input tensor, so the graph can be allocated once and submitted for the
+// lifetime of the context. The fixed physical KV view is masked until the cache
+// fills; after rollover it contains the exact sliding window as a cyclic
+// permutation of paired K/V rows.
+static ggml_cgraph * build_decoder_step_graph_reusable(
+    voxtral_context * ctx, ggml_context * gctx, bool full_cache) {
+    voxtral_model * model = ctx->model;
+    const int32_t capacity = ctx->decoder_kv_configured_capacity;
+    ggml_cgraph * gf = ggml_new_graph_custom(
+        gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
+
+    ggml_tensor * token_id = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ggml_set_name(token_id, "token_id");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, token_id, ctx->backend);
+    ggml_tensor * position = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ggml_set_name(position, "position");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, position, ctx->backend);
+    ggml_tensor * time_emb = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
+    ggml_set_name(time_emb, "time_emb");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, time_emb, ctx->backend);
+    ggml_tensor * kv_slot = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ggml_set_name(kv_slot, "decoder_kv_slot");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, kv_slot, ctx->backend);
+    ggml_tensor * audio_slot = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ggml_set_name(audio_slot, "decoder_audio_slot");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, audio_slot, ctx->backend);
+    ggml_tensor * kv_mask = nullptr;
+    if (!full_cache) {
+        kv_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, capacity, 1);
+        ggml_set_name(kv_mask, "decoder_kv_mask");
+        ggml_backend_sched_set_tensor_backend(
+            ctx->sched_dec_step, kv_mask, ctx->backend);
+    }
+
+    ggml_tensor * tok_emb = ggml_get_rows(
+        gctx, model->tok_embeddings_weight, token_id);
+    ggml_tensor * audio_emb = ggml_get_rows(
+        gctx, ctx->audio_emb_ring, audio_slot);
+    ggml_tensor * x = ggml_add(gctx, tok_emb, audio_emb);
+
+    // The dynamic-slot branch of build_decoder_layer does not consume physical
+    // segments from the plan; retain a valid shape object for the shared API.
+    voxtral_decoder_kv_plan_t static_plan{};
+    static_plan.used_after = capacity;
+    static_plan.read_nseg = 1;
+    static_plan.read_seg[0] = {0, capacity};
+    for (int32_t i = 0; i < model->hp.dec_layers; ++i) {
+        x = build_decoder_layer(ctx, gctx, gf, x, position, time_emb,
+            i, 1, static_plan, kv_mask, kv_slot);
+    }
+
+    x = ggml_rms_norm(gctx, x, model->hp.dec_norm_eps);
+    x = ggml_mul(gctx, x, model->dec_norm_weight);
+    ggml_tensor * x_flat = ggml_reshape_1d(gctx, x, VOXTRAL_DEC_DIM);
+    if (ctx->capture_decoder_diagnostics) {
+        ggml_build_forward_expand(gf,
+            ggml_cpy(gctx, x_flat, ctx->decoder_hidden_diagnostic));
+    }
+    emit_logits_argmax(ctx, gctx, gf, x_flat, model->tok_embeddings_weight);
+    return gf;
+}
+
+static bool ensure_decoder_step_graph(voxtral_context * ctx, bool full_cache) {
+    if (ctx->decoder_step_graph && ctx->decoder_step_graph_allocated &&
+        ctx->decoder_step_graph_full == full_cache) {
+        return true;
+    }
+
+    // The growing cache needs a mask; the full sliding window must use the
+    // unmasked Flash Attention topology used by the bounded physical/logical
+    // reference graphs. Keeping an all-zero mask after the cache fills is not
+    // numerically equivalent on Vulkan: it selects a different shader and can
+    // change a boundary top-1 token. This is one bounded transition per stream,
+    // never a rebuild per decoder step.
+    ggml_backend_sched_reset(ctx->sched_dec_step);
+    if (ctx->decoder_step_graph_ctx) {
+        ggml_free(ctx->decoder_step_graph_ctx);
+        ctx->decoder_step_graph_ctx = nullptr;
+    }
+    ctx->decoder_step_graph = nullptr;
+    ctx->decoder_step_graph_allocated = false;
+    ctx->decoder_step_graph_meta.clear();
+
+    const auto build_start = std::chrono::steady_clock::now();
+    ctx->decoder_step_graph_ctx = init_graph_ctx(ctx->decoder_step_graph_meta, 4);
+    if (!ctx->decoder_step_graph_ctx) return false;
+    ctx->decoder_step_graph = build_decoder_step_graph_reusable(
+        ctx, ctx->decoder_step_graph_ctx, full_cache);
+    if (!ctx->decoder_step_graph) return false;
+    voxtral_context_profile_record_internal(
+        ctx, voxtral_profile_stage::decoder_step_graph_build,
+        elapsed_ms(build_start));
+
+    ggml_backend_sched_reset(ctx->sched_dec_step);
+    voxtral_context_profile_note_allocation_internal(
+        ctx, voxtral_profile_stage::decoder_step_graph_execute);
+    if (!ggml_backend_sched_alloc_graph(
+            ctx->sched_dec_step, ctx->decoder_step_graph)) {
+        LOG_ERR(ctx, "decoder step: reusable graph allocation failed");
+        return false;
+    }
+    ctx->decoder_step_graph_allocated = true;
+    ctx->decoder_step_graph_full = full_cache;
+    if (!full_cache) {
+        ctx->decoder_step_mask.assign(
+            (size_t) ctx->decoder_kv_configured_capacity, -INFINITY);
+    }
+    ctx->decoder_step_mask_valid = -1;
+    return true;
 }
 
 // ============================================================================
@@ -2209,6 +3132,10 @@ static ggml_cgraph * build_offline_prefill_graph(
     voxtral_model * model = ctx->model;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
     const int32_t n_tokens = n_prefix + n_audio + n_suffix;
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv,
+                                 ctx->decoder_kv.next_absolute_position,
+                                 n_tokens, kv_plan)) return nullptr;
 
     ggml_tensor * prefix_ids = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_prefix);
     ggml_set_name(prefix_ids, "prefix_ids");
@@ -2235,7 +3162,7 @@ static ggml_cgraph * build_offline_prefill_graph(
 
     for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         x = build_decoder_layer(ctx, gctx, gf, x, positions, /*time_emb=*/nullptr,
-            i, n_tokens, /*kv_offset=*/0, causal_mask);
+            i, n_tokens, kv_plan, causal_mask);
     }
     offline_logits_tail(ctx, gctx, gf, x, n_tokens);
     return gf;
@@ -2244,8 +3171,11 @@ static ggml_cgraph * build_offline_prefill_graph(
 // Single-token autoregressive step (no audio embedding).
 static ggml_cgraph * build_offline_step_graph(voxtral_context * ctx, ggml_context * gctx) {
     voxtral_model * model = ctx->model;
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv,
+                                 ctx->decoder_kv.next_absolute_position,
+                                 1, kv_plan)) return nullptr;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    const int32_t kv_used = ctx->kv_used;
 
     ggml_tensor * token_id = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
     ggml_set_name(token_id, "token_id");
@@ -2257,7 +3187,7 @@ static ggml_cgraph * build_offline_step_graph(voxtral_context * ctx, ggml_contex
     ggml_tensor * x = ggml_get_rows(gctx, model->tok_embeddings_weight, token_id); // [dec_dim, 1]
     for (int32_t i = 0; i < model->hp.dec_layers; i++) {
         x = build_decoder_layer(ctx, gctx, gf, x, pos_tensor, /*time_emb=*/nullptr,
-            i, 1, /*kv_offset=*/kv_used, /*attn_mask=*/nullptr);
+            i, 1, kv_plan, /*attn_mask=*/nullptr);
     }
     offline_logits_tail(ctx, gctx, gf, x, 1);
     return gf;
@@ -2271,10 +3201,23 @@ static ggml_tensor * find_tensor_in_graph(ggml_cgraph * gf, const char * name) {
     return ggml_graph_get_tensor(gf, name);
 }
 
+static void profile_tensor_set(voxtral_context * ctx, ggml_tensor * tensor,
+                               const void * data, size_t offset, size_t bytes) {
+    voxtral_context_profile_note_tensor_set_internal(ctx);
+    ggml_backend_tensor_set(tensor, data, offset, bytes);
+}
+
+static void profile_tensor_get(voxtral_context * ctx, const ggml_tensor * tensor,
+                               void * data, size_t offset, size_t bytes) {
+    voxtral_context_profile_note_tensor_get_internal(ctx);
+    ggml_backend_tensor_get(tensor, data, offset, bytes);
+}
+
 // Set a named graph input tensor if it exists (no-op if absent).
-static void set_graph_input(ggml_cgraph * gf, const char * name, const void * data, size_t bytes) {
+static void set_graph_input(voxtral_context * ctx, ggml_cgraph * gf,
+                            const char * name, const void * data, size_t bytes) {
     if (ggml_tensor * t = find_tensor_in_graph(gf, name)) {
-        ggml_backend_tensor_set(t, data, 0, bytes);
+        profile_tensor_set(ctx, t, data, 0, bytes);
     }
 }
 
@@ -2294,17 +3237,30 @@ static ggml_context * init_graph_ctx(std::vector<uint8_t> & buf, int32_t graph_m
 template <typename SetInputs>
 static bool run_graph(voxtral_context * ctx, ggml_backend_sched_t sched,
                       ggml_context * gctx, ggml_cgraph * gf,
-                      SetInputs && set_inputs, const char * what) {
+                      SetInputs && set_inputs, const char * what,
+                      voxtral_profile_stage execute_stage) {
     ggml_backend_sched_reset(sched);
+    voxtral_context_profile_note_allocation_internal(ctx, execute_stage);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         LOG_ERR(ctx, "%s: failed to allocate graph", what);
         ggml_free(gctx);
         return false;
     }
     set_inputs(gf);
-    ggml_backend_sched_graph_compute(sched, gf);
+    const auto exec_start = std::chrono::steady_clock::now();
+    voxtral_context_profile_note_submit_internal(ctx);
+    const enum ggml_status status = ggml_backend_sched_graph_compute_async(sched, gf);
+    const auto sync_start = std::chrono::steady_clock::now();
+    ggml_backend_sched_synchronize(sched);
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::backend_synchronize,
+                                            elapsed_ms(sync_start));
+    voxtral_context_profile_record_internal(ctx, execute_stage, elapsed_ms(exec_start));
     ggml_backend_sched_reset(sched);
     ggml_free(gctx);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR(ctx, "%s: graph compute failed (%d)", what, (int) status);
+        return false;
+    }
     return true;
 }
 
@@ -2647,8 +3603,10 @@ static int64_t enc_frames_realizable(int64_t mel_frames) {
 // ============================================================================
 struct voxtral_encoder_kv_state {
     voxtral_context * ctx = nullptr;
+    bool reusable_stream_graph = false;
 
-    // Persistent device ring, [kv_dim, capacity, enc_layers] F32 (K and V).
+    // Persistent device ring, [kv_dim, capacity, enc_layers] FP16 by default
+    // (explicit F32 numerical oracle via VOXTRAL_ENCODER_KV_TYPE=f32).
     ggml_context        * ctx_ring = nullptr;
     ggml_backend_buffer_t buf_ring = nullptr;
     ggml_tensor         * ring_k   = nullptr;
@@ -2897,28 +3855,46 @@ static bool encoder_kv_alloc(voxtral_encoder_kv_state * kv) {
     ggml_init_params p = { 2 * ggml_tensor_overhead(), nullptr, /*.no_alloc=*/true };
     kv->ctx_ring = ggml_init(p);
     if (!kv->ctx_ring) return false;
-    kv->ring_k = ggml_new_tensor_3d(kv->ctx_ring, GGML_TYPE_F32, kv_dim, VOXTRAL_ENC_KV_CAP, layers);
-    kv->ring_v = ggml_new_tensor_3d(kv->ctx_ring, GGML_TYPE_F32, kv_dim, VOXTRAL_ENC_KV_CAP, layers);
+    const ggml_type encoder_kv_type = encoder_kv_type_from_env();
+    kv->ring_k = ggml_new_tensor_3d(kv->ctx_ring, encoder_kv_type, kv_dim, VOXTRAL_ENC_KV_CAP, layers);
+    kv->ring_v = ggml_new_tensor_3d(kv->ctx_ring, encoder_kv_type, kv_dim, VOXTRAL_ENC_KV_CAP, layers);
     ggml_set_name(kv->ring_k, "enc_kv_k");
     ggml_set_name(kv->ring_v, "enc_kv_v");
     kv->buf_ring = ggml_backend_alloc_ctx_tensors(kv->ctx_ring, ctx->backend);
     if (!kv->buf_ring) { ggml_free(kv->ctx_ring); kv->ctx_ring = nullptr; return false; }
     kv->ring_bytes = (int64_t) ggml_nbytes(kv->ring_k) + (int64_t) ggml_nbytes(kv->ring_v);
+    ctx->encoder_kv_allocated_bytes = kv->ring_bytes;
+    ctx->encoder_kv_storage_type = encoder_kv_type;
     // Flash attention may speculatively load masked physical columns.  A
     // one-time device clear keeps those loads finite before the ring has wrapped;
     // it is not repeated per graph and therefore does not grow with the stream.
     ggml_backend_buffer_clear(kv->buf_ring, 0);
-    LOG_INFO(ctx, "encoder KV: ring %d x %d x %d F32, %.2f MB on device",
-             kv_dim, VOXTRAL_ENC_KV_CAP, layers, (double) kv->ring_bytes / 1e6);
+    LOG_INFO(ctx, "encoder KV: ring %d x %d x %d %s, %.2f MB on device",
+             kv_dim, VOXTRAL_ENC_KV_CAP, layers,
+             kv->ring_k->type == GGML_TYPE_F16 ? "F16" : "F32",
+             (double) kv->ring_bytes / 1e6);
     return true;
 }
 
 static void encoder_kv_free_ring(voxtral_encoder_kv_state * kv) {
+    if (kv->ctx && kv->ctx->encoder_steady_graph_ctx) {
+        ggml_backend_sched_reset(kv->ctx->sched_encoder_steady);
+        ggml_free(kv->ctx->encoder_steady_graph_ctx);
+        kv->ctx->encoder_steady_graph_ctx = nullptr;
+        kv->ctx->encoder_steady_graph = nullptr;
+        kv->ctx->encoder_steady_graph_allocated = false;
+        kv->ctx->encoder_steady_graph_meta.clear();
+        kv->ctx->encoder_steady_mask.clear();
+    }
     if (kv->trace_file) { std::fclose(kv->trace_file); kv->trace_file = nullptr; }
     if (kv->buf_ring) { ggml_backend_buffer_free(kv->buf_ring); kv->buf_ring = nullptr; }
     if (kv->ctx_ring) { ggml_free(kv->ctx_ring); kv->ctx_ring = nullptr; }
     kv->ring_k = kv->ring_v = nullptr;
     kv->ring_bytes = 0;
+    if (kv->ctx) {
+        kv->ctx->encoder_kv_allocated_bytes = 0;
+        kv->ctx->encoder_kv_storage_type = GGML_TYPE_COUNT;
+    }
 }
 
 // Run one KV graph over the enc frames [q_start, q_start+n_new) described by `plan`
@@ -2934,6 +3910,7 @@ static void encoder_kv_free_ring(voxtral_encoder_kv_state * kv) {
 // ring lives in its own buffer, so clear_kv_cache never wipes it.)
 static bool copy_chunk_to_enc_out_ring(voxtral_context * ctx, int64_t q_start, int32_t N) {
     if (!ctx->want_enc_out_ring || !ctx->enc_out_ring || N <= 0) return true;
+    const auto build_start = std::chrono::steady_clock::now();
     const int32_t cap  = (int32_t) ctx->enc_out_ring->ne[1];
     const size_t  scol = ctx->encoder_chunk_output->nb[1];
     const size_t  dcol = ctx->enc_out_ring->nb[1];
@@ -2952,7 +3929,155 @@ static bool copy_chunk_to_enc_out_ring(voxtral_context * ctx, int64_t q_start, i
         ggml_build_forward_expand(gf, ggml_cpy(gctx, src, dst));
         done += seg;
     }
-    return run_graph(ctx, ctx->sched_encoder, gctx, gf, [](ggml_cgraph *){}, "enc-out ring copy");
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::encoder_graph_build,
+                                            elapsed_ms(build_start));
+    return run_graph(ctx, ctx->sched_encoder, gctx, gf, [](ggml_cgraph *){},
+                     "enc-out ring copy", voxtral_profile_stage::encoder_device_copy);
+}
+
+static bool ensure_encoder_steady_graph(voxtral_encoder_kv_state * kv) {
+    voxtral_context * ctx = kv->ctx;
+    if (ctx->encoder_steady_graph && ctx->encoder_steady_graph_allocated) return true;
+    const auto build_start = std::chrono::steady_clock::now();
+    ctx->encoder_steady_graph_ctx = init_graph_ctx(
+        ctx->encoder_steady_graph_meta, 8);
+    if (!ctx->encoder_steady_graph_ctx) return false;
+    ctx->encoder_steady_graph = build_encoder_steady_graph(
+        ctx, kv->ring_k, kv->ring_v, ctx->encoder_steady_graph_ctx);
+    if (!ctx->encoder_steady_graph) return false;
+    voxtral_context_profile_record_internal(
+        ctx, voxtral_profile_stage::encoder_graph_build,
+        elapsed_ms(build_start));
+    ggml_backend_sched_reset(ctx->sched_encoder_steady);
+    voxtral_context_profile_note_allocation_internal(
+        ctx, voxtral_profile_stage::encoder_graph_execute);
+    if (!ggml_backend_sched_alloc_graph(
+            ctx->sched_encoder_steady, ctx->encoder_steady_graph)) {
+        LOG_ERR(ctx, "encoder KV: reusable 4-row graph allocation failed");
+        return false;
+    }
+    ctx->encoder_steady_graph_allocated = true;
+    ctx->encoder_steady_mask.assign(
+        (size_t) VOXTRAL_ENC_KV_CAP * 4, -INFINITY);
+    return true;
+}
+
+static bool run_encoder_steady_batch(
+    voxtral_encoder_kv_state * kv, const voxtral_enc_kv_plan_t & plan) {
+    constexpr int32_t P = 4;
+    constexpr int32_t conv_len = 2 * P + 4;
+    if (plan.n_new != P) return false;
+    voxtral_context * ctx = kv->ctx;
+    if (!ensure_encoder_steady_graph(kv)) return false;
+
+    // Fixed conv window [2*(q-2), 2*(q+P)); negative startup positions are the
+    // same causal zeros used by the variable graph.
+    kv->conv_cm.assign(
+        (size_t) VOXTRAL_MEL_N_MEL * conv_len, 0.0f);
+    const int64_t first_mel = 2 * (plan.q_start - 2);
+    const int64_t tail_frames =
+        (int64_t) kv->mel_tail.size() / VOXTRAL_MEL_N_MEL;
+    for (int32_t i = 0; i < conv_len; ++i) {
+        const int64_t absolute = first_mel + i;
+        if (absolute < 0) continue;
+        const int64_t rel = absolute - kv->tail_base;
+        if (rel < 0 || rel >= tail_frames) {
+            LOG_ERR(ctx, "encoder steady: Mel %lld outside tail [%lld,%lld)",
+                    (long long) absolute, (long long) kv->tail_base,
+                    (long long) (kv->tail_base + tail_frames));
+            return false;
+        }
+        const float * src = kv->mel_tail.data() +
+            (size_t) rel * VOXTRAL_NUM_MEL_BINS;
+        for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
+            kv->conv_cm[(size_t) m * conv_len + i] = src[m];
+        }
+    }
+
+    std::fill(ctx->encoder_steady_mask.begin(),
+              ctx->encoder_steady_mask.end(), -INFINITY);
+    for (int32_t q = 0; q < P; ++q) {
+        const int64_t absolute_q = plan.q_start + q;
+        ctx->encoder_steady_positions[(size_t) q] = (int32_t) absolute_q;
+        ctx->encoder_steady_kv_rows[(size_t) q] =
+            (int32_t) (absolute_q % VOXTRAL_ENC_KV_CAP);
+        ctx->encoder_steady_output_rows[(size_t) q] =
+            (int32_t) (absolute_q % VOXTRAL_ENC_OUT_RING_CAP);
+        const int64_t first_key = std::max<int64_t>(
+            0, absolute_q - (VOXTRAL_ENC_WINDOW - 1));
+        for (int64_t key = first_key; key <= absolute_q; ++key) {
+            const int32_t slot = (int32_t) (key % VOXTRAL_ENC_KV_CAP);
+            ctx->encoder_steady_mask[(size_t) q * VOXTRAL_ENC_KV_CAP + slot] = 0.0f;
+        }
+    }
+
+    ggml_cgraph * gf = ctx->encoder_steady_graph;
+    set_graph_input(ctx, gf, "mel_input", kv->conv_cm.data(),
+                    kv->conv_cm.size() * sizeof(float));
+    set_graph_input(ctx, gf, "enc_positions",
+                    ctx->encoder_steady_positions.data(),
+                    ctx->encoder_steady_positions.size() * sizeof(int32_t));
+    set_graph_input(ctx, gf, "enc_kv_rows",
+                    ctx->encoder_steady_kv_rows.data(),
+                    ctx->encoder_steady_kv_rows.size() * sizeof(int32_t));
+    set_graph_input(ctx, gf, "enc_output_rows",
+                    ctx->encoder_steady_output_rows.data(),
+                    ctx->encoder_steady_output_rows.size() * sizeof(int32_t));
+    set_graph_input(ctx, gf, "enc_kv_mask",
+                    ctx->encoder_steady_mask.data(),
+                    ctx->encoder_steady_mask.size() * sizeof(float));
+
+    const int64_t queued_ns = encoder_now_ns();
+    const int64_t compute_start_ns = encoder_now_ns();
+    const auto exec_start = std::chrono::steady_clock::now();
+    voxtral_context_profile_note_submit_internal(ctx);
+    const enum ggml_status status = ggml_backend_sched_graph_compute_async(
+        ctx->sched_encoder_steady, gf);
+    const auto sync_start = std::chrono::steady_clock::now();
+    ggml_backend_sched_synchronize(ctx->sched_encoder_steady);
+    voxtral_context_profile_record_internal(
+        ctx, voxtral_profile_stage::backend_synchronize,
+        elapsed_ms(sync_start));
+    voxtral_context_profile_record_internal(
+        ctx, voxtral_profile_stage::encoder_graph_execute,
+        elapsed_ms(exec_start));
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR(ctx, "encoder KV: reusable graph compute failed (%d)", (int) status);
+        return false;
+    }
+
+    if (ctx->capture_encoder_diagnostics) {
+        // Numerical acceptance samples one real steady 4-row production block.
+        // This is a bounded opt-in readback, never a resident F32 KV mirror.
+        ctx->diagnostic_encoder_output.resize((size_t) P * VOXTRAL_ENC_DIM);
+        for (int32_t q = 0; q < P; ++q) {
+            const int32_t slot = ctx->encoder_steady_output_rows[(size_t) q];
+            profile_tensor_get(ctx, ctx->enc_out_ring,
+                ctx->diagnostic_encoder_output.data() + (size_t) q * VOXTRAL_ENC_DIM,
+                (size_t) slot * ctx->enc_out_ring->nb[1],
+                (size_t) VOXTRAL_ENC_DIM * sizeof(float));
+        }
+        ctx->capture_encoder_diagnostics = false;
+    }
+
+    const int64_t ready_ns = encoder_now_ns();
+    if (kv->telemetry) {
+        kv->compute_ms.push_back((double) (ready_ns - compute_start_ns) / 1e6);
+        encoder_record_outputs(kv, plan, queued_ns, compute_start_ns, ready_ns);
+    }
+    kv->emitted = plan.q_start + P;
+    kv->transformer_frames += P;
+    kv->kv_appends += P;
+    kv->kv_evictions += plan.evicted;
+    if (plan.read_wraps || plan.write_wraps) ++kv->kv_wraps;
+    ++kv->graph_execs;
+    kv->logical_frames_submitted += P;
+    kv->physical_rows_evaluated += P;
+    kv->max_new_per_exec = std::max(kv->max_new_per_exec, P);
+    const int64_t logical = kv->emitted -
+        std::max<int64_t>(0, kv->emitted - VOXTRAL_ENC_WINDOW);
+    kv->peak_logical = std::max(kv->peak_logical, logical);
+    return true;
 }
 
 static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_enc_kv_plan_t & plan,
@@ -2969,6 +4094,11 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
     const int32_t n_mel   = VOXTRAL_MEL_N_MEL;
     const int32_t conv_len = (int32_t) (plan.conv_mel_end - plan.conv_mel_start);
 
+    if (kv->reusable_stream_graph && ctx->want_enc_out_ring &&
+        emit_col == 0 && N == 4 && P == 4) {
+        return run_encoder_steady_batch(kv, plan);
+    }
+
     // Materialize the conv Mel window channel-major [n_mel, conv_len] from the tail.
     const int64_t tail_frames = (int64_t) (kv->mel_tail.size() / (size_t) n_mel);
     if (plan.conv_mel_start < kv->tail_base || plan.conv_mel_end > kv->tail_base + tail_frames) {
@@ -2984,9 +4114,14 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
         for (int32_t m = 0; m < n_mel; ++m) kv->conv_cm[(size_t) m * conv_len + i] = src[m];
     }
 
+    const auto graph_build_start = std::chrono::steady_clock::now();
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 8 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 8, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    // Graph metadata is host scratch, not graph state. Retain its allocation
+    // across microbatches so steady state does not call the host heap once per
+    // encoder execution.
+    static thread_local std::vector<uint8_t> meta_buf;
+    if (meta_buf.size() < meta_size) meta_buf.resize(meta_size);
     ggml_init_params p = { meta_size, meta_buf.data(), /*.no_alloc=*/true };
     ggml_context * gctx = ggml_init(p);
 
@@ -2996,8 +4131,11 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
         ggml_free(gctx);
         return false;
     }
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::encoder_graph_build,
+                                            elapsed_ms(graph_build_start));
 
     ggml_backend_sched_reset(ctx->sched_encoder);
+    voxtral_context_profile_note_allocation_internal(ctx, voxtral_profile_stage::encoder_graph_execute);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_encoder, gf)) {
         LOG_ERR(ctx, "encoder KV: failed to allocate graph (N=%d P=%d L=%d)", N, P, L);
         ggml_free(gctx);
@@ -3005,11 +4143,11 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
     }
 
     if (ggml_tensor * t = find_tensor_in_graph(gf, "mel_input"))
-        ggml_backend_tensor_set(t, kv->conv_cm.data(), 0, (size_t) n_mel * conv_len * sizeof(float));
+        profile_tensor_set(ctx, t, kv->conv_cm.data(), 0, (size_t) n_mel * conv_len * sizeof(float));
     if (ggml_tensor * t = find_tensor_in_graph(gf, "enc_positions")) {
         kv->pos_buf.resize(P);
         for (int32_t i = 0; i < P; ++i) kv->pos_buf[i] = (int32_t) (block_start + i);
-        ggml_backend_tensor_set(t, kv->pos_buf.data(), 0, (size_t) P * sizeof(int32_t));
+        profile_tensor_set(ctx, t, kv->pos_buf.data(), 0, (size_t) P * sizeof(int32_t));
     }
     if (ggml_tensor * t = find_tensor_in_graph(gf, "enc_kv_mask")) {
         kv->mask_buf.assign((size_t) L * P, -INFINITY);
@@ -3020,7 +4158,7 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
                 const int64_t kv_abs = key_start + kl;
                 if (real_query && voxtral_enc_kv_mask_allows(kv_abs, q_abs, VOXTRAL_ENC_WINDOW)) {
                     kv->mask_buf[(size_t) ql * L + kl] = 0.0f;
-                } else if (!real_query && std::getenv("VOXTRAL_ENC_KV_MANUAL") && kl == 0) {
+                } else if (!real_query && encoder_kv_uses_segmented_attention(P) && kl == 0) {
                     // The manual softmax has no defined value for an all -Inf
                     // row. Give every discarded dummy query one private
                     // numerical sink so the oracle stays finite. Dummy rows are
@@ -3030,14 +4168,27 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
                 }
             }
         }
-        ggml_backend_tensor_set(t, kv->mask_buf.data(), 0, kv->mask_buf.size() * sizeof(float));
+        profile_tensor_set(ctx, t, kv->mask_buf.data(), 0, kv->mask_buf.size() * sizeof(float));
     }
 
     const int64_t queued_ns = encoder_now_ns();
     const int64_t compute_start_ns = encoder_now_ns();
-    ggml_backend_sched_graph_compute(ctx->sched_encoder, gf);
+    const auto exec_start = std::chrono::steady_clock::now();
+    voxtral_context_profile_note_submit_internal(ctx);
+    const enum ggml_status compute_status =
+        ggml_backend_sched_graph_compute_async(ctx->sched_encoder, gf);
+    const auto sync_start = std::chrono::steady_clock::now();
+    ggml_backend_sched_synchronize(ctx->sched_encoder);
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::backend_synchronize,
+                                            elapsed_ms(sync_start));
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::encoder_graph_execute,
+                                            elapsed_ms(exec_start));
     ggml_backend_sched_reset(ctx->sched_encoder);
     ggml_free(gctx);
+    if (compute_status != GGML_STATUS_SUCCESS) {
+        LOG_ERR(ctx, "encoder KV: graph compute failed (%d)", (int) compute_status);
+        return false;
+    }
 
     // Append the newly-emitted enc frames [emit_col, N) (channel-major) to the accum.
     // Session 7.1: the incremental production path (want_enc_out_ring) reads encoder
@@ -3120,7 +4271,25 @@ static bool encoder_kv_run(voxtral_encoder_kv_state * kv, int64_t q0, int32_t n,
 // batches run; finish flushes the remainder.
 static bool encoder_kv_drive(voxtral_encoder_kv_state * kv, bool final) {
     const encoder_kv_schedule schedule = encoder_kv_schedule_from_env();
+    // The terminal right-padding is bounded, but it used to be fed through the
+    // ordinary 4-row cadence and consequently launched about 17 independent
+    // encoder graphs. A wider terminal graph preserves absolute positions and
+    // the same causal mask while amortising submission/synchronisation overhead.
+    // Keep a selector for the measured 4/8/16/32/128 acceptance matrix.
+    // On RX 6600 the full 750-frame-window tail profile is non-monotonic. P8 is
+    // the measured minimum for the fixed 72-frame right pad (about 420 ms),
+    // versus about 467 ms at P4 and 727 ms at P16. Keep the full-window result,
+    // rather than the misleading short-context result, as the default.
+    int32_t finish_physical = 8;
+    if (const char * value = std::getenv("VOXTRAL_ENCODER_FINISH_PHYSICAL")) {
+        const int parsed = std::atoi(value);
+        if (parsed == 4 || parsed == 8 || parsed == 16 || parsed == 32 || parsed == 128) {
+            finish_physical = parsed;
+        }
+    }
     const int64_t target = enc_frames_realizable(kv->stable_mel);   // true global count
+    const bool batch_terminal = final && kv->reusable_stream_graph &&
+                                kv->ctx->want_enc_out_ring;
     while (kv->emitted < target) {
         const int64_t rem = target - kv->emitted;
         // The causal left pad makes an initial 128-frame block available before
@@ -3143,12 +4312,14 @@ static bool encoder_kv_drive(voxtral_encoder_kv_state * kv, bool final) {
             continue;
         }
         if (!final && rem < schedule.logical) break;                // wait for a full logical batch
-        const int32_t q_offset = (int32_t) (kv->emitted % schedule.physical);
-        const int32_t room = schedule.physical - q_offset;
+        const int32_t physical = batch_terminal ? finish_physical : schedule.physical;
+        const int32_t logical  = batch_terminal ? finish_physical : schedule.logical;
+        const int32_t q_offset = (int32_t) (kv->emitted % physical);
+        const int32_t room = physical - q_offset;
         const int32_t n = (int32_t) std::min<int64_t>(
-            std::min<int64_t>(schedule.logical, room), rem);
+            std::min<int64_t>(logical, room), rem);
         if (n <= 0) return false;
-        if (!encoder_kv_run(kv, kv->emitted, n, final)) return false;
+        if (!encoder_kv_run(kv, kv->emitted, n, final, physical)) return false;
     }
     return true;
 }
@@ -3506,6 +4677,87 @@ void voxtral_encoder_stream_reset(voxtral_encoder_stream * es) {
     // Keep vector capacities (and the device KV ring) for cheap reuse.
 }
 
+bool voxtral_encoder_stream_warmup(voxtral_encoder_stream * es) {
+    if (!es || !es->kv || !es->ctx || !es->ctx->want_enc_out_ring) return false;
+
+    // 156 encoder frames are the first point at which the production stream has
+    // all 39 adapter groups needed for prompt prefill + its first decoder step.
+    // They exercise the startup 128-row graph followed by the steady 4-row
+    // segmented-attention graph. Scratch Mel is never exposed to stream events.
+    constexpr int32_t warm_enc_frames =
+        VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS + 1;
+    static_assert(warm_enc_frames == 39, "decoder prompt geometry changed");
+    constexpr int32_t warm_encoder_rows = warm_enc_frames * VOXTRAL_DOWNSAMPLE_FACTOR;
+    constexpr int32_t warm_mel_frames = warm_encoder_rows * 2;
+
+    const bool capture_encoder_saved = es->ctx->capture_encoder_diagnostics;
+    const bool capture_adapter_saved = es->ctx->capture_adapter_diagnostics;
+    const bool capture_decoder_saved = es->ctx->capture_decoder_diagnostics;
+    std::vector<float> encoder_saved = std::move(es->ctx->diagnostic_encoder_output);
+    std::vector<float> adapter_saved = std::move(es->ctx->diagnostic_adapter_output);
+    std::vector<float> hidden_saved = std::move(es->ctx->diagnostic_first_hidden);
+    std::vector<float> logits_saved = std::move(es->ctx->diagnostic_first_logits);
+    es->ctx->capture_encoder_diagnostics = false;
+    es->ctx->capture_adapter_diagnostics = false;
+    auto restore_diagnostics = [&] {
+        es->ctx->capture_encoder_diagnostics = capture_encoder_saved;
+        es->ctx->capture_adapter_diagnostics = capture_adapter_saved;
+        es->ctx->capture_decoder_diagnostics = capture_decoder_saved;
+        es->ctx->diagnostic_encoder_output = std::move(encoder_saved);
+        es->ctx->diagnostic_adapter_output = std::move(adapter_saved);
+        es->ctx->diagnostic_first_hidden = std::move(hidden_saved);
+        es->ctx->diagnostic_first_logits = std::move(logits_saved);
+    };
+
+    voxtral_encoder_stream_reset(es);
+    voxtral_encoder_kv_state * kv = es->kv;
+    kv->reusable_stream_graph = true;
+    if (!encoder_kv_alloc(kv)) {
+        restore_diagnostics();
+        return false;
+    }
+    kv->mel_tail.assign((size_t) warm_mel_frames * VOXTRAL_MEL_N_MEL, 0.0f);
+    kv->tail_base = 0;
+    kv->stable_mel = warm_mel_frames;
+    es->stable_mel = warm_mel_frames;
+    es->mel_frames_received = warm_mel_frames;
+
+    bool ok = encoder_kv_drive(kv, /*final=*/false) &&
+              kv->emitted == warm_encoder_rows;
+    if (ok) {
+        ok = voxtral_ctx_adapter_commit(es->ctx, 0, warm_enc_frames) == warm_enc_frames;
+    }
+
+    // clear_kv_cache() enables the diagnostic copy node while the reusable
+    // decoder graph is built. The captured warmup values are discarded below;
+    // the real stream reuses that graph and records its own first step.
+    es->ctx->capture_decoder_diagnostics = false;
+
+    if (ok) {
+        int32_t prompt[VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS + 1];
+        prompt[0] = VOXTRAL_TOKEN_BOS;
+        std::fill(prompt + 1, prompt + warm_enc_frames, VOXTRAL_TOKEN_STREAMING_PAD);
+        voxtral_ctx_decoder_begin_incremental(es->ctx);
+        ok = voxtral_ctx_decoder_prefill_incremental(es->ctx, prompt, warm_enc_frames - 1);
+        int32_t ignored_token = 0;
+        if (ok) {
+            ok = voxtral_ctx_decoder_step_incremental(
+                es->ctx, prompt[warm_enc_frames - 1], warm_enc_frames - 1,
+                &ignored_token);
+        }
+        voxtral_ctx_decoder_reset_incremental(es->ctx);
+    }
+
+    restore_diagnostics();
+
+    // Logical state is pristine; retained capacities, scheduler buffers and
+    // Vulkan pipelines are deliberately kept. Warmup work is excluded from the
+    // production profile counters and first-output timeline.
+    voxtral_encoder_stream_reset(es);
+    voxtral_context_profile_reset_internal(es->ctx);
+    return ok;
+}
+
 // Push newly-stable, frame-major Mel frames [base_frame, base_frame+n) (each
 // n_mel contiguous) and run whatever became available. base_frame must equal the
 // running stable_mel (contiguous, in order).
@@ -3517,6 +4769,7 @@ bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
     if (base_frame != es->stable_mel) return false;   // must be contiguous
 
     if (es->kv) {
+        es->kv->reusable_stream_graph = es->ctx->want_enc_out_ring;
         if (!encoder_kv_alloc(es->kv)) return false;
         es->kv->mel_tail.insert(es->kv->mel_tail.end(), frames,
                                 frames + (size_t) n * VOXTRAL_MEL_N_MEL);
@@ -3532,6 +4785,39 @@ bool voxtral_encoder_stream_push_mel(voxtral_encoder_stream * es,
     es->mel_frames_received += n;
     encoder_stream_update_peak(es);
     const bool ok = encoder_stream_drive(es, /*final=*/false);
+    encoder_stream_update_peak(es);
+    return ok;
+}
+
+// Terminal counterpart to push_mel(). The frontend exposes all right-padding
+// frames at once, so preserve that boundary and let encoder_kv_drive(final=true)
+// use a bounded tail graph instead of pretending every eight Mel frames arrived
+// as a separate realtime feed. Each encoder frame is still evaluated once.
+bool voxtral_encoder_stream_push_mel_final(voxtral_encoder_stream * es,
+                                           const float * frames,
+                                           int64_t base_frame,
+                                           int32_t n) {
+    if (!es || es->finalized) return false;
+    if (n <= 0) return true;
+    if (!frames || base_frame != es->stable_mel) return false;
+
+    if (es->kv) {
+        es->kv->reusable_stream_graph = es->ctx->want_enc_out_ring;
+        if (!encoder_kv_alloc(es->kv)) return false;
+        es->kv->mel_tail.insert(es->kv->mel_tail.end(), frames,
+                                frames + (size_t) n * VOXTRAL_MEL_N_MEL);
+        es->kv->stable_mel += n;
+        es->stable_mel += n;
+        es->mel_frames_received += n;
+        return encoder_kv_drive(es->kv, /*final=*/true);
+    }
+
+    es->mel_window.insert(es->mel_window.end(), frames,
+                          frames + (size_t) n * VOXTRAL_MEL_N_MEL);
+    es->stable_mel += n;
+    es->mel_frames_received += n;
+    encoder_stream_update_peak(es);
+    const bool ok = encoder_stream_drive(es, /*final=*/true);
     encoder_stream_update_peak(es);
     return ok;
 }
@@ -3631,7 +4917,7 @@ voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_str
         m.encoderKvLogicalFrames          = kv->emitted - std::max<int64_t>(0, kv->emitted - VOXTRAL_ENC_WINDOW);
         m.encoderKvPeakLogicalFrames      = kv->peak_logical;
         m.encoderKvCapacityFrames         = VOXTRAL_ENC_KV_CAP;
-        m.encoderKvElementSize            = (int32_t) sizeof(float);
+        m.encoderKvElementSize            = (int32_t) ggml_type_size(kv->ring_k->type);
         m.encoderMelRetainedBytes         = (int64_t) (kv->mel_tail.size() * sizeof(float));
         m.encoderMelRetainedFrames        = (int64_t) (kv->mel_tail.size() / (size_t) VOXTRAL_MEL_N_MEL);
         m.encoderMelPeakRetainedFrames    = kv->peak_mel_tail;
@@ -3702,6 +4988,7 @@ voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_str
 static bool run_adapter(voxtral_context * ctx) {
     const int32_t enc_seq = ctx->enc_seq_used;
     const int32_t dec_seq = enc_seq / VOXTRAL_DOWNSAMPLE_FACTOR;
+    if (ctx->numerical_diagnostics) ctx->diagnostic_adapter_output.clear();
 
     LOG_INFO(ctx, "running adapter: enc_seq=%d -> dec_seq=%d", enc_seq, dec_seq);
 
@@ -3712,6 +4999,7 @@ static bool run_adapter(voxtral_context * ctx) {
         return false;
     }
 
+    const auto build_start = std::chrono::steady_clock::now();
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, false);
     std::vector<uint8_t> meta_buf(meta_size);
@@ -3724,18 +5012,40 @@ static bool run_adapter(voxtral_context * ctx) {
     ggml_context * gctx = ggml_init(p);
 
     ggml_cgraph * gf = build_adapter_graph(ctx, gctx);
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::adapter_graph_build,
+                                            elapsed_ms(build_start));
     log_graph_info(ctx, "adapter", gf);
 
     ggml_backend_sched_reset(ctx->sched_adapter);
+    voxtral_context_profile_note_allocation_internal(ctx, voxtral_profile_stage::adapter_graph_execute);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_adapter, gf)) {
         LOG_ERR(ctx, "adapter: failed to allocate graph");
         ggml_free(gctx);
         return false;
     }
 
-    ggml_backend_sched_graph_compute(ctx->sched_adapter, gf);
+    const auto exec_start = std::chrono::steady_clock::now();
+    voxtral_context_profile_note_submit_internal(ctx);
+    const enum ggml_status status = ggml_backend_sched_graph_compute_async(ctx->sched_adapter, gf);
+    const auto sync_start = std::chrono::steady_clock::now();
+    ggml_backend_sched_synchronize(ctx->sched_adapter);
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::backend_synchronize,
+                                            elapsed_ms(sync_start));
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::adapter_graph_execute,
+                                            elapsed_ms(exec_start));
     ggml_backend_sched_reset(ctx->sched_adapter);
     ggml_free(gctx);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR(ctx, "adapter: graph compute failed (%d)", (int) status);
+        return false;
+    }
+
+    if (ctx->numerical_diagnostics) {
+        ctx->diagnostic_adapter_output.resize((size_t) ctx->dec_seq_len * VOXTRAL_DEC_DIM);
+        profile_tensor_get(ctx, ctx->decoder_memory,
+            ctx->diagnostic_adapter_output.data(), 0,
+            ctx->diagnostic_adapter_output.size() * sizeof(float));
+    }
 
     LOG_INFO(ctx, "adapter done: dec_seq_len=%d (%.2f MB on device)",
              ctx->dec_seq_len,
@@ -3759,29 +5069,43 @@ static bool run_decoder_prefill(
         LOG_ERR(ctx, "decoder prefill: n_tokens=%d exceeds DEC_WINDOW=%d", n_tokens, VOXTRAL_DEC_WINDOW);
         return false;
     }
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv,
+                                 ctx->decoder_kv.next_absolute_position,
+                                 n_tokens, kv_plan)) {
+        LOG_ERR(ctx, "decoder prefill: invalid KV append start=%lld n=%d",
+                (long long) ctx->decoder_kv.next_absolute_position, n_tokens);
+        return false;
+    }
 
+    const auto build_start = std::chrono::steady_clock::now();
     static thread_local std::vector<uint8_t> meta_buf;
     ggml_context * gctx = init_graph_ctx(meta_buf, 4);
     ggml_cgraph * gf = build_decoder_prefill_graph(ctx, gctx, n_tokens);
+    if (!gf) { ggml_free(gctx); return false; }
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::decoder_prefill_graph_build,
+                                            elapsed_ms(build_start));
     log_graph_info(ctx, "decoder prefill", gf);
 
     if (!run_graph(ctx, ctx->sched_dec_pre, gctx, gf, [&](ggml_cgraph * g) {
-        set_graph_input(g, "token_ids", token_ids, n_tokens * sizeof(int32_t));
+        set_graph_input(ctx, g, "token_ids", token_ids, n_tokens * sizeof(int32_t));
         std::vector<int32_t> pos(n_tokens);
-        std::iota(pos.begin(), pos.end(), 0);
-        set_graph_input(g, "positions", pos.data(), n_tokens * sizeof(int32_t));
-        set_graph_input(g, "time_emb", ctx->time_emb_cpu.data(), VOXTRAL_DEC_DIM * sizeof(float));
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            pos[(size_t) i] = (int32_t) (kv_plan.absolute_start + i);
+        }
+        set_graph_input(ctx, g, "positions", pos.data(), n_tokens * sizeof(int32_t));
+        set_graph_input(ctx, g, "time_emb", ctx->time_emb_cpu.data(), VOXTRAL_DEC_DIM * sizeof(float));
         std::vector<float> mask;
         fill_causal_mask(mask, n_tokens);
-        set_graph_input(g, "causal_mask", mask.data(), mask.size() * sizeof(float));
-    }, "decoder prefill")) {
+        set_graph_input(ctx, g, "causal_mask", mask.data(), mask.size() * sizeof(float));
+    }, "decoder prefill", voxtral_profile_stage::decoder_prefill_graph_execute)) {
         return false;
     }
 
     if (logits_out) {
-        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+        profile_tensor_get(ctx, ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
     }
-    ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
+    decoder_kv_commit_plan(ctx, kv_plan);
 
     LOG_INFO(ctx, "decoder prefill done");
     return true;
@@ -3799,33 +5123,166 @@ static bool run_decoder_step(
     float           * logits_out,   // [vocab_size] — optional, full logits readback
     int32_t         * token_out)    // optional — greedy argmax token (cheap readback)
 {
-    if (ctx->kv_used >= VOXTRAL_DEC_WINDOW) {
-        kv_cache_shift_left(ctx, 1);
-        ctx->kv_used = VOXTRAL_DEC_WINDOW - 1;
-    }
-
-    static thread_local std::vector<uint8_t> step_meta_buf;
-    ggml_context * gctx = init_graph_ctx(step_meta_buf, 4);
-    ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
-
-    if (!run_graph(ctx, ctx->sched_dec_step, gctx, gf, [&](ggml_cgraph * g) {
-        set_graph_input(g, "token_id", &token_id, sizeof(int32_t));
-        set_graph_input(g, "position", &position, sizeof(int32_t));
-        set_graph_input(g, "time_emb", ctx->time_emb_cpu.data(), VOXTRAL_DEC_DIM * sizeof(float));
-    }, "decoder step")) {
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv, position, 1, kv_plan)) {
+        LOG_ERR(ctx, "decoder step: invalid absolute position %d (next=%lld)",
+                position, (long long) ctx->decoder_kv.next_absolute_position);
         return false;
     }
 
-    // Read back the greedy token (4 bytes) and/or full logits if requested.
-    if (token_out) {
-        ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    const auto rollover_step_start = std::chrono::steady_clock::now();
+    const char * step_graph_mode = std::getenv("VOXTRAL_DECODER_STEP_GRAPH");
+    const bool force_dynamic_graph = step_graph_mode &&
+        (std::strcmp(step_graph_mode, "dynamic") == 0 ||
+         std::strcmp(step_graph_mode, "oracle") == 0);
+    if (ctx->dec_audio_cap > 0 && !force_dynamic_graph) {
+        // Incremental production owns the device-resident audio ring and can
+        // reuse one fixed-topology graph.  The finish-only oracle instead owns
+        // a linear decoder_memory tensor; it must keep the dynamic view below
+        // or this graph would silently read unrelated audio-ring columns.
+        const bool full_cache =
+            kv_plan.used_after == ctx->decoder_kv_configured_capacity;
+        if (!ensure_decoder_step_graph(ctx, full_cache)) return false;
+        ggml_cgraph * gf = ctx->decoder_step_graph;
+
+        const int32_t kv_slot =
+            position % ctx->decoder_kv_configured_capacity;
+        const int32_t audio_slot = audio_pos % ctx->dec_audio_cap;
+        set_graph_input(ctx, gf, "token_id", &token_id, sizeof(token_id));
+        set_graph_input(ctx, gf, "position", &position, sizeof(position));
+        set_graph_input(ctx, gf, "time_emb", ctx->time_emb_cpu.data(),
+                        VOXTRAL_DEC_DIM * sizeof(float));
+        set_graph_input(ctx, gf, "decoder_kv_slot", &kv_slot, sizeof(kv_slot));
+        set_graph_input(ctx, gf, "decoder_audio_slot", &audio_slot, sizeof(audio_slot));
+
+        const int32_t valid = (int32_t) kv_plan.used_after;
+        if (!full_cache && ctx->decoder_step_mask_valid != valid) {
+            std::fill(ctx->decoder_step_mask.begin(),
+                      ctx->decoder_step_mask.end(), -INFINITY);
+            std::fill(ctx->decoder_step_mask.begin(),
+                      ctx->decoder_step_mask.begin() + valid, 0.0f);
+            set_graph_input(ctx, gf, "decoder_kv_mask",
+                            ctx->decoder_step_mask.data(),
+                            ctx->decoder_step_mask.size() * sizeof(float));
+            ctx->decoder_step_mask_valid = valid;
+        }
+
+        const auto exec_start = std::chrono::steady_clock::now();
+        voxtral_context_profile_note_submit_internal(ctx);
+        const enum ggml_status status =
+            ggml_backend_sched_graph_compute_async(ctx->sched_dec_step, gf);
+        const auto sync_start = std::chrono::steady_clock::now();
+        ggml_backend_sched_synchronize(ctx->sched_dec_step);
+        voxtral_context_profile_record_internal(
+            ctx, voxtral_profile_stage::backend_synchronize,
+            elapsed_ms(sync_start));
+        voxtral_context_profile_record_internal(
+            ctx, voxtral_profile_stage::decoder_step_graph_execute,
+            elapsed_ms(exec_start));
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERR(ctx, "decoder step: reusable graph compute failed (%d)",
+                    (int) status);
+            return false;
+        }
+    } else {
+        // Reference/offline execution addresses the linear adapter output by a
+        // graph view.  This path is intentionally not the production steady
+        // graph and may rebuild per step; it preserves the accepted oracle.
+        const auto build_start = std::chrono::steady_clock::now();
+        static thread_local std::vector<uint8_t> step_meta_buf;
+        ggml_context * gctx = init_graph_ctx(step_meta_buf, 4);
+        ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
+        if (!gf) {
+            ggml_free(gctx);
+            return false;
+        }
+        voxtral_context_profile_record_internal(
+            ctx, voxtral_profile_stage::decoder_step_graph_build,
+            elapsed_ms(build_start));
+        if (!run_graph(ctx, ctx->sched_dec_step, gctx, gf,
+                       [&](ggml_cgraph * graph) {
+                           set_graph_input(ctx, graph, "token_id", &token_id,
+                                           sizeof(token_id));
+                           set_graph_input(ctx, graph, "position", &position,
+                                           sizeof(position));
+                           set_graph_input(ctx, graph, "time_emb",
+                                           ctx->time_emb_cpu.data(),
+                                           VOXTRAL_DEC_DIM * sizeof(float));
+                       }, "decoder step",
+                       voxtral_profile_stage::decoder_step_graph_execute)) {
+            return false;
+        }
     }
-    if (logits_out) {
-        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    const double rollover_step_ms = elapsed_ms(rollover_step_start);
+    auto & rollover = ctx->decoder_rollover;
+    if (rollover.first_wrap_position < 0) {
+        if (kv_plan.wrapped) {
+            rollover.first_wrap_position = position;
+            rollover.pre_wrap_p99_ms = fixed_percentile(
+                rollover.recent, rollover.recent_count, 0.99);
+            rollover.wrap_step_ms = rollover_step_ms;
+        } else {
+            rollover.recent[rollover.recent_next] = rollover_step_ms;
+            rollover.recent_next =
+                (rollover.recent_next + 1) % rollover.recent.size();
+            rollover.recent_count = std::min(
+                rollover.recent_count + 1, rollover.recent.size());
+        }
+    } else if (position > rollover.first_wrap_position &&
+               rollover.post_count < rollover.post.size()) {
+        rollover.post[rollover.post_count++] = rollover_step_ms;
     }
 
-    ctx->kv_used += 1;
+    // Read back the greedy token (4 bytes) and/or full logits if requested.
+    // Argmax is a node in the decoder graph, so its count is exact but its GPU
+    // duration is inseparable from decoder-step execution without a Vulkan
+    // timestamp-query build.  Keep total=0 and report that containment explicitly.
+    voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::argmax, 0.0);
+    if (token_out) {
+        const auto read_start = std::chrono::steady_clock::now();
+        profile_tensor_get(ctx, ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+        voxtral_context_profile_record_internal(ctx, voxtral_profile_stage::token_readback,
+                                                elapsed_ms(read_start));
+    }
+    if (logits_out) {
+        profile_tensor_get(ctx, ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    }
+    if (ctx->capture_decoder_diagnostics) {
+        ctx->diagnostic_first_hidden.resize(VOXTRAL_DEC_DIM);
+        ctx->diagnostic_first_logits.resize(VOXTRAL_VOCAB_SIZE);
+        profile_tensor_get(ctx, ctx->decoder_hidden_diagnostic,
+            ctx->diagnostic_first_hidden.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
+        profile_tensor_get(ctx, ctx->decoder_logits,
+            ctx->diagnostic_first_logits.data(), 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+        ctx->capture_decoder_diagnostics = false;
+    }
+
+    decoder_kv_commit_plan(ctx, kv_plan);
     return true;
+}
+
+const std::vector<float> & voxtral_context_diagnostic_first_hidden_internal(
+    const voxtral_context * ctx) {
+    static const std::vector<float> empty;
+    return ctx ? ctx->diagnostic_first_hidden : empty;
+}
+
+const std::vector<float> & voxtral_context_diagnostic_first_logits_internal(
+    const voxtral_context * ctx) {
+    static const std::vector<float> empty;
+    return ctx ? ctx->diagnostic_first_logits : empty;
+}
+
+const std::vector<float> & voxtral_context_diagnostic_adapter_output_internal(
+    const voxtral_context * ctx) {
+    static const std::vector<float> empty;
+    return ctx ? ctx->diagnostic_adapter_output : empty;
+}
+
+const std::vector<float> & voxtral_context_diagnostic_encoder_output_internal(
+    const voxtral_context * ctx) {
+    static const std::vector<float> empty;
+    return ctx ? ctx->diagnostic_encoder_output : empty;
 }
 
 // ============================================================================
@@ -3837,24 +5294,92 @@ static bool run_decoder_step(
 // 4-byte token id is read back per decoder step.
 // ============================================================================
 
+static bool ensure_adapter_graph(voxtral_context * ctx, int32_t groups) {
+    voxtral_adapter_graph_cache & cache = groups == 1
+        ? ctx->adapter_group_graph : ctx->adapter_batch_graph;
+    ggml_backend_sched_t sched = groups == 1
+        ? ctx->sched_adapter_group : ctx->sched_adapter_batch;
+    if (cache.graph && cache.allocated) return true;
+    cache.groups = groups;
+    const auto build_start = std::chrono::steady_clock::now();
+    cache.gctx = init_graph_ctx(cache.meta, 2);
+    if (!cache.gctx) return false;
+    cache.graph = build_adapter_ring_graph_reusable(ctx, cache.gctx, groups);
+    if (!cache.graph) return false;
+    voxtral_context_profile_record_internal(
+        ctx, voxtral_profile_stage::adapter_graph_build,
+        elapsed_ms(build_start));
+    ggml_backend_sched_reset(sched);
+    voxtral_context_profile_note_allocation_internal(
+        ctx, voxtral_profile_stage::adapter_graph_execute);
+    if (!ggml_backend_sched_alloc_graph(sched, cache.graph)) {
+        LOG_ERR(ctx, "adapter: reusable %d-group graph allocation failed", groups);
+        return false;
+    }
+    cache.allocated = true;
+    cache.encoder_rows.resize(
+        (size_t) groups * VOXTRAL_DOWNSAMPLE_FACTOR);
+    cache.audio_rows.resize((size_t) groups);
+    return true;
+}
+
 int32_t voxtral_ctx_adapter_commit(voxtral_context * ctx, int64_t group_start, int32_t n_groups) {
     if (!ctx || !ctx->enc_out_ring || !ctx->audio_emb_ring || n_groups <= 0) return -1;
-    const int32_t enc_gcap = (int32_t) ctx->enc_out_ring->ne[1] / VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int32_t enc_cap = (int32_t) ctx->enc_out_ring->ne[1];
     const int32_t aemb_cap = (int32_t) ctx->audio_emb_ring->ne[1];
     int32_t done = 0;
     while (done < n_groups) {
-        const int64_t g      = group_start + done;
-        const int32_t enc_gs = (int32_t) (g % enc_gcap);   // group slot in the enc-output ring
-        const int32_t aemb_s = (int32_t) (g % aemb_cap);   // slot in the audio-embedding ring
-        // Longest run that wraps neither ring, so both graph views are contiguous.
-        const int32_t run = std::min(n_groups - done, std::min(enc_gcap - enc_gs, aemb_cap - aemb_s));
+        // The startup prefix is exactly 32 groups. Everything else uses the
+        // one-group steady graph; arbitrary bounded tails are split without
+        // creating another graph family.
+        const int32_t run = n_groups - done >= 32 ? 32 : 1;
+        if (!ensure_adapter_graph(ctx, run)) return -1;
+        voxtral_adapter_graph_cache & cache = run == 1
+            ? ctx->adapter_group_graph : ctx->adapter_batch_graph;
+        ggml_backend_sched_t sched = run == 1
+            ? ctx->sched_adapter_group : ctx->sched_adapter_batch;
 
-        static thread_local std::vector<uint8_t> meta_buf;
-        ggml_context * gctx = init_graph_ctx(meta_buf, 2);
-        ggml_cgraph * gf = build_adapter_ring_graph(ctx, gctx,
-            enc_gs * VOXTRAL_DOWNSAMPLE_FACTOR, aemb_s, run);
-        if (!run_graph(ctx, ctx->sched_adapter, gctx, gf, [](ggml_cgraph *){}, "adapter commit")) {
+        for (int32_t i = 0; i < run; ++i) {
+            const int64_t group = group_start + done + i;
+            cache.audio_rows[(size_t) i] = (int32_t) (group % aemb_cap);
+            for (int32_t j = 0; j < VOXTRAL_DOWNSAMPLE_FACTOR; ++j) {
+                cache.encoder_rows[(size_t) i * VOXTRAL_DOWNSAMPLE_FACTOR + j] =
+                    (int32_t) ((group * VOXTRAL_DOWNSAMPLE_FACTOR + j) % enc_cap);
+            }
+        }
+        set_graph_input(ctx, cache.graph, "adapter_encoder_rows",
+                        cache.encoder_rows.data(),
+                        cache.encoder_rows.size() * sizeof(int32_t));
+        set_graph_input(ctx, cache.graph, "adapter_audio_rows",
+                        cache.audio_rows.data(),
+                        cache.audio_rows.size() * sizeof(int32_t));
+
+        const auto exec_start = std::chrono::steady_clock::now();
+        voxtral_context_profile_note_submit_internal(ctx);
+        const enum ggml_status status =
+            ggml_backend_sched_graph_compute_async(sched, cache.graph);
+        const auto sync_start = std::chrono::steady_clock::now();
+        ggml_backend_sched_synchronize(sched);
+        voxtral_context_profile_record_internal(
+            ctx, voxtral_profile_stage::backend_synchronize,
+            elapsed_ms(sync_start));
+        voxtral_context_profile_record_internal(
+            ctx, voxtral_profile_stage::adapter_graph_execute,
+            elapsed_ms(exec_start));
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERR(ctx, "adapter: reusable graph compute failed (%d)", (int) status);
             return -1;
+        }
+        if (ctx->capture_adapter_diagnostics) {
+            // Capture one production adapter vector after the real reusable
+            // graph. It is sufficient for an F16/F32 tensor delta and bounded
+            // independently of utterance length.
+            ctx->diagnostic_adapter_output.resize(VOXTRAL_DEC_DIM);
+            profile_tensor_get(ctx, ctx->audio_emb_ring,
+                ctx->diagnostic_adapter_output.data(),
+                (size_t) cache.audio_rows[0] * ctx->audio_emb_ring->nb[1],
+                (size_t) VOXTRAL_DEC_DIM * sizeof(float));
+            ctx->capture_adapter_diagnostics = false;
         }
         done += run;
     }
@@ -3911,44 +5436,54 @@ static bool run_offline_prefill(voxtral_context * ctx,
     const int32_t * suffix_ids, int32_t n_suffix,
     int32_t * token_out, float * logits_out) {
     const int32_t n_tokens = n_prefix + n_audio + n_suffix;
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv,
+                                 ctx->decoder_kv.next_absolute_position,
+                                 n_tokens, kv_plan)) return false;
     static thread_local std::vector<uint8_t> meta_buf;
     ggml_context * gctx = init_graph_ctx(meta_buf, 8);
     ggml_cgraph * gf = build_offline_prefill_graph(ctx, gctx, n_prefix, n_audio, n_suffix);
+    if (!gf) { ggml_free(gctx); return false; }
 
     if (!run_graph(ctx, ctx->sched_dec_pre, gctx, gf, [&](ggml_cgraph * g) {
-        set_graph_input(g, "prefix_ids", prefix_ids, n_prefix * sizeof(int32_t));
-        set_graph_input(g, "suffix_ids", suffix_ids, n_suffix * sizeof(int32_t));
+        set_graph_input(ctx, g, "prefix_ids", prefix_ids, n_prefix * sizeof(int32_t));
+        set_graph_input(ctx, g, "suffix_ids", suffix_ids, n_suffix * sizeof(int32_t));
         std::vector<int32_t> pos(n_tokens);
-        std::iota(pos.begin(), pos.end(), 0);
-        set_graph_input(g, "positions", pos.data(), n_tokens * sizeof(int32_t));
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            pos[(size_t) i] = (int32_t) (kv_plan.absolute_start + i);
+        }
+        set_graph_input(ctx, g, "positions", pos.data(), n_tokens * sizeof(int32_t));
         std::vector<float> mask;
         fill_causal_mask(mask, n_tokens);
-        set_graph_input(g, "causal_mask", mask.data(), mask.size() * sizeof(float));
-    }, "offline prefill")) {
+        set_graph_input(ctx, g, "causal_mask", mask.data(), mask.size() * sizeof(float));
+    }, "offline prefill", voxtral_profile_stage::decoder_prefill_graph_execute)) {
         return false;
     }
 
-    if (token_out)  ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
-    if (logits_out) ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
-    ctx->kv_used = n_tokens;
+    if (token_out)  profile_tensor_get(ctx, ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    if (logits_out) profile_tensor_get(ctx, ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    decoder_kv_commit_plan(ctx, kv_plan);
     return true;
 }
 
 // Offline single-token step.
 static bool run_offline_step(voxtral_context * ctx, int32_t token_id, int32_t position, int32_t * token_out) {
+    voxtral_decoder_kv_plan_t kv_plan;
+    if (!voxtral_decoder_kv_plan(ctx->decoder_kv, position, 1, kv_plan)) return false;
     static thread_local std::vector<uint8_t> step_meta_buf;
     ggml_context * gctx = init_graph_ctx(step_meta_buf, 4);
     ggml_cgraph * gf = build_offline_step_graph(ctx, gctx);
+    if (!gf) { ggml_free(gctx); return false; }
 
     if (!run_graph(ctx, ctx->sched_dec_step, gctx, gf, [&](ggml_cgraph * g) {
-        set_graph_input(g, "token_id", &token_id, sizeof(int32_t));
-        set_graph_input(g, "position", &position, sizeof(int32_t));
-    }, "offline step")) {
+        set_graph_input(ctx, g, "token_id", &token_id, sizeof(int32_t));
+        set_graph_input(ctx, g, "position", &position, sizeof(int32_t));
+    }, "offline step", voxtral_profile_stage::decoder_step_graph_execute)) {
         return false;
     }
 
-    if (token_out) ggml_backend_tensor_get(ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
-    ctx->kv_used += 1;
+    if (token_out) profile_tensor_get(ctx, ctx->decoder_argmax, token_out, 0, sizeof(int32_t));
+    decoder_kv_commit_plan(ctx, kv_plan);
     return true;
 }
 

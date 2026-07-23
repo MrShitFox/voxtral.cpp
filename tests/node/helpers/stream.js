@@ -43,6 +43,8 @@ export async function runStreamSession({
   modelPath = null,
   maxTokens = 0,
   ab = false,
+  kvParity = false,
+  warmup = false,
   env = null,
   realtimeMs = 0,
   skipParity = false,
@@ -70,6 +72,12 @@ export async function runStreamSession({
   // context, and emit both results plus a distinctContexts flag.
   if (ab) {
     args.push("--ab");
+  }
+  if (kvParity) {
+    args.push("--kv-parity");
+  }
+  if (warmup) {
+    args.push("--warmup");
   }
   if (realtimeMs > 0) {
     args.push("--realtime-ms", String(realtimeMs));

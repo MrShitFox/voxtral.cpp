@@ -11,7 +11,7 @@
 // Usage:
 //   voxtral-stream-test --model M.gguf --wav in.wav [--gpu auto|vulkan|none]
 //                       [--plan-file plan.txt] [--mode MODE] [--max-tokens N]
-//                       [--realtime-ms N] [--manual-oracle] [--ab]
+//                       [--realtime-ms N] [--warmup] [--manual-oracle] [--ab] [--kv-parity]
 //
 //   --plan-file : text file, one integer per line = a feed's sample count
 //                 (0 = an explicit zero-length feed). Must sum to the WAV's
@@ -28,6 +28,9 @@
 //                 (each owns its own context), run the same plan through both
 //                 sequentially, and emit both results plus a distinctContexts
 //                 flag. Proves model-shared / context-per-stream ownership.
+//   --kv-parity : sequential FP16 production, same-shape FP16/F32 numerical
+//                 plans, F32 production-topology plan, and accepted F32/32-row
+//                 finish-only oracle runs from one shared model.
 // ============================================================================
 
 #include "voxtral-stream.h"
@@ -307,6 +310,15 @@ struct StreamRun {
     std::vector<voxtral_stream_event> events;
     bool                 contextOwned = false;
     bool                 ok           = false;
+    bool                 warmupApplied = false;
+    double               warmupMs = 0.0;
+    double               modelLoadMs = 0.0;
+    double               coldFirstDecoderStepMs = 0.0;
+    double               coldFirstTokenMs = 0.0;
+    double               coldFirstVisibleTextMs = 0.0;
+    double               warmModelFirstDecoderStepMs = 0.0;
+    double               warmModelFirstTokenMs = 0.0;
+    double               warmModelFirstVisibleTextMs = 0.0;
 
     // Incremental Mel frontend evidence.
     bool     incrementalMel          = false;
@@ -344,6 +356,10 @@ struct StreamRun {
     double   encoderManualCosineSimilarity = 0.0;
     std::string encoderManualSha;
     bool     manualOracleChecked         = false;
+    std::vector<float> numericalEncoderOutput;
+    std::vector<float> numericalAdapterOutput;
+    std::vector<float> numericalDecoderHidden;
+    std::vector<float> numericalDecoderLogits;
     bool     fullMelReencodedAtFinish  = false;
     voxtral_encoder_metrics encMetrics;   // full strategy + KV work/memory instrumentation
 
@@ -402,6 +418,12 @@ struct StreamRun {
     double backlogMaxMs = 0.0;
     double finalBacklogMs = 0.0;
     double backlogGrowthSlopeMsPerSec = 0.0;
+    double postInputDrainMs = 0.0;
+    uint64_t deadlineMisses = 0;
+    double deadlineMissRate = 0.0;
+    voxtral_backlog_metrics encoderBacklog;
+    voxtral_backlog_metrics adapterBacklog;
+    voxtral_backlog_metrics decoderBacklog;
     double finishFrontendMs = 0.0;
     double finishEncoderMs = 0.0;
     double finishDecoderMs = 0.0;
@@ -410,7 +432,13 @@ struct StreamRun {
     int64_t streamIdleVramBytes = 0;
     int64_t afterFinishVramBytes = 0;
     int64_t afterDestroyVramBytes = 0;
+    int64_t modelLoadedRssKiB = 0;
+    int64_t streamIdleRssKiB = 0;
+    int64_t afterFinishRssKiB = 0;
+    int64_t afterDestroyRssKiB = 0;
     bool parityChecked = true;
+    voxtral_runtime_profile steadyRuntimeProfile;
+    voxtral_runtime_profile runtimeProfile;
 
     // Session 7: device-resident incremental adapter + decoder.
     bool     usesIncrementalDecode = false;
@@ -453,6 +481,7 @@ struct DriveOptions {
     int32_t pace_chunk_ms = 0;
     bool check_parity = true;
     bool check_manual_oracle = false;
+    bool capture_numerical = false;
     // Session 7.1 backpressure exercise: shrink the event queue to `max_events`
     // and, when `backpressure` is set, DELIBERATELY stop draining until feed
     // reports queue_full — then drain and continue. Proves mandatory events are
@@ -478,6 +507,22 @@ int64_t read_vram_used_bytes() {
     int64_t value = 0;
     if (in) in >> value;
     return value;
+}
+
+int64_t read_process_rss_kib() {
+    std::ifstream in("/proc/self/status");
+    std::string key;
+    while (in >> key) {
+        if (key == "VmRSS:") {
+            int64_t value = 0;
+            std::string unit;
+            in >> value >> unit;
+            return value;
+        }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    return 0;
 }
 
 // Direct batch-vs-incremental encoder tensor parity: recompute the batch encoder
@@ -531,6 +576,7 @@ double encoder_delta_vs_batch(const voxtral_context * cctx,
 // opt-in harness operation; production code never mutates process environment.
 struct TensorComparison {
     bool ok = false;
+    size_t elements = 0;
     double max_abs = 0.0;
     double mean_abs = 0.0;
     double rms_delta = 0.0;
@@ -538,6 +584,34 @@ struct TensorComparison {
     double cosine = 0.0;
     std::string reference_sha;
 };
+
+TensorComparison compare_tensors(const std::vector<float> & got,
+                                 const std::vector<float> & reference) {
+    TensorComparison cmp;
+    if (got.empty() || got.size() != reference.size()) return cmp;
+    cmp.elements = got.size();
+    long double sum_abs = 0.0L, sum_sq = 0.0L, ref_sq = 0.0L;
+    long double got_sq = 0.0L, dot = 0.0L;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double g = got[i];
+        const double r = reference[i];
+        const double d = g - r;
+        cmp.max_abs = std::max(cmp.max_abs, std::fabs(d));
+        sum_abs += std::fabs(d);
+        sum_sq += d * d;
+        ref_sq += r * r;
+        got_sq += g * g;
+        dot += g * r;
+    }
+    const long double n = (long double) got.size();
+    cmp.mean_abs = (double) (sum_abs / n);
+    cmp.rms_delta = std::sqrt((double) (sum_sq / n));
+    cmp.reference_rms = std::sqrt((double) (ref_sq / n));
+    const long double denom = std::sqrt(got_sq * ref_sq);
+    cmp.cosine = denom > 0.0L ? (double) (dot / denom) : 0.0;
+    cmp.ok = true;
+    return cmp;
+}
 
 TensorComparison encoder_delta_vs_manual(const voxtral_context * cctx,
                                           const float * mel, int32_t mel_frames,
@@ -719,6 +793,12 @@ StreamRun drive_stream(voxtral_stream * stream,
         }
     }
 
+    // Snapshot the hot path before bounded right-padding/EOS work. Session 8's
+    // no-growth gate applies to steady audio processing; terminal graph families
+    // are reported separately instead of being mistaken for per-step churn.
+    r.steadyRuntimeProfile = voxtral_context_runtime_profile_internal(
+        static_cast<const voxtral_context *>(voxtral_stream_context_ptr(stream)));
+
     voxtral_status finst = voxtral_status::internal_error;
     if (fst == voxtral_status::ok) {
         const auto tfin0 = std::chrono::steady_clock::now();
@@ -758,11 +838,19 @@ StreamRun drive_stream(voxtral_stream * stream,
         r.feedFinishLatenessP50Ms = percentile(finish_lateness_ms, 0.50);
         r.feedFinishLatenessP95Ms = percentile(finish_lateness_ms, 0.95);
         r.feedFinishLatenessMaxMs = percentile(finish_lateness_ms, 1.00);
+        // The feed call is synchronous: this is the wall interval from arrival
+        // of the final PCM sample to completion of all work triggered by it.
+        // EOS/right-padding work remains separately accounted by finish().
+        r.postInputDrainMs = finish_lateness_ms.back();
         r.backlogP50Ms = percentile(backlog_ms, 0.50);
         r.backlogP95Ms = percentile(backlog_ms, 0.95);
         r.backlogP99Ms = percentile(backlog_ms, 0.99);
         r.backlogMaxMs = percentile(backlog_ms, 1.00);
         r.finalBacklogMs = backlog_ms.back();
+        r.deadlineMisses = (uint64_t) std::count_if(
+            backlog_ms.begin(), backlog_ms.end(), [](double value) { return value > 0.0; });
+        r.deadlineMissRate = backlog_ms.empty()
+            ? 0.0 : (double) r.deadlineMisses / (double) backlog_ms.size();
         if (backlog_ms.size() > 1 && backlog_audio_s.size() == backlog_ms.size()) {
             // Least-squares slope over the whole run, not a fragile first/last
             // difference. A sustained realtime deficit therefore remains
@@ -861,6 +949,13 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.finishEncoderMs              = voxtral_stream_finish_encoder_ms(stream);
     r.finishDecoderMs              = voxtral_stream_finish_decoder_ms(stream);
     r.decoderKvAllocatedBytes      = voxtral_stream_decoder_kv_allocated_bytes(stream);
+    // Snapshot BEFORE the optional batch/manual parity passes below: those are
+    // reference-oracle work, not part of the production stream profile.
+    r.runtimeProfile = voxtral_context_runtime_profile_internal(
+        static_cast<const voxtral_context *>(voxtral_stream_context_ptr(stream)));
+    r.encoderBacklog = voxtral_stream_encoder_backlog(stream);
+    r.adapterBacklog = voxtral_stream_adapter_backlog(stream);
+    r.decoderBacklog = voxtral_stream_decoder_backlog(stream);
     r.fullMelReencodedAtFinish      = false;   // finish runs at most the last 1-2 encoder chunks
 
     const float * inc_enc    = voxtral_stream_encoder_output_data(stream);
@@ -872,6 +967,11 @@ StreamRun drive_stream(voxtral_stream * stream,
             esha.update(inc_enc, (size_t) used * VOXTRAL_ENC_DIM * sizeof(float));
         }
         r.encoderSha = esha.hex();
+    }
+    if (options.capture_numerical && inc_enc && inc_enc_frames > 0) {
+        const int32_t used = (inc_enc_frames / 4) * 4;
+        r.numericalEncoderOutput.assign(
+            inc_enc, inc_enc + (size_t) used * VOXTRAL_ENC_DIM);
     }
     if (options.check_parity) {
         const voxtral_context * ctx =
@@ -929,6 +1029,22 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.encoderOutputD2hBytes   = voxtral_stream_encoder_output_d2h_bytes(stream);
     r.partialTextRevision     = voxtral_stream_partial_text_revision(stream);
 
+    if (options.capture_numerical) {
+        const auto * ctx = static_cast<const voxtral_context *>(
+            voxtral_stream_context_ptr(stream));
+        const auto & production_encoder =
+            voxtral_context_diagnostic_encoder_output_internal(ctx);
+        if (!production_encoder.empty()) {
+            r.numericalEncoderOutput = production_encoder;
+        }
+        r.numericalAdapterOutput =
+            voxtral_context_diagnostic_adapter_output_internal(ctx);
+        r.numericalDecoderHidden =
+            voxtral_context_diagnostic_first_hidden_internal(ctx);
+        r.numericalDecoderLogits =
+            voxtral_context_diagnostic_first_logits_internal(ctx);
+    }
+
     // Session 7.1: decoder mode + event-queue telemetry.
     r.decoderMode                = voxtral_stream_decoder_mode(stream);
     r.eventsEmitted              = voxtral_stream_events_emitted(stream);
@@ -952,6 +1068,15 @@ StreamRun drive_stream(voxtral_stream * stream,
 void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"state\":\"" << r.state << "\",";
     js << "\"finishStatus\":\"" << r.finishStatus << "\",";
+    js << "\"warmupApplied\":" << (r.warmupApplied ? "true" : "false") << ",";
+    js << "\"warmupMs\":" << r.warmupMs << ",";
+    js << "\"modelLoadMs\":" << r.modelLoadMs << ",";
+    js << "\"coldFirstDecoderStepMs\":" << r.coldFirstDecoderStepMs << ",";
+    js << "\"coldFirstTokenMs\":" << r.coldFirstTokenMs << ",";
+    js << "\"coldFirstVisibleTextMs\":" << r.coldFirstVisibleTextMs << ",";
+    js << "\"warmModelFirstDecoderStepMs\":" << r.warmModelFirstDecoderStepMs << ",";
+    js << "\"warmModelFirstTokenMs\":" << r.warmModelFirstTokenMs << ",";
+    js << "\"warmModelFirstVisibleTextMs\":" << r.warmModelFirstVisibleTextMs << ",";
     js << "\"samplesReceived\":" << r.samplesReceived << ",";
     js << "\"samplesConsumed\":" << r.samplesConsumed << ",";
     js << "\"feedCalls\":" << r.feedCalls << ",";
@@ -1070,10 +1195,94 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"encoderFinishMs\":" << r.finishEncoderMs << ",";
     js << "\"decoderFinishMs\":" << r.finishDecoderMs << ",";
     js << "\"decoderKvAllocatedBytes\":" << r.decoderKvAllocatedBytes << ",";
+    js << "\"profileEnabled\":" << (r.runtimeProfile.enabled ? "true" : "false") << ",";
+    js << "\"profileStages\":{";
+    for (size_t i = 0; i < r.runtimeProfile.stages.size(); ++i) {
+        if (i) js << ",";
+        const auto stage = static_cast<voxtral_profile_stage>(i);
+        const auto & p = r.runtimeProfile.stages[i];
+        js << "\"" << voxtral_profile_stage_name(stage) << "\":{";
+        js << "\"count\":" << p.count << ",";
+        js << "\"totalMs\":" << p.totalMs << ",";
+        js << "\"meanMs\":" << p.meanMs << ",";
+        js << "\"p50Ms\":" << p.p50Ms << ",";
+        js << "\"p95Ms\":" << p.p95Ms << ",";
+        js << "\"p99Ms\":" << p.p99Ms << ",";
+        js << "\"maxMs\":" << p.maxMs << "}";
+    }
+    js << "},";
+    js << "\"totalGpuComputeMs\":" << r.runtimeProfile.totalGpuComputeMs << ",";
+    js << "\"totalPipelineComputeMs\":" << r.runtimeProfile.totalPipelineComputeMs << ",";
+    const double profiledRtf = r.audioDurationMs > 0.0
+        ? (r.runtimeProfile.totalPipelineComputeMs + r.finishLatencyMs) / r.audioDurationMs : 0.0;
+    js << "\"pipelineRtf\":" << profiledRtf << ",";
+    js << "\"computeHeadroomRatio\":" << (1.0 - profiledRtf) << ",";
+    js << "\"gpuBusyMeanMsPerFeed\":"
+       << (r.dataFeeds > 0 ? r.runtimeProfile.totalGpuComputeMs / (double) r.dataFeeds : 0.0) << ",";
+    js << "\"gpuBusyMeasurement\":\"synchronized_graph_wall_time\",";
+    js << "\"gpuTimestampQueries\":false,";
+    js << "\"cpuWallMeanMsPerFeed\":"
+       << (r.dataFeeds > 0 ? r.runtimeProfile.totalPipelineComputeMs / (double) r.dataFeeds : 0.0) << ",";
+    js << "\"encoderGraphBuildCount\":" << r.runtimeProfile.encoderGraphBuildCount << ",";
+    js << "\"adapterGraphBuildCount\":" << r.runtimeProfile.adapterGraphBuildCount << ",";
+    js << "\"decoderGraphBuildCount\":" << r.runtimeProfile.decoderGraphBuildCount << ",";
+    js << "\"encoderAllocations\":" << r.runtimeProfile.encoderAllocations << ",";
+    js << "\"adapterAllocations\":" << r.runtimeProfile.adapterAllocations << ",";
+    js << "\"decoderAllocations\":" << r.runtimeProfile.decoderAllocations << ",";
+    js << "\"steadyEncoderGraphBuildCount\":"
+       << r.steadyRuntimeProfile.encoderGraphBuildCount << ",";
+    js << "\"steadyAdapterGraphBuildCount\":"
+       << r.steadyRuntimeProfile.adapterGraphBuildCount << ",";
+    js << "\"steadyDecoderGraphBuildCount\":"
+       << r.steadyRuntimeProfile.decoderGraphBuildCount << ",";
+    js << "\"steadyEncoderAllocations\":"
+       << r.steadyRuntimeProfile.encoderAllocations << ",";
+    js << "\"steadyAdapterAllocations\":"
+       << r.steadyRuntimeProfile.adapterAllocations << ",";
+    js << "\"steadyDecoderAllocations\":"
+       << r.steadyRuntimeProfile.decoderAllocations << ",";
+    js << "\"graphAllocations\":" << r.runtimeProfile.graphAllocations << ",";
+    js << "\"allocationCounterUnit\":\"scheduler_graph_allocation_pass\",";
+    js << "\"individualTensorAllocationsInstrumented\":false,";
+    js << "\"backendSyncCount\":" << r.runtimeProfile.backendSyncCount << ",";
+    js << "\"commandSubmitCount\":" << r.runtimeProfile.commandSubmitCount << ",";
+    js << "\"tensorSetCount\":" << r.runtimeProfile.tensorSetCount << ",";
+    js << "\"tensorGetCount\":" << r.runtimeProfile.tensorGetCount << ",";
+    js << "\"kvF16Bytes\":" << r.runtimeProfile.kvF16Bytes << ",";
+    js << "\"temporaryF32KvBytes\":" << r.runtimeProfile.temporaryF32KvBytes << ",";
+    js << "\"decoderKvCapacity\":" << r.runtimeProfile.decoderKvCapacity << ",";
+    js << "\"decoderKvUsed\":" << r.runtimeProfile.decoderKvUsed << ",";
+    js << "\"decoderKvWraps\":" << r.runtimeProfile.decoderKvWraps << ",";
+    js << "\"decoderKvEvictions\":" << r.runtimeProfile.decoderKvEvictions << ",";
+    js << "\"decoderKvBytesMoved\":" << r.runtimeProfile.decoderKvBytesMoved << ",";
+    js << "\"decoderKvFullBufferMoves\":" << r.runtimeProfile.decoderKvFullBufferMoves << ",";
+    js << "\"decoderOldestAbsolutePosition\":"
+       << r.runtimeProfile.decoderOldestAbsolutePosition << ",";
+    js << "\"decoderNextAbsolutePosition\":"
+       << r.runtimeProfile.decoderNextAbsolutePosition << ",";
+    js << "\"decoderKvElementSize\":" << r.runtimeProfile.decoderKvElementSize << ",";
+    js << "\"decoderFirstWrapAbsolutePosition\":"
+       << r.runtimeProfile.decoderFirstWrapAbsolutePosition << ",";
+    const double firstWrapAudioMs = r.runtimeProfile.decoderFirstWrapAbsolutePosition >= 0
+        ? std::max(0.0,
+            ((double) (r.runtimeProfile.decoderFirstWrapAbsolutePosition + 1) *
+             VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK -
+             (double) VOXTRAL_N_LEFT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK) *
+            1000.0 / VOXTRAL_SAMPLE_RATE)
+        : 0.0;
+    js << "\"decoderFirstWrapAudioMs\":" << firstWrapAudioMs << ",";
+    js << "\"decoderPreWrapP99Ms\":" << r.runtimeProfile.decoderPreWrapP99Ms << ",";
+    js << "\"decoderWrapStepMs\":" << r.runtimeProfile.decoderWrapStepMs << ",";
+    js << "\"decoderPostWrapP99Ms\":" << r.runtimeProfile.decoderPostWrapP99Ms << ",";
+    js << "\"argmaxEmbeddedInDecoderGraph\":true,";
     js << "\"modelLoadedVramBytes\":" << r.modelLoadedVramBytes << ",";
     js << "\"streamIdleVramBytes\":" << r.streamIdleVramBytes << ",";
     js << "\"afterFinishVramBytes\":" << r.afterFinishVramBytes << ",";
     js << "\"afterDestroyVramBytes\":" << r.afterDestroyVramBytes << ",";
+    js << "\"modelLoadedRssKiB\":" << r.modelLoadedRssKiB << ",";
+    js << "\"streamIdleRssKiB\":" << r.streamIdleRssKiB << ",";
+    js << "\"afterFinishRssKiB\":" << r.afterFinishRssKiB << ",";
+    js << "\"afterDestroyRssKiB\":" << r.afterDestroyRssKiB << ",";
     js << "\"pacedRealtime\":" << (r.pacedRealtime ? "true" : "false") << ",";
     js << "\"paceChunkMs\":" << r.paceChunkMs << ",";
     js << "\"audioDurationMs\":" << r.audioDurationMs << ",";
@@ -1091,6 +1300,24 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"backlogMaxMs\":" << r.backlogMaxMs << ",";
     js << "\"finalBacklogMs\":" << r.finalBacklogMs << ",";
     js << "\"backlogGrowthSlopeMsPerSec\":" << r.backlogGrowthSlopeMsPerSec << ",";
+    js << "\"postInputDrainMs\":" << r.postInputDrainMs << ",";
+    js << "\"deadlineMisses\":" << r.deadlineMisses << ",";
+    js << "\"deadlineMissRate\":" << r.deadlineMissRate << ",";
+    auto write_backlog = [&](const char * name, const voxtral_backlog_metrics & m) {
+        js << "\"" << name << "\":{";
+        js << "\"count\":" << m.count << ",";
+        js << "\"p50Ms\":" << m.p50Ms << ",";
+        js << "\"p95Ms\":" << m.p95Ms << ",";
+        js << "\"p99Ms\":" << m.p99Ms << ",";
+        js << "\"maxMs\":" << m.maxMs << ",";
+        js << "\"finalMs\":" << m.finalMs << ",";
+        js << "\"slopeMsPerSec\":" << m.slopeMsPerSec << ",";
+        js << "\"deadlineMisses\":" << m.deadlineMisses << ",";
+        js << "\"deadlineMissRate\":" << m.deadlineMissRate << "},";
+    };
+    write_backlog("encoderBacklog", r.encoderBacklog);
+    write_backlog("adapterBacklog", r.adapterBacklog);
+    write_backlog("decoderBacklog", r.decoderBacklog);
     js << "\"contextOwnedByStream\":" << (r.contextOwned ? "true" : "false") << ",";
     // --- Session 7 incremental adapter + decoder ---
     js << "\"usesIncrementalDecode\":" << (r.usesIncrementalDecode ? "true" : "false") << ",";
@@ -1156,6 +1383,7 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    const auto process_started_at = std::chrono::steady_clock::now();
     std::string model_path, wav_path, plan_file, mode = "full";
     voxtral_gpu_backend gpu = voxtral_gpu_backend::auto_detect;
     int32_t max_tokens = 0;
@@ -1163,6 +1391,8 @@ int main(int argc, char ** argv) {
     bool skip_parity = false;
     bool manual_oracle = false;
     bool ab = false;
+    bool kv_parity = false;
+    bool warmup = false;
     int32_t max_events = 0;
     bool backpressure = false;
     int32_t synthetic_seconds = 0;    // >0: generate synthetic audio instead of reading --wav
@@ -1183,6 +1413,8 @@ int main(int argc, char ** argv) {
         else if (a == "--skip-parity") { skip_parity = true; }
         else if (a == "--manual-oracle") { manual_oracle = true; }
         else if (a == "--ab")          { ab = true; }
+        else if (a == "--kv-parity")   { kv_parity = true; }
+        else if (a == "--warmup")      { warmup = true; }
         else if (a == "--max-events")  { const char * v = val("--max-events"); if (!v) return 2; max_events = int32_t(std::strtol(v, nullptr, 10)); }
         else if (a == "--backpressure") { backpressure = true; }
         else if (a == "--synthetic-seconds") { const char * v = val("--synthetic-seconds"); if (!v) return 2; synthetic_seconds = int32_t(std::strtol(v, nullptr, 10)); }
@@ -1201,7 +1433,7 @@ int main(int argc, char ** argv) {
 
     if (model_path.empty() || (wav_path.empty() && synthetic_seconds <= 0)) {
         std::cerr << "usage: voxtral-stream-test --model M.gguf --wav in.wav "
-                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n] [--realtime-ms n] [--ab]\n"
+                     "[--gpu ...] [--plan-file f] [--mode m] [--max-tokens n] [--realtime-ms n] [--warmup] [--ab] [--kv-parity]\n"
                      "       [--max-events n] [--backpressure] [--synthetic-seconds n] [--max-total-samples n]\n";
         return 2;
     }
@@ -1258,13 +1490,18 @@ int main(int argc, char ** argv) {
     drive_options.check_manual_oracle = manual_oracle;
     drive_options.max_events = max_events;
     drive_options.backpressure = backpressure;
+    drive_options.capture_numerical = kv_parity;
 
     // Load the model ONCE (shared, immutable). Each stream will create and own
     // its own execution context from it via voxtral_stream_create_internal.
     voxtral_log_callback logger = log_stderr;
+    const auto model_load_started_at = std::chrono::steady_clock::now();
     voxtral_model * model = voxtral_model_load_from_file(model_path, logger, gpu);
     if (!model) { std::cerr << "failed to load model\n"; return 5; }
+    const double model_load_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - model_load_started_at).count();
     const int64_t model_loaded_vram_bytes = read_vram_used_bytes();
+    const int64_t model_loaded_rss_kib = read_process_rss_kib();
 
     voxtral_context_params cp;
     cp.log_level = voxtral_log_level::info;
@@ -1279,7 +1516,139 @@ int main(int argc, char ** argv) {
     int exit_code = 0;
     std::ostringstream js;
 
-    if (ab) {
+    auto apply_warmup = [&](voxtral_stream * stream, StreamRun & run) -> bool {
+        if (!warmup) return true;
+        const auto start = std::chrono::steady_clock::now();
+        const voxtral_status status = voxtral_stream_warmup_internal(stream);
+        run.warmupMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        run.warmupApplied = status == voxtral_status::ok;
+        if (status != voxtral_status::ok) {
+            std::cerr << "warmup failed: " << voxtral_stream_status_name(status)
+                      << " (" << voxtral_stream_last_error(stream) << ")\n";
+            return false;
+        }
+        // Warmup is a preparation operation, not a synthetic utterance. Lock
+        // down that contract here so shader/graph preparation can never become
+        // an invisible source of token, transcript, event or audio state.
+        voxtral_stream_event warmup_event;
+        const bool pristine =
+            voxtral_stream_get_state(stream) == voxtral_stream_state::created &&
+            voxtral_stream_samples_received(stream) == 0 &&
+            voxtral_stream_samples_consumed(stream) == 0 &&
+            voxtral_stream_tokens(stream).empty() &&
+            voxtral_stream_transcript(stream).empty() &&
+            voxtral_stream_events_emitted(stream) == 0 &&
+            !voxtral_stream_poll_event(stream, warmup_event);
+        if (!pristine) {
+            std::cerr << "warmup polluted fresh stream state\n";
+            return false;
+        }
+        if (voxtral_stream_warmup_internal(stream) != voxtral_status::ok) {
+            std::cerr << "warmup is not idempotent\n";
+            return false;
+        }
+        return true;
+    };
+
+    if (kv_parity) {
+        // Keep only one execution context resident at a time (RX 6600 VRAM),
+        // while sharing the immutable model across all plans. Test-only ring
+        // and graph selectors must not leak into this production-parity mode.
+        unsetenv("VOXTRAL_DECODER_KV_TEST_CAPACITY");
+        unsetenv("VOXTRAL_DECODER_STEP_GRAPH");
+        unsetenv("VOXTRAL_DECODER_RING_ATTENTION");
+        auto run_variant = [&](const char * decoder_mode,
+                               const char * encoder_kv_type,
+                               const char * decoder_kv_type,
+                               const char * physical_rows) {
+            setenv("VOXTRAL_NUMERICAL_DIAGNOSTICS", "1", 1);
+            setenv("VOXTRAL_STREAM_DECODER", decoder_mode, 1);
+            setenv("VOXTRAL_ENCODER_KV_TYPE", encoder_kv_type, 1);
+            setenv("VOXTRAL_DECODER_KV_TYPE", decoder_kv_type, 1);
+            setenv("VOXTRAL_ENC_KV_LOGICAL_BATCH", "4", 1);
+            setenv("VOXTRAL_ENC_KV_PHYSICAL_ROWS", physical_rows, 1);
+            voxtral_stream * stream = voxtral_stream_create_internal(model, cp, sp);
+            if (!stream) return StreamRun{};
+            StreamRun run;
+            if (apply_warmup(stream, run)) {
+                const bool warmed = run.warmupApplied;
+                const double warmup_ms = run.warmupMs;
+                run = drive_stream(stream, pcm16, counts, drive_options);
+                run.warmupApplied = warmed;
+                run.warmupMs = warmup_ms;
+            }
+            voxtral_stream_destroy_internal(stream);
+            return run;
+        };
+
+        StreamRun production = run_variant("incremental", "f16", "f16", "4");
+        StreamRun fp16_reference = run_variant("reference", "f16", "f16", "4");
+        StreamRun f32_same_shape = run_variant("reference", "f32", "f32", "4");
+        StreamRun f32_production = run_variant("incremental", "f32", "f32", "4");
+        StreamRun f32_reference = run_variant("reference", "f32", "f32", "32");
+
+        // Tensor deltas use the exact production reusable topology in both
+        // storage modes. The finish-only plans below remain independent token
+        // and transcript oracles, rather than standing in for production math.
+        const TensorComparison encoder_cmp = compare_tensors(
+            production.numericalEncoderOutput,
+            f32_production.numericalEncoderOutput);
+        const TensorComparison adapter_cmp = compare_tensors(
+            production.numericalAdapterOutput,
+            f32_production.numericalAdapterOutput);
+        const TensorComparison hidden_cmp = compare_tensors(
+            production.numericalDecoderHidden,
+            f32_production.numericalDecoderHidden);
+        const TensorComparison logits_cmp = compare_tensors(
+            production.numericalDecoderLogits,
+            f32_production.numericalDecoderLogits);
+        const bool token_parity = production.tokens == f32_reference.tokens &&
+                                  fp16_reference.tokens == f32_reference.tokens &&
+                                  f32_same_shape.tokens == f32_reference.tokens &&
+                                  f32_production.tokens == f32_reference.tokens;
+        const bool transcript_parity = production.text == f32_reference.text &&
+                                       fp16_reference.text == f32_reference.text &&
+                                       f32_same_shape.text == f32_reference.text &&
+                                       f32_production.text == f32_reference.text;
+
+        auto write_comparison = [&](const TensorComparison & cmp) {
+            js << "{\"available\":" << (cmp.ok ? "true" : "false")
+               << ",\"elements\":" << cmp.elements
+               << ",\"maxAbsDelta\":" << cmp.max_abs
+               << ",\"meanAbsDelta\":" << cmp.mean_abs
+               << ",\"rmsDelta\":" << cmp.rms_delta
+               << ",\"referenceRms\":" << cmp.reference_rms
+               << ",\"normalizedRms\":"
+               << (cmp.reference_rms > 0.0 ? cmp.rms_delta / cmp.reference_rms : 0.0)
+               << ",\"cosineSimilarity\":" << cmp.cosine << "}";
+        };
+
+        js << "{";
+        js << "\"mode\":\"kv-parity\",";
+        js << "\"modelShared\":true,";
+        js << "\"execution\":\"sequential\",";
+        js << "\"sampleRate\":" << sp.sample_rate << ",";
+        js << "\"wavSamples\":" << total << ",";
+        js << "\"production\":{"; write_run_fields(js, production); js << "},";
+        js << "\"fp16Reference\":{"; write_run_fields(js, fp16_reference); js << "},";
+        js << "\"f32SameShape\":{"; write_run_fields(js, f32_same_shape); js << "},";
+        js << "\"f32Production\":{"; write_run_fields(js, f32_production); js << "},";
+        js << "\"f32Reference\":{"; write_run_fields(js, f32_reference); js << "},";
+        js << "\"numerical\":{";
+        js << "\"encoder\":"; write_comparison(encoder_cmp); js << ",";
+        js << "\"adapter\":"; write_comparison(adapter_cmp); js << ",";
+        js << "\"decoderHidden\":"; write_comparison(hidden_cmp); js << ",";
+        js << "\"decoderLogits\":"; write_comparison(logits_cmp); js << "},";
+        js << "\"tokenParity\":" << (token_parity ? "true" : "false") << ",";
+        js << "\"transcriptParity\":" << (transcript_parity ? "true" : "false");
+        js << "}";
+
+        exit_code = (production.ok && fp16_reference.ok && f32_same_shape.ok &&
+                     f32_production.ok && f32_reference.ok &&
+                     encoder_cmp.ok && adapter_cmp.ok && hidden_cmp.ok && logits_cmp.ok &&
+                     token_parity && transcript_parity) ? 0 : 1;
+    } else if (ab) {
         // Two streams from one model, both alive: their contexts must be distinct
         // (each stream owns its own). Execution stays strictly sequential — A is
         // fully finished before B is fed; this is NOT concurrent streaming.
@@ -1296,8 +1665,17 @@ int main(int argc, char ** argv) {
         const void * ctx_b = voxtral_stream_context_ptr(b);
         const bool distinct = (ctx_a != nullptr && ctx_b != nullptr && ctx_a != ctx_b);
 
-        StreamRun run_a = drive_stream(a, pcm16, counts, drive_options);
-        StreamRun run_b = drive_stream(b, pcm16, counts, drive_options);
+        StreamRun run_a, run_b;
+        if (apply_warmup(a, run_a)) {
+            const double ms = run_a.warmupMs; const bool applied = run_a.warmupApplied;
+            run_a = drive_stream(a, pcm16, counts, drive_options);
+            run_a.warmupMs = ms; run_a.warmupApplied = applied;
+        }
+        if (apply_warmup(b, run_b)) {
+            const double ms = run_b.warmupMs; const bool applied = run_b.warmupApplied;
+            run_b = drive_stream(b, pcm16, counts, drive_options);
+            run_b.warmupMs = ms; run_b.warmupApplied = applied;
+        }
 
         // Destroy each stream (frees its OWN context); the model outlives both.
         voxtral_stream_destroy_internal(a);
@@ -1317,18 +1695,45 @@ int main(int argc, char ** argv) {
 
         exit_code = (run_a.ok && run_b.ok && distinct) ? 0 : 1;
     } else {
+        const auto warm_model_started_at = std::chrono::steady_clock::now();
         voxtral_stream * stream = voxtral_stream_create_internal(model, cp, sp);
         if (!stream) { std::cerr << "failed to create stream\n"; voxtral_model_free(model); return 7; }
 
         const int64_t stream_idle_vram_bytes = read_vram_used_bytes();
-        StreamRun run = drive_stream(stream, pcm16, counts, drive_options);
+        const int64_t stream_idle_rss_kib = read_process_rss_kib();
+        StreamRun run;
+        if (!apply_warmup(stream, run)) {
+            voxtral_stream_destroy_internal(stream);
+            voxtral_model_free(model);
+            return 8;
+        }
+        const double warmup_ms = run.warmupMs;
+        const bool warmup_applied = run.warmupApplied;
+        const double pre_drive_process_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - process_started_at).count();
+        const double pre_drive_warm_model_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - warm_model_started_at).count();
+        run = drive_stream(stream, pcm16, counts, drive_options);
+        run.warmupMs = warmup_ms;
+        run.warmupApplied = warmup_applied;
+        run.modelLoadMs = model_load_ms;
+        run.coldFirstDecoderStepMs = pre_drive_process_ms + run.firstDecoderStepMs;
+        run.coldFirstTokenMs = pre_drive_process_ms + run.firstTokenMs;
+        run.coldFirstVisibleTextMs = pre_drive_process_ms + run.firstVisibleTextMs;
+        run.warmModelFirstDecoderStepMs = pre_drive_warm_model_ms + run.firstDecoderStepMs;
+        run.warmModelFirstTokenMs = pre_drive_warm_model_ms + run.firstTokenMs;
+        run.warmModelFirstVisibleTextMs = pre_drive_warm_model_ms + run.firstVisibleTextMs;
         run.modelLoadedVramBytes = model_loaded_vram_bytes;
         run.streamIdleVramBytes = stream_idle_vram_bytes;
         run.afterFinishVramBytes = read_vram_used_bytes();
+        run.modelLoadedRssKiB = model_loaded_rss_kib;
+        run.streamIdleRssKiB = stream_idle_rss_kib;
+        run.afterFinishRssKiB = read_process_rss_kib();
 
         // Destroy the stream (frees its owned context), then free the model.
         voxtral_stream_destroy_internal(stream);
         run.afterDestroyVramBytes = read_vram_used_bytes();
+        run.afterDestroyRssKiB = read_process_rss_kib();
 
         js << "{";
         js << "\"mode\":\"single\",";
