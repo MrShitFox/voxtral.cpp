@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.16)
 
 project(voxtral_cpp LANGUAGES C CXX)
 
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -27,6 +31,39 @@ endif()
 include(CTest)
 
 find_package(Threads REQUIRED)
+
+# The standalone network adapter is enabled by default when its normal system
+# dependencies are discoverable. Boost.System is header-only on the supported
+# Boost range. Some distributions (including Arch) ship libboost_json without
+# per-component CMake config files, so discover the headers and JSON library
+# separately rather than requiring boost_systemConfig.cmake.
+find_package(Boost 1.75 QUIET)
+find_library(VOXTRAL_BOOST_JSON_LIBRARY
+    NAMES boost_json
+    HINTS ${Boost_LIBRARY_DIRS})
+if(Boost_FOUND AND VOXTRAL_BOOST_JSON_LIBRARY)
+    set(VOXTRAL_BUILD_SERVER_DEFAULT ON)
+else()
+    set(VOXTRAL_BUILD_SERVER_DEFAULT OFF)
+endif()
+option(
+    VOXTRAL_BUILD_SERVER
+    "Build the standalone HTTP/WebSocket transcription server"
+    ${VOXTRAL_BUILD_SERVER_DEFAULT})
+if(VOXTRAL_BUILD_SERVER AND
+   (NOT Boost_FOUND OR NOT VOXTRAL_BOOST_JSON_LIBRARY))
+    message(FATAL_ERROR
+        "VOXTRAL_BUILD_SERVER requires Boost >= 1.75 headers and libboost_json")
+endif()
+if(VOXTRAL_BUILD_SERVER)
+    if(DEFINED BUILD_SHARED_LIBS AND NOT BUILD_SHARED_LIBS)
+        message(FATAL_ERROR
+            "voxtral-server must link libvoxtral.so.1; "
+            "do not configure it with BUILD_SHARED_LIBS=OFF")
+    endif()
+    set(BUILD_SHARED_LIBS ON CACHE BOOL
+        "Build shared libraries (required by voxtral-server)")
+endif()
 
 if(VOXTRAL_USE_SYSTEM_GGML)
     find_package(ggml CONFIG REQUIRED)
@@ -178,6 +215,51 @@ if(VOXTRAL_BUILD_EXAMPLES)
     target_link_libraries(voxtral-streaming-c PRIVATE voxtral_lib)
 endif()
 
+if(VOXTRAL_BUILD_SERVER)
+    add_library(voxtral_server_common STATIC
+        server/auth.cpp
+        server/gpu-lease.cpp
+        server/json-protocol.cpp
+        server/logger.cpp
+        server/server-config.cpp
+        server/wav-reader.cpp)
+    target_include_directories(voxtral_server_common
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/server
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${Boost_INCLUDE_DIRS})
+    target_link_libraries(voxtral_server_common
+        PUBLIC
+            ${VOXTRAL_BOOST_JSON_LIBRARY}
+            Threads::Threads)
+    target_compile_definitions(voxtral_server_common PUBLIC
+        BOOST_ERROR_CODE_HEADER_ONLY)
+
+    add_executable(voxtral-server
+        server/batch-transcription.cpp
+        server/engine.cpp
+        server/http-session.cpp
+        server/main.cpp
+        server/realtime-session.cpp
+        server/server-app.cpp)
+    target_include_directories(voxtral-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/server)
+    target_link_libraries(voxtral-server PRIVATE
+        voxtral_server_common
+        voxtral_lib
+        Threads::Threads)
+    if(UNIX)
+        if(APPLE)
+            set_property(TARGET voxtral-server PROPERTY
+                INSTALL_RPATH "@loader_path/../lib")
+        else()
+            set_property(TARGET voxtral-server PROPERTY
+                BUILD_RPATH "$ORIGIN"
+                INSTALL_RPATH "$ORIGIN/../lib")
+        endif()
+    endif()
+endif()
+
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
 target_link_libraries(voxtral-quantize PRIVATE ${VOXTRAL_GGML_TARGETS} Threads::Threads)
 target_include_directories(voxtral-quantize PRIVATE ${VOXTRAL_GGML_INCLUDES})
@@ -207,6 +289,9 @@ endif()
 # Install the CLI tools, stable library and C headers.
 install(TARGETS voxtral voxtral-quantize
     RUNTIME DESTINATION bin)
+if(VOXTRAL_BUILD_SERVER)
+    install(TARGETS voxtral-server RUNTIME DESTINATION bin)
+endif()
 install(TARGETS voxtral_lib
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
@@ -237,6 +322,14 @@ endif()
 # header lives in src/.
 # ----------------------------------------------------------------------------
 if(BUILD_TESTING)
+    if(VOXTRAL_BUILD_SERVER)
+        add_executable(voxtral_server_unit
+            tests/server/server_unit_test.cpp)
+        target_link_libraries(voxtral_server_unit PRIVATE
+            voxtral_server_common)
+        add_test(NAME voxtral_server_unit COMMAND voxtral_server_unit)
+    endif()
+
     # Public headers are compiled as standalone translation units without any
     # private include directory or GGML header dependency.
     add_executable(public_header_c11 tests/headers/public_header_smoke.c)
