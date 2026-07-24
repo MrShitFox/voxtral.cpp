@@ -19,7 +19,8 @@ extern "C" {
 #define VOXTRAL_EVENT_QUEUE_CAPACITY_DEFAULT 4096u
 #define VOXTRAL_EVENT_QUEUE_CAPACITY_MAX 4096u
 #define VOXTRAL_EVENT_TERMINAL_HEADROOM 64u
-#define VOXTRAL_STREAM_MAX_AUDIO_SAMPLES UINT64_C(57600000)
+/** Representational ceiling of the public cumulative sample counters. */
+#define VOXTRAL_STREAM_MAX_AUDIO_SAMPLES UINT64_MAX
 
 /** Session 11 accepts exactly signed little-endian PCM16 samples. */
 typedef enum voxtral_audio_format {
@@ -199,11 +200,13 @@ VOXTRAL_API void voxtral_stream_destroy(voxtral_stream * stream);
  *         samples_consumed precisely states whether this call accepted audio;
  *         no sample is silently dropped.
  * @return VOXTRAL_STATUS_INVALID_ARGUMENT when the request exceeds the fixed
- *         per-call guard or VOXTRAL_STREAM_MAX_AUDIO_SAMPLES cumulatively.
+ *         per-call guard or cannot be represented by cumulative runtime
+ *         counters.
  * @return VOXTRAL_STATUS_INVALID_STATE after finish/cancel/completion.
  *
  * A successful zero-length feed is a no-op and may also resume a decoder after
- * the caller has drained events. Input is copied before return.
+ * the caller has drained events. Input is copied before return. The core
+ * library does not impose a product-level session-duration policy.
  * Thread safety: all calls on one stream must be externally serialized.
  */
 VOXTRAL_API voxtral_status voxtral_stream_feed_pcm16(

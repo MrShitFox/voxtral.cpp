@@ -26,8 +26,8 @@ try {
       run.lifecycle?.secondStreamRejected === true,
     cancelIdempotent:
       run.lifecycle?.cancelIdempotent === true,
-    durationLimitStructured:
-      run.lifecycle?.durationLimitStructured === true,
+    oversizeFeedStructured:
+      run.lifecycle?.oversizeFeedStructured === true,
     resetActiveRejected:
       run.lifecycle?.resetActiveRejected === true,
     resetFromCreated:

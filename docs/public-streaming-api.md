@@ -105,11 +105,18 @@ format returns `VOXTRAL_STATUS_UNSUPPORTED_AUDIO_FORMAT`.
 The caller retains ownership of its input array. Samples accepted by
 `voxtral_stream_feed_pcm16()` are copied before the call returns.
 
-API v1 admits at most `VOXTRAL_STREAM_MAX_AUDIO_SAMPLES` (57,600,000 samples,
-60 minutes) per reset generation. This is a fixed decoder admission guard, not
-retained PCM: production inference still keeps bounded frontend state. A call
-that would cross the limit consumes zero of that call and returns
-`INVALID_ARGUMENT`; it is not reported as event backpressure.
+The core streaming library does not impose a product-level session-duration
+limit. It rejects only requests that cannot be represented by its runtime
+counters or violate the bounded per-call input guard. Applications and network
+servers must enforce their own duration, memory, and idle-time policies.
+
+`VOXTRAL_STREAM_MAX_AUDIO_SAMPLES` remains source-compatible and denotes the
+`UINT64_MAX` representational ceiling of the cumulative sample counters, not a
+recommended session length. Transcript and token history can grow with stream
+duration, so the absence of a library duration limit does not guarantee bounded
+host memory indefinitely. A future server must enforce its own configurable
+session limit. Reset releases stream-specific accumulated state as described
+by the existing lifecycle contract.
 
 ## Backpressure
 

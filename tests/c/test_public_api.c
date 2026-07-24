@@ -194,8 +194,8 @@ int main(void) {
                    "event text ABI changed");
     _Static_assert(VOXTRAL_EVENT_TERMINAL_HEADROOM == 64,
                    "terminal queue bound changed");
-    _Static_assert(VOXTRAL_STREAM_MAX_AUDIO_SAMPLES == UINT64_C(57600000),
-                   "stream duration bound changed");
+    _Static_assert(VOXTRAL_STREAM_MAX_AUDIO_SAMPLES == UINT64_MAX,
+                   "stream sample ceiling changed");
 
     test_version_and_status();
     test_defaults();

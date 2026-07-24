@@ -1017,7 +1017,7 @@ static int run_lifecycle_edges(
     const voxtral_stream_params * params,
     int * second_stream_rejected,
     int * cancel_idempotent,
-    int * duration_limit_structured,
+    int * oversize_feed_structured,
     int * reset_active_rejected,
     int * reset_created,
     int * no_cancel_final)
@@ -1031,22 +1031,20 @@ static int run_lifecycle_edges(
     if (!reset_is_pristine(stream)) return 0;
     int16_t sample = 0;
     size_t consumed = 99;
-    const voxtral_status duration_status = voxtral_stream_feed_pcm16(
-        stream, &sample,
-        (size_t) VOXTRAL_STREAM_MAX_AUDIO_SAMPLES + 1u,
-        &consumed);
-    voxtral_error_info duration_error;
-    memset(&duration_error, 0, sizeof(duration_error));
-    duration_error.struct_size = sizeof(duration_error);
-    duration_error.api_version = VOXTRAL_API_VERSION;
-    *duration_limit_structured =
-        duration_status == VOXTRAL_STATUS_INVALID_ARGUMENT &&
+    const voxtral_status oversize_status = voxtral_stream_feed_pcm16(
+        stream, &sample, SIZE_MAX, &consumed);
+    voxtral_error_info oversize_error;
+    memset(&oversize_error, 0, sizeof(oversize_error));
+    oversize_error.struct_size = sizeof(oversize_error);
+    oversize_error.api_version = VOXTRAL_API_VERSION;
+    *oversize_feed_structured =
+        oversize_status == VOXTRAL_STATUS_INVALID_ARGUMENT &&
         consumed == 0 &&
         voxtral_stream_get_state(stream) == VOXTRAL_STREAM_CREATED &&
-        voxtral_stream_get_last_error(stream, &duration_error) ==
+        voxtral_stream_get_last_error(stream, &oversize_error) ==
             VOXTRAL_STATUS_OK &&
-        duration_error.status == VOXTRAL_STATUS_INVALID_ARGUMENT &&
-        duration_error.message[0] != '\0';
+        oversize_error.status == VOXTRAL_STATUS_INVALID_ARGUMENT &&
+        oversize_error.message[0] != '\0';
 
     consumed = 0;
     const size_t n = pcm->count < 1280u ? pcm->count : 1280u;
@@ -1085,7 +1083,7 @@ static int run_lifecycle_edges(
         voxtral_stream_reset(stream) == VOXTRAL_STATUS_OK &&
         voxtral_stream_get_state(stream) == VOXTRAL_STREAM_CREATED;
     return *second_stream_rejected && *cancel_idempotent &&
-           *duration_limit_structured &&
+           *oversize_feed_structured &&
            *reset_active_rejected &&
            *reset_created && *no_cancel_final;
 }
@@ -1311,7 +1309,7 @@ int main(int argc, char ** argv) {
 
     int second_stream_rejected = 0;
     int cancel_idempotent = 0;
-    int duration_limit_structured = 0;
+    int oversize_feed_structured = 0;
     int reset_active_rejected = 0;
     int reset_created = 0;
     int no_cancel_final = 0;
@@ -1320,7 +1318,7 @@ int main(int argc, char ** argv) {
         lifecycle_ok = run_lifecycle_edges(
             context, stream, &pcm, &stream_params,
             &second_stream_rejected, &cancel_idempotent,
-            &duration_limit_structured,
+            &oversize_feed_structured,
             &reset_active_rejected,
             &reset_created, &no_cancel_final);
     }
@@ -1410,8 +1408,8 @@ int main(int argc, char ** argv) {
            second_stream_rejected ? "true" : "false");
     printf(",\"cancelIdempotent\":%s",
            cancel_idempotent ? "true" : "false");
-    printf(",\"durationLimitStructured\":%s",
-           duration_limit_structured ? "true" : "false");
+    printf(",\"oversizeFeedStructured\":%s",
+           oversize_feed_structured ? "true" : "false");
     printf(",\"resetActiveRejected\":%s",
            reset_active_rejected ? "true" : "false");
     printf(",\"resetFromCreated\":%s",

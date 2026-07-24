@@ -105,17 +105,26 @@ voxtral_status_internal feed_common(voxtral_stream * s, const void * ptr, size_t
         return voxtral_status_internal::ok;
     }
 
-    if (static_cast<uint64_t>(count) > kMaxFeedSamples) {
+    if (count > kMaxFeedSamples) {
         set_error(s, voxtral_status_internal::invalid_argument, "feed exceeds per-call sample limit");
         return voxtral_status_internal::invalid_argument;
     }
 
     const uint64_t received = s->lifecycle.total_samples_received;
-    // Overflow-safe cumulative admission bound, not an allocation failure.
-    // Production inference retains only bounded frontend/encoder state, and
-    // decoder rollover is handled by the fixed circular KV.
-    if (count > s->params.max_total_samples ||
-        received > s->params.max_total_samples - static_cast<uint64_t>(count)) {
+    uint64_t admitted = 0;
+    if (!checked_sample_count_add(received, count, admitted)) {
+        set_error(s, voxtral_status_internal::invalid_argument,
+                  "feed would overflow cumulative sample counter");
+        return voxtral_status_internal::invalid_argument;
+    }
+    if (admitted > static_cast<uint64_t>(INT64_MAX)) {
+        set_error(s, voxtral_status_internal::invalid_argument,
+                  "stream sample position exceeds internal counter range");
+        return voxtral_status_internal::invalid_argument;
+    }
+    // Private tests/tools may request a lower admission bound. Public streams
+    // use UINT64_MAX and therefore have no product-level duration policy.
+    if (admitted > s->params.max_total_samples) {
         set_error(s, voxtral_status_internal::limit_exceeded,
                   "stream duration exceeds max_total_samples admission limit");
         return voxtral_status_internal::limit_exceeded;
@@ -201,7 +210,7 @@ voxtral_status_internal feed_common(voxtral_stream * s, const void * ptr, size_t
             // frames, so output is produced during feed rather than finish().
             voxtral_encoder_stream_note_audio(
                 s->frontend.enc,
-                (int64_t) (received + (uint64_t) count),
+                static_cast<int64_t>(admitted),
                 arrival_ns,
                 voxtral_mel_frontend_frame_count(s->frontend.mel_fe),
                 stream_now_ns(),
@@ -242,7 +251,7 @@ voxtral_status_internal feed_common(voxtral_stream * s, const void * ptr, size_t
     }
     s->frontend.feed_scratch.clear();
 
-    s->lifecycle.total_samples_received += static_cast<uint64_t>(count);
+    s->lifecycle.total_samples_received = admitted;
     s->lifecycle.feed_calls++;
     sample_stage_backlogs(s);
     if (s->lifecycle.state == voxtral_stream_state_internal::created) {

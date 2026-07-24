@@ -25,8 +25,8 @@ constexpr size_t kEventV1StructSize =
     offsetof(voxtral_event, text) + VOXTRAL_EVENT_TEXT_CAPACITY;
 static_assert(kTerminalEventHeadroom == VOXTRAL_EVENT_TERMINAL_HEADROOM,
               "public and internal terminal event bounds must match");
-static_assert(VOXTRAL_STREAM_MAX_AUDIO_SAMPLES == UINT64_C(57600000),
-              "public and internal stream duration bounds must match");
+static_assert(VOXTRAL_STREAM_MAX_AUDIO_SAMPLES == UINT64_MAX,
+              "public sample ceiling must match its uint64_t counter");
 
 struct versioned_header {
     uint32_t struct_size;

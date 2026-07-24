@@ -36,6 +36,20 @@
 // sanity ceiling that keeps overflow arithmetic well-defined.
 inline constexpr uint64_t kMaxFeedSamples = 64ull * 1024 * 1024;   // 64M samples / feed
 
+// Convert a platform size_t and add it to the public 64-bit counter without
+// narrowing or wraparound. `total` is unchanged when the sum is not
+// representable.
+inline bool checked_sample_count_add(
+    uint64_t received, size_t count, uint64_t & total) {
+    if constexpr (sizeof(size_t) > sizeof(uint64_t)) {
+        if (count > static_cast<size_t>(UINT64_MAX)) return false;
+    }
+    const uint64_t converted = static_cast<uint64_t>(count);
+    if (converted > UINT64_MAX - received) return false;
+    total = received + converted;
+    return true;
+}
+
 // Default ordinary-output bound for the event queue. Incremental TOKEN/PARTIAL
 // output can reach it when the caller stops polling; mandatory output then
 // backpressures the producer instead of being dropped.

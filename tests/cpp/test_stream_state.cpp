@@ -12,6 +12,7 @@
 // ============================================================================
 
 #include "voxtral-stream.h"
+#include "voxtral-stream-internal.h"
 
 #include <cmath>
 #include <cstdint>
@@ -305,8 +306,22 @@ void test_error_cleared_by_reset() {
     voxtral_stream_destroy_internal(s);
 }
 
-// --- 18. size / overflow guards (per-call vs cumulative limit) --------------
+// --- 18. size / overflow guards (per-call and checked cumulative addition) ---
 void test_overflow_guards() {
+    uint64_t total = 99;
+    CHECK(checked_sample_count_add(0, 1280, total));
+    CHECK(total == 1280);
+
+    // The former one-hour boundary is an ordinary representable position.
+    CHECK(checked_sample_count_add(UINT64_C(57600000), 1, total));
+    CHECK(total == UINT64_C(57600001));
+
+    CHECK(checked_sample_count_add(UINT64_MAX - 1, 1, total));
+    CHECK(total == UINT64_MAX);
+    total = 123;
+    CHECK(!checked_sample_count_add(UINT64_MAX, 1, total));
+    CHECK(total == 123);  // failed addition never wraps or mutates the output
+
     // Per-call sanity limit: a huge count is rejected before any read of the
     // buffer. This is an argument sanity ceiling, not a resource limit.
     voxtral_stream * s = make_stream();
@@ -316,9 +331,8 @@ void test_overflow_guards() {
     CHECK(voxtral_stream_samples_received(s) == 0);
     voxtral_stream_destroy_internal(s);
 
-    // Cumulative compatibility bound: max_total_samples enforced across feeds,
-    // overflow-safe. This is the documented full-buffer limit -> limit_exceeded
-    // (NOT out_of_memory: it is not an allocation failure).
+    // A private test/tool override remains enforceable across feeds. Public
+    // streams leave this at UINT64_MAX and impose no duration policy.
     voxtral_stream_params_internal bounded = default_params();
     bounded.max_total_samples = 10;
     voxtral_stream * b = make_stream(bounded);
