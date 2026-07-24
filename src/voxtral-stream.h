@@ -135,9 +135,10 @@ enum class voxtral_stream_state {
 };
 
 // ----------------------------------------------------------------------------
-// Internal event queue. token/partial_text are reserved for the future
-// incremental decoder and are never emitted by the current finish-only path.
-// Every event owns its text (no dangling const char *).
+// Internal event queue. token / partial_text are emitted incrementally by the
+// device-resident decoder during feed(); final_text / completed / error /
+// cancelled are the terminal lifecycle events. Every event owns its text (no
+// dangling const char *).
 // ----------------------------------------------------------------------------
 enum class voxtral_stream_event_type {
     token,
@@ -155,7 +156,7 @@ struct voxtral_stream_event {
     double                    t_audio_ms = 0.0;// audio position, derived from 64-bit count
     int32_t                   error_code = 0;  // voxtral_status value for error events
 
-    // Session 7 incremental streaming payload.
+    // Incremental streaming payload (token / partial_text events).
     uint64_t sequence               = 0;   // token events: strictly monotonic id
     int64_t  decoder_position       = 0;   // token events: absolute decoder position
     int64_t  audio_end_sample       = 0;   // token/partial: real-audio end sample (>=0)
@@ -174,7 +175,7 @@ struct voxtral_stream_params {
     int32_t  sample_rate = VOXTRAL_SAMPLE_RATE;   // must equal 16000
     int32_t  channels    = 1;                      // must equal 1
     int32_t  max_tokens  = 0;                       // 0 = decode whole buffer
-    // Bounded utterance limit retained for the finish-only decoder. This is an
+    // Bounded utterance admission limit for the decoder. This is an
     // internal compatibility guard, not a public streaming contract: it keeps
     // Admission limit only; inference streams do not retain full PCM. The
     // decoder now has a fixed circular KV, so the default safely admits the
@@ -239,9 +240,10 @@ voxtral_status voxtral_stream_feed_pcm16_internal(
 voxtral_status voxtral_stream_feed_f32_internal(
     voxtral_stream * stream, const float * samples, size_t sample_count);
 
-// Flush the remaining Mel/encoder frames, then run the finish-only adapter and
-// decoder once and emit FINAL_TEXT + COMPLETED. Idempotent after completion
-// (never re-runs the encoder prefix).
+// Flush the remaining Mel/encoder frames and process the bounded decoder tail
+// (the adapter and decoder already ran incrementally during feed), then emit
+// FINAL_TEXT + COMPLETED. Idempotent after completion (never re-runs the encoder
+// prefix).
 // Synchronous; see the threading contract.
 voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream);
 
@@ -365,7 +367,7 @@ const float * voxtral_stream_encoder_output_data        (const voxtral_stream * 
 int32_t       voxtral_stream_encoder_output_frames_count (const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
-// Session 7: device-resident incremental adapter + decoder introspection. For a
+// Device-resident incremental adapter + decoder introspection. For a
 // finish-only stream (VOXTRAL_STREAM_DECODER != "incremental") these are all zero
 // / false. `uses_incremental_decode` reports the active path. Adapter groups and
 // decoder positions each advance exactly once; the counters below prove no replay.
@@ -406,7 +408,7 @@ uint64_t voxtral_stream_partial_text_revision       (const voxtral_stream * stre
 const char * voxtral_stream_decoder_mode            (const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
-// Session 7.1: event-queue telemetry. events_dropped is a hard gate (== 0):
+// Event-queue telemetry. events_dropped is a hard gate (== 0):
 // mandatory events (token / final_text / completed / error) are never dropped —
 // a full queue is surfaced as explicit feed backpressure (queue_full) instead,
 // and partials coalesce to the newest revision.

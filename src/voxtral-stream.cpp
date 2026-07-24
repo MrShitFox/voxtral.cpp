@@ -1,10 +1,14 @@
 // ============================================================================
 // Internal streaming session runtime — implementation.
 //
-// PCM/STFT/log-Mel and the causal per-layer-KV encoder run incrementally during
-// feed(). The adapter and decoder are the remaining finish-only stages.
+// PCM/STFT/log-Mel, the causal per-layer-KV encoder, and the device-resident
+// adapter + decoder all run incrementally during feed(); finish() only processes
+// the bounded remaining tail. This translation unit holds the public lifecycle
+// entry points, feed orchestration and the state machine; the per-subsystem work
+// lives in voxtral-stream-{frontend,decoder,events,telemetry,diagnostics}.cpp.
 //
-// See src/voxtral-stream.h and docs/architecture/streaming-runtime.md.
+// See src/voxtral-stream.h, src/voxtral-stream-internal.h and
+// docs/architecture/streaming-runtime.md.
 // ============================================================================
 
 #include "voxtral-stream.h"
@@ -12,14 +16,10 @@
 #include "voxtral-stream-internal.h"  // voxtral_stream + shared streaming internals
 
 #include <algorithm>
-#include <array>
-#include <chrono>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <new>
 #include <stdexcept>
@@ -52,7 +52,7 @@ bool feed_allowed(voxtral_stream_state st) {
 }
 
 // ============================================================================
-// Session 7: device-resident incremental adapter + decoder scheduling (feed()).
+// Feed orchestration (incremental Mel -> encoder -> adapter -> decoder).
 // ============================================================================
 
 // Common core for both feed variants: guard reentrancy, validate state/args,
@@ -75,7 +75,7 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
         return voxtral_status::invalid_state;
     }
 
-    // Session 7.1 backpressure resume: a prior feed stalled the decoder because the
+    // Backpressure resume: a prior feed stalled the decoder because the
     // event queue filled. Flush the stashed token + drain pending steps before
     // accepting anything new. If the queue is still full, reject this feed WITHOUT
     // consuming its audio (atomic; samples_received unchanged) so the caller drains
@@ -211,7 +211,7 @@ voxtral_status feed_common(voxtral_stream * s, const void * ptr, size_t count, C
                 s->frontend.feed_scratch.clear();
                 return voxtral_status::backend_error;
             }
-            // Session 7: advance the device-resident adapter + decoder during feed,
+            // Advance the device-resident adapter + decoder during feed,
             // draining every slice so the encoder-output / audio-embedding rings stay
             // bounded. TOKEN and PARTIAL_TEXT are emitted here, not at finish.
             if (s->decoder.incremental && !backpressured) {
@@ -298,7 +298,7 @@ voxtral_stream * voxtral_stream_create_internal(
     s->params = params;
     s->model  = model;
 
-    // Session 7.1: the device-resident incremental adapter + decoder is the
+    // The device-resident incremental adapter + decoder is the
     // production default. Only the explicit reference oracle disables it; any
     // other value (including the legacy explicit "incremental") keeps the
     // incremental path. No silent incremental→reference fallback: a reference run
@@ -605,7 +605,7 @@ voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream) {
     stream->telemetry.decoder_backlog.reset();
     stream->frontend.left_pad_injected            = false;
     stream->frontend.full_pcm_buffered_at_finish  = false;
-    // Session 7 incremental adapter/decoder state. The device rings are append-only
+    // Incremental adapter/decoder state. The device rings are append-only
     // and only ever read at written positions, so resetting the counters is enough;
     // detach the shared decoder from this stream's audio ring and clear its KV.
     if (stream->ctx) {

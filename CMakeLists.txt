@@ -201,6 +201,12 @@ if(BUILD_TESTING)
     target_include_directories(voxtral_decoder_kv_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_decoder_kv_unit COMMAND voxtral_decoder_kv_unit)
 
+    # Header-only unit test for the streaming diagnostic SHA-256 (known-answer
+    # vectors + chunk-invariance). Self-contained: no backend / model link.
+    add_executable(voxtral_stream_diag_unit tests/cpp/test_stream_diagnostics.cpp)
+    target_include_directories(voxtral_stream_diag_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME voxtral_stream_diag_unit COMMAND voxtral_stream_diag_unit)
+
     # Model-driven harness used by the Node.js acceptance suite. Not a CLI/server.
     add_executable(voxtral-stream-test tests/cpp/voxtral_stream_test.cpp)
     target_link_libraries(voxtral-stream-test PRIVATE voxtral_lib)

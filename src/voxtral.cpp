@@ -476,6 +476,15 @@ struct voxtral_context {
     bool numerical_diagnostics = false;
     bool capture_encoder_diagnostics = false;
     bool capture_adapter_diagnostics = false;
+
+    // Immutable runtime/test configuration captured once at context creation and
+    // read on the hot paths (encoder KV batch, decoder step) so feed()/decoder
+    // steps perform no getenv. The model-free arithmetic getters
+    // voxtral_enc_kv_{logical,physical}_*_internal deliberately re-read the
+    // environment instead, so their unit test can vary it in-process.
+    encoder_kv_schedule encoder_schedule;
+    bool decoder_step_force_dynamic = false;
+    int32_t encoder_finish_physical = 8;   // VOXTRAL_ENCODER_FINISH_PHYSICAL (finish tail)
     bool capture_decoder_diagnostics = false;
     std::vector<float> diagnostic_encoder_output;
     std::vector<float> diagnostic_first_hidden;
@@ -1310,6 +1319,19 @@ voxtral_context * voxtral_init_from_model(
     ctx->numerical_diagnostics = std::getenv("VOXTRAL_NUMERICAL_DIAGNOSTICS") != nullptr;
     ctx->capture_encoder_diagnostics = ctx->numerical_diagnostics;
     ctx->capture_adapter_diagnostics = ctx->numerical_diagnostics;
+    // Capture the env-derived runtime config once (read on the hot paths below).
+    ctx->encoder_schedule = encoder_kv_schedule_from_env();
+    if (const char * step_graph_mode = std::getenv("VOXTRAL_DECODER_STEP_GRAPH")) {
+        ctx->decoder_step_force_dynamic =
+            std::strcmp(step_graph_mode, "dynamic") == 0 ||
+            std::strcmp(step_graph_mode, "oracle") == 0;
+    }
+    if (const char * value = std::getenv("VOXTRAL_ENCODER_FINISH_PHYSICAL")) {
+        const int parsed = std::atoi(value);
+        if (parsed == 4 || parsed == 8 || parsed == 16 || parsed == 32 || parsed == 128) {
+            ctx->encoder_finish_physical = parsed;
+        }
+    }
     voxtral_context_profile_reset_internal(ctx);
     if (params.n_threads > 0) {
         ctx->n_threads = params.n_threads;
@@ -4090,7 +4112,7 @@ static bool run_encoder_kv_batch(voxtral_encoder_kv_state * kv, const voxtral_en
                                  int32_t physical_override = 0) {
     voxtral_context * ctx = kv->ctx;
     const int32_t N       = plan.n_new;
-    const int32_t P       = physical_override > 0 ? physical_override : encoder_kv_schedule_from_env().physical;
+    const int32_t P       = physical_override > 0 ? physical_override : ctx->encoder_schedule.physical;
     const int32_t q_offset = (int32_t) (plan.q_start % P);
     const int64_t block_start = plan.q_start - q_offset;
     const int64_t key_start = std::max<int64_t>(0, block_start - (int64_t) (VOXTRAL_ENC_WINDOW - 1));
@@ -4275,7 +4297,7 @@ static bool encoder_kv_run(voxtral_encoder_kv_state * kv, int64_t q0, int32_t n,
 // the absolute reduction order of any real frame. During feed only full logical
 // batches run; finish flushes the remainder.
 static bool encoder_kv_drive(voxtral_encoder_kv_state * kv, bool final) {
-    const encoder_kv_schedule schedule = encoder_kv_schedule_from_env();
+    const encoder_kv_schedule schedule = kv->ctx->encoder_schedule;
     // The terminal right-padding is bounded, but it used to be fed through the
     // ordinary 4-row cadence and consequently launched about 17 independent
     // encoder graphs. A wider terminal graph preserves absolute positions and
@@ -4285,13 +4307,7 @@ static bool encoder_kv_drive(voxtral_encoder_kv_state * kv, bool final) {
     // the measured minimum for the fixed 72-frame right pad (about 420 ms),
     // versus about 467 ms at P4 and 727 ms at P16. Keep the full-window result,
     // rather than the misleading short-context result, as the default.
-    int32_t finish_physical = 8;
-    if (const char * value = std::getenv("VOXTRAL_ENCODER_FINISH_PHYSICAL")) {
-        const int parsed = std::atoi(value);
-        if (parsed == 4 || parsed == 8 || parsed == 16 || parsed == 32 || parsed == 128) {
-            finish_physical = parsed;
-        }
-    }
+    const int32_t finish_physical = kv->ctx->encoder_finish_physical;
     const int64_t target = enc_frames_realizable(kv->stable_mel);   // true global count
     const bool batch_terminal = final && kv->reusable_stream_graph &&
                                 kv->ctx->want_enc_out_ring;
@@ -4928,7 +4944,7 @@ voxtral_encoder_metrics voxtral_encoder_stream_metrics(const voxtral_encoder_str
         m.encoderMelPeakRetainedFrames    = kv->peak_mel_tail;
         m.encoderOutputQueuedFrames       = kv->emitted;
         m.encoderOutputPeakQueuedFrames   = kv->peak_output;
-        const encoder_kv_schedule schedule = encoder_kv_schedule_from_env();
+        const encoder_kv_schedule schedule = kv->ctx->encoder_schedule;
         m.encoderScheduler                 = "static";
         m.encoderLogicalBatchFrames       = schedule.logical;
         m.encoderPhysicalQueryRows        = schedule.physical;
@@ -5136,10 +5152,7 @@ static bool run_decoder_step(
     }
 
     const auto rollover_step_start = std::chrono::steady_clock::now();
-    const char * step_graph_mode = std::getenv("VOXTRAL_DECODER_STEP_GRAPH");
-    const bool force_dynamic_graph = step_graph_mode &&
-        (std::strcmp(step_graph_mode, "dynamic") == 0 ||
-         std::strcmp(step_graph_mode, "oracle") == 0);
+    const bool force_dynamic_graph = ctx->decoder_step_force_dynamic;
     if (ctx->dec_audio_cap > 0 && !force_dynamic_graph) {
         // Incremental production owns the device-resident audio ring and can
         // reuse one fixed-topology graph.  The finish-only oracle instead owns

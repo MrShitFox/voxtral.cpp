@@ -193,7 +193,7 @@ voxtral_status pump_incremental(voxtral_stream * s) {
 int64_t voxtral_stream_decoder_kv_allocated_bytes(const voxtral_stream * s) {
     return s ? voxtral_context_decoder_kv_bytes_internal(s->ctx) : 0;
 }
-// --- Session 7: incremental adapter + decoder introspection ----------------
+// --- Incremental adapter + decoder introspection ---------------------------
 bool voxtral_stream_uses_incremental_decode(const voxtral_stream * s) {
     return s ? s->decoder.incremental : false;
 }
@@ -236,7 +236,7 @@ int64_t voxtral_stream_token_id_d2h_bytes(const voxtral_stream * s) {
 uint64_t voxtral_stream_partial_text_revision(const voxtral_stream * s) {
     return s ? s->decoder.partial_revision : 0;
 }
-// Session 7.1: active decoder path. "incremental" is the production default;
+// Active decoder path. "incremental" is the production default;
 // "reference" is the finish-only oracle (env override, or the coupled fallback
 // when the reference encoder is selected). Meaningful once the encoder is created
 // (first feed); reflects the env choice before then.
