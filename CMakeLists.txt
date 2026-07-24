@@ -59,7 +59,12 @@ endif()
 add_library(voxtral_lib
     src/voxtral.cpp
     src/voxtral-mel.cpp
-    src/voxtral-stream.cpp)
+    src/voxtral-stream.cpp
+    src/voxtral-stream-diagnostics.cpp
+    src/voxtral-stream-events.cpp
+    src/voxtral-stream-telemetry.cpp
+    src/voxtral-stream-frontend.cpp
+    src/voxtral-stream-decoder.cpp)
 
 # On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
 # import library (voxtral_lib.lib) is generated for dependents like `voxtral`.
