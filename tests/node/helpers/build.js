@@ -10,6 +10,7 @@ function localConfigureArgs(config) {
   return [
     "-S", ".", "-B", config.localBuild, "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+    "-DBUILD_SHARED_LIBS=ON",
     "-DVOXTRAL_NATIVE_OPT=ON",
     "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
     "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",

@@ -1591,5 +1591,7 @@ fixture content. Current hard latency gates measure runtime overhead after the
 required context is available: approximately 60 ms for the first decoder step
 and 62–63 ms for the first lexical token/partial on both real fixtures.
 
-Public streaming APIs, multi-stream scheduling and Q8 remain out of scope; the
-streaming implementation in this section is the internal production runtime.
+Session 11 now exposes this runtime through the thin, stable polling-based C
+adapter documented in `docs/public-streaming-api.md`. The inference runtime in
+this section remains private; multi-stream scheduling, networking and Q8 remain
+out of scope.

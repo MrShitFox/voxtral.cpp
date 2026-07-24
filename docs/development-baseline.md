@@ -199,8 +199,8 @@ Independent evidence collected during this baseline:
 - `kv_cache_shift_left()` still directly accesses tensor data from the host. The measured clips do
   not approach the 8192-token cache window, so this path was not exercised or changed. It must be
   audited before relying on very long-lived GPU streaming sessions.
-- The current public path is batch file transcription. There is no public streaming C API,
-  incremental Mel frontend, WebSocket server or multi-user scheduler.
+- At the baseline commit, the public path was batch file transcription. It had no public
+  streaming C API, incremental Mel frontend, WebSocket server or multi-user scheduler.
 - Each CLI invocation reloads approximately 2.9 GB of model weights and allocates its context again.
 - The synthetic long WAV measures execution, memory and stability only; it is not an ASR quality
   benchmark.

@@ -86,6 +86,19 @@ By default the GPU is auto-detected (`--gpu auto`): **Metal** on Apple Silicon,
 with `--gpu metal|cuda|vulkan|none`. Thread count for the CPU path defaults to
 the machine's hardware concurrency; override with `--threads N`.
 
+## Streaming C API
+
+Native applications can use the stable, polling-based C ABI in
+`include/voxtral.h` and `include/voxtral-stream.h` to load a model, create a
+reusable context, feed mono 16 kHz PCM16, poll value-type UTF-8 events, finish
+or cancel, reset, and read structured errors or metrics. Handles are opaque,
+one stream per context is enforced, and no allocator-owned text crosses the
+ABI.
+
+See [Public streaming C API](docs/public-streaming-api.md) for lifecycle,
+ownership, backpressure, ABI/versioning, P/Invoke notes, and the buildable
+[C example](examples/c/streaming.c).
+
 ---
 
 ## Advanced Usage
