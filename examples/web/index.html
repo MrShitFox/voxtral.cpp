@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voxtral Realtime Demo</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="topbar">
+      <div>
+        <h1>Voxtral Realtime Demo</h1>
+        <p class="subtitle">Plain Web Audio + WebSocket protocol inspector</p>
+      </div>
+      <span id="main-status" class="badge disconnected">DISCONNECTED</span>
+    </header>
+
+    <section class="notice warning">
+      Browser authentication note: native WebSocket cannot send the required
+      Bearer header. This demo only connects to a development server started
+      with <code>--no-auth --allow-insecure-no-auth</code> on a trusted LAN.
+      Never expose that configuration to the public Internet.
+    </section>
+
+    <section id="capability-error" class="notice error hidden" role="alert"></section>
+    <section id="local-error" class="notice error hidden" role="alert"></section>
+
+    <section class="controls panel">
+      <label class="url-field">
+        <span>WebSocket URL</span>
+        <input
+          id="websocket-url"
+          type="url"
+          spellcheck="false"
+          value="ws://192.168.2.136:8080/v1/realtime/transcription">
+      </label>
+      <label class="checkbox-field">
+        <input id="receive-tokens" type="checkbox">
+        <span>Receive token events</span>
+      </label>
+      <div class="button-row">
+        <button id="start-button" class="primary">Start microphone</button>
+        <button id="finish-button" disabled>Finish transcription</button>
+        <button id="cancel-button" disabled>Cancel session</button>
+        <button id="ping-button" disabled>Ping</button>
+        <button id="clear-button">Clear logs</button>
+      </div>
+    </section>
+
+    <section class="status-grid" aria-label="Realtime status">
+      <article class="status-card"><span>WebSocket state</span><strong id="ws-state">DISCONNECTED</strong></article>
+      <article class="status-card"><span>Session state</span><strong id="session-state">DISCONNECTED</strong></article>
+      <article class="status-card"><span>Microphone state</span><strong id="mic-state">IDLE</strong></article>
+      <article class="status-card"><span>Terminal status</span><strong id="terminal-status">—</strong></article>
+      <article class="status-card"><span>Server session ID</span><strong id="session-id">—</strong></article>
+      <article class="status-card"><span>Protocol version</span><strong id="protocol-version">—</strong></article>
+      <article class="status-card"><span>Input device sample rate</span><strong id="input-rate">—</strong></article>
+      <article class="status-card"><span>Output sample rate</span><strong id="output-rate">16000 Hz</strong></article>
+      <article class="status-card"><span>Chunks sent</span><strong id="chunks-sent">0</strong></article>
+      <article class="status-card"><span>Samples sent</span><strong id="samples-sent">0</strong></article>
+      <article class="status-card"><span>Bytes sent</span><strong id="bytes-sent">0 B</strong></article>
+      <article class="status-card"><span>Audio duration</span><strong id="audio-duration">0.000 s</strong></article>
+      <article class="status-card"><span>Wall-clock duration</span><strong id="wall-duration">0.000 s</strong></article>
+      <article class="status-card"><span>WebSocket bufferedAmount</span><strong id="buffered-amount">0 B</strong></article>
+      <article class="status-card"><span>Local PCM queue</span><strong id="local-queue">0 chunks / 0 B</strong></article>
+      <article class="status-card"><span>Partial count</span><strong id="partial-count">0</strong></article>
+      <article class="status-card"><span>Token count</span><strong id="token-count">0</strong></article>
+      <article class="status-card"><span>Warning count</span><strong id="warning-count">0</strong></article>
+      <article class="status-card"><span>Error count</span><strong id="error-count">0</strong></article>
+      <article class="status-card"><span>Last server sequence</span><strong id="last-sequence">—</strong></article>
+      <article class="status-card"><span>Ping RTT</span><strong id="ping-rtt">—</strong></article>
+      <article class="status-card"><span>Approximate protocol lag</span><strong id="approx-lag">—</strong></article>
+    </section>
+
+    <section class="transcripts">
+      <article class="panel">
+        <h2>Live partial transcript</h2>
+        <pre id="partial-transcript" class="transcript" aria-live="polite"></pre>
+      </article>
+      <article class="panel">
+        <h2>Final transcript</h2>
+        <pre id="final-transcript" class="transcript" aria-live="polite"></pre>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <h2>Event timeline</h2>
+        <span>Unknown server events are displayed and are not fatal.</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Local time</th>
+              <th>Relative</th>
+              <th>Sequence</th>
+              <th>Event type</th>
+              <th>audio_end_ms</th>
+              <th>Short summary</th>
+            </tr>
+          </thead>
+          <tbody id="event-timeline"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <h2>Raw log</h2>
+        <span>IN / OUT / LOCAL; binary audio is aggregated once per second.</span>
+      </div>
+      <div id="raw-log" class="raw-log" aria-live="polite"></div>
+    </section>
+  </main>
+</body>
+</html>

@@ -337,6 +337,21 @@ CHUNK_BYTES   = 2560
 
 It deliberately does not capture a microphone.
 
+## Browser development demo
+
+[`examples/web`](../examples/web/README.md) contains a dependency-free
+HTML/CSS/JavaScript microphone client. It waits for `session.created`, uses an
+`AudioWorklet`, performs phase-preserving streaming resampling to 16 kHz mono
+PCM16LE, sends 80 ms binary frames, and exposes transcripts, protocol events,
+backpressure, queue, timing, and completion status.
+
+Native browser WebSocket cannot set the required Bearer header. The demo is
+therefore only for a server deliberately started with
+`--no-auth --allow-insecure-no-auth` on a trusted LAN. It does not put a token
+in the URL and does not add cookies, subprotocol authentication, CORS, or TLS.
+Serve it from `http://127.0.0.1` as documented in its README, not from
+`file://`.
+
 ## TLS and limitations
 
 `voxtral-server` itself serves HTTP and WebSocket without TLS. For public
@@ -344,6 +359,6 @@ Internet deployment place it behind Caddy, nginx, or HAProxy.
 
 Version 1 intentionally has no compressed audio decoding, multipart form
 parsing, jobs, persistence, server queue, multi-stream/continuous batching,
-VAD, diarization, translation, Hy-MT2, resampling, channel mixing, browser UI,
-CORS policy, Prometheus endpoint, or embedded deployment configuration. One
-RX 6600 workload is active at a time.
+VAD, diarization, translation, Hy-MT2, server-side resampling, channel mixing,
+embedded browser UI, CORS policy, Prometheus endpoint, or embedded deployment
+configuration. One RX 6600 workload is active at a time.

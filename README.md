@@ -135,6 +135,13 @@ See [Standalone server API](docs/server-api.md) for configuration, auth,
 limits, batch formats, the realtime event protocol, backpressure, errors, and
 C# usage.
 
+For trusted-LAN development, the dependency-free
+[browser microphone demo](examples/web/README.md) shows realtime partials,
+final output, protocol events, queue sizes, and connection/audio metrics. It
+must be used with the server's explicit
+`--no-auth --allow-insecure-no-auth` development mode because native browser
+WebSocket cannot add an Authorization header.
+
 `voxtral-server` itself serves HTTP and WebSocket without TLS. For public
 Internet deployment place it behind Caddy, nginx, or HAProxy.
 
