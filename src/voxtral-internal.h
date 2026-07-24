@@ -6,7 +6,7 @@
 // the streaming layer (voxtral-stream.cpp). Not part of include/voxtral.h.
 // ============================================================================
 
-#include "voxtral.h"
+#include "voxtral-cpp.h"
 
 #include <array>
 
@@ -49,6 +49,25 @@ bool voxtral_encode_mel_batch_internal(
 
 // Fixed decoder self-attention K/V allocation owned by one inference context.
 int64_t voxtral_context_decoder_kv_bytes_internal(const voxtral_context * ctx);
+
+// Thin public-C-adapter hooks. These expose no private layout and perform no
+// inference. Public stream operations are externally serialized in API v1.
+voxtral_model * voxtral_context_model_internal(const voxtral_context * ctx);
+bool voxtral_context_supports_incremental_internal(const voxtral_context * ctx);
+bool voxtral_context_try_acquire_public_stream_internal(voxtral_context * ctx);
+void voxtral_context_release_public_stream_internal(voxtral_context * ctx);
+bool voxtral_context_has_public_stream_internal(const voxtral_context * ctx);
+void voxtral_context_set_public_error_internal(
+    voxtral_context * ctx,
+    voxtral_status status,
+    int32_t backend_code,
+    const char * message) noexcept;
+voxtral_status voxtral_context_public_last_status_internal(
+    const voxtral_context * ctx);
+int32_t voxtral_context_public_backend_code_internal(
+    const voxtral_context * ctx);
+const std::string & voxtral_context_public_last_error_internal(
+    const voxtral_context * ctx);
 
 // First-step numerical diagnostics. Empty unless
 // VOXTRAL_NUMERICAL_DIAGNOSTICS=1 was set before context creation.
@@ -146,8 +165,21 @@ struct voxtral_runtime_profile {
     double  decoderPostWrapP99Ms             = 0.0;
 };
 
+// Allocation-free scalar subset used by the stable public metrics adapter.
+// Reading this snapshot neither sorts profiling reservoirs nor synchronizes a
+// backend; public API v1 externally serializes it with inference operations.
+struct voxtral_public_context_metrics_internal {
+    bool profile_enabled = false;
+    double total_pipeline_compute_ms = 0.0;
+    int64_t decoder_kv_wraps = 0;
+    int64_t decoder_kv_evictions = 0;
+    int64_t decoder_kv_bytes_moved = 0;
+};
+
 const char * voxtral_profile_stage_name(voxtral_profile_stage stage);
 voxtral_runtime_profile voxtral_context_runtime_profile_internal(const voxtral_context * ctx);
+voxtral_public_context_metrics_internal
+voxtral_context_public_metrics_internal(const voxtral_context * ctx);
 void voxtral_context_profile_record_internal(voxtral_context * ctx,
                                              voxtral_profile_stage stage,
                                              double milliseconds);

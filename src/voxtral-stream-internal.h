@@ -36,11 +36,17 @@
 // sanity ceiling that keeps overflow arithmetic well-defined.
 inline constexpr uint64_t kMaxFeedSamples = 64ull * 1024 * 1024;   // 64M samples / feed
 
-// Default hard bound for the event queue. v1 emits only a handful of lifecycle
-// events per session, so this is never reached in practice; it is a backstop
-// against a future decoder emitting unboundedly. It is a TRUE maximum: a push
-// into a full queue is dropped and recorded, never grown past.
+// Default ordinary-output bound for the event queue. Incremental TOKEN/PARTIAL
+// output can reach it when the caller stops polling; mandatory output then
+// backpressures the producer instead of being dropped.
 inline constexpr size_t kMaxEvents = 4096;
+// Public API v1 reserves this fixed number of slots for the at-most-18-position
+// right-pad decoder tail plus TOKEN/PARTIAL and FINAL/COMPLETED markers.
+inline constexpr size_t kTerminalEventHeadroom = 64;
+static_assert(
+    kTerminalEventHeadroom >=
+        2u * (static_cast<size_t>(VOXTRAL_N_RIGHT_PAD_TOKENS) + 1u) + 2u,
+    "terminal event reserve must hold TOKEN/PARTIAL tail plus FINAL/COMPLETED");
 inline constexpr size_t kBacklogSamples = 32768;
 
 // Streaming left/right zero padding (mirrors the batch pad_audio_streaming in
@@ -115,12 +121,12 @@ struct voxtral_stream {
     voxtral_context     * ctx          = nullptr;
     voxtral_model       * model        = nullptr;  // shared, immutable; for detokenization
     bool                  owns_context = false;
-    voxtral_stream_params params;
+    voxtral_stream_params_internal params;
 
     // ---- Lifecycle / state machine ----------------------------------------
     struct lifecycle_state {
-        voxtral_stream_state state       = voxtral_stream_state::created;
-        voxtral_status       last_status = voxtral_status::ok;
+        voxtral_stream_state_internal state       = voxtral_stream_state_internal::created;
+        voxtral_status_internal       last_status = voxtral_status_internal::ok;
         std::string          last_error;
         // Non-blocking reentrancy/concurrency guard (see the threading
         // contract). Set while a mutating entry point runs on this stream.
@@ -191,7 +197,7 @@ struct voxtral_stream {
 
     // ---- Event queue + ordering / backpressure ----------------------------
     struct event_state {
-        std::deque<voxtral_stream_event> queue;
+        std::deque<voxtral_stream_event_internal> queue;
         size_t max_events        = kMaxEvents;    // hard bound; test-overridable
         bool   events_overflowed = false;
         // Event telemetry (all hard-gate: events_dropped == 0).
@@ -202,8 +208,9 @@ struct voxtral_stream {
         uint64_t event_queue_high_watermark = 0;  // peak queue depth observed
         uint64_t event_queue_overflow_attempts = 0;  // mandatory pushes that hit the bound
         uint64_t events_dropped             = 0;  // mandatory events actually lost — MUST stay 0
+        uint64_t public_poll_sequence        = 0;  // all public events, reset-scoped
         bool decoder_backpressured         = false;  // event queue full; caller must drain
-        bool finalizing_flush              = false;  // finish(): terminal events bypass the bound
+        bool finalizing_flush              = false;  // finish/cancel: allow fixed terminal reserve
         bool aggressive_partial_coalescing = false;  // one large accepted feed
     } events;
 
@@ -254,13 +261,13 @@ struct voxtral_stream {
 // ----------------------------------------------------------------------------
 // Shared inline helpers (error state, reentrancy guard, profiler scope).
 // ----------------------------------------------------------------------------
-inline void set_error(voxtral_stream * s, voxtral_status status, const std::string & msg) {
+inline void set_error(voxtral_stream * s, voxtral_status_internal status, const std::string & msg) {
     s->lifecycle.last_status = status;
     s->lifecycle.last_error  = msg;
 }
 
 inline void clear_error(voxtral_stream * s) {
-    s->lifecycle.last_status = voxtral_status::ok;
+    s->lifecycle.last_status = voxtral_status_internal::ok;
     s->lifecycle.last_error.clear();
 }
 
@@ -314,9 +321,9 @@ bool capture_new_adapter_output_sha(voxtral_stream * s, int64_t start, int32_t c
 // Bounded push for mandatory events; false without enqueuing when the queue is
 // at its bound (caller raises backpressure). Terminal/error/token emitters used
 // by the lifecycle and decoder modules.
-bool push_event(voxtral_stream * s, voxtral_stream_event ev);
+bool push_event(voxtral_stream * s, voxtral_stream_event_internal ev);
 void emit_final_and_completed(voxtral_stream * s);
-void emit_error(voxtral_stream * s, voxtral_status status, const std::string & msg);
+void emit_error(voxtral_stream * s, voxtral_status_internal status, const std::string & msg);
 bool emit_token_event(voxtral_stream * s, int32_t token, int64_t position, bool special);
 void emit_partial_text_event(voxtral_stream * s, int64_t position);
 
@@ -341,6 +348,6 @@ voxtral_encoder_metrics stream_encoder_metrics(const voxtral_stream * s);
 // ---- decoder (voxtral-stream-decoder.cpp) ----------------------------------
 // One incremental adapter+decoder scheduler pass. Driven by feed/finish
 // (lifecycle); emits TOKEN/PARTIAL_TEXT via the events module.
-voxtral_status pump_incremental(voxtral_stream * s);
+voxtral_status_internal pump_incremental(voxtral_stream * s);
 
 #endif // VOXTRAL_STREAM_INTERNAL_H

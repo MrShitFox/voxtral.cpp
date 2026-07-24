@@ -1,4 +1,4 @@
-#include "voxtral.h"
+#include "voxtral-cpp.h"
 #include "voxtral-mel.h"
 #include "voxtral-internal.h"
 #include "gguf.h"
@@ -352,6 +352,13 @@ struct voxtral_context {
     ggml_backend_t         blas_backend = nullptr;
     voxtral_gpu_backend    gpu_type     = voxtral_gpu_backend::none;
 
+    // Stable public-C adapter bookkeeping. API v1 externally serializes all
+    // operations and enforces one live stream handle per context.
+    bool                   public_stream_active = false;
+    voxtral_status         public_last_status = VOXTRAL_STATUS_OK;
+    int32_t                public_backend_code = 0;
+    std::string            public_last_error;
+
     // Persistent device tensors (allocated once)
     ggml_context       * ctx_persistent = nullptr;
     ggml_backend_buffer_t buf_persistent = nullptr;
@@ -699,6 +706,20 @@ voxtral_runtime_profile voxtral_context_runtime_profile_internal(const voxtral_c
         stage_total(voxtral_profile_stage::decoder_prefill_graph_execute) +
         stage_total(voxtral_profile_stage::decoder_step_graph_execute);
     out.totalPipelineComputeMs = stage_total(voxtral_profile_stage::pipeline_feed);
+    return out;
+}
+
+voxtral_public_context_metrics_internal
+voxtral_context_public_metrics_internal(const voxtral_context * ctx) {
+    voxtral_public_context_metrics_internal out;
+    if (!ctx) return out;
+    out.profile_enabled = ctx->profile.enabled;
+    out.total_pipeline_compute_ms =
+        ctx->profile.stages[
+            profile_index(voxtral_profile_stage::pipeline_feed)].total_ms;
+    out.decoder_kv_wraps = ctx->decoder_kv.wraps;
+    out.decoder_kv_evictions = ctx->decoder_kv.evictions;
+    out.decoder_kv_bytes_moved = ctx->decoder_kv.bytes_moved;
     return out;
 }
 
@@ -3551,6 +3572,65 @@ int32_t voxtral_enc_kv_physical_rows_internal() { return encoder_kv_schedule_fro
 int64_t voxtral_context_decoder_kv_bytes_internal(const voxtral_context * ctx) {
     if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) return 0;
     return (int64_t) ggml_nbytes(ctx->kv_self_k) + (int64_t) ggml_nbytes(ctx->kv_self_v);
+}
+
+voxtral_model * voxtral_context_model_internal(const voxtral_context * ctx) {
+    return ctx ? ctx->model : nullptr;
+}
+
+bool voxtral_context_supports_incremental_internal(const voxtral_context * ctx) {
+    return ctx && ctx->model && !ctx->model->hp.is_offline;
+}
+
+bool voxtral_context_try_acquire_public_stream_internal(voxtral_context * ctx) {
+    if (!ctx || ctx->public_stream_active) return false;
+    ctx->public_stream_active = true;
+    return true;
+}
+
+void voxtral_context_release_public_stream_internal(voxtral_context * ctx) {
+    if (ctx) ctx->public_stream_active = false;
+}
+
+bool voxtral_context_has_public_stream_internal(const voxtral_context * ctx) {
+    return ctx && ctx->public_stream_active;
+}
+
+void voxtral_context_set_public_error_internal(
+    voxtral_context * ctx,
+    voxtral_status status,
+    int32_t backend_code,
+    const char * message) noexcept
+{
+    if (!ctx) return;
+    ctx->public_last_status = status;
+    ctx->public_backend_code = backend_code;
+    try {
+        ctx->public_last_error = message ? message : "";
+    } catch (...) {
+        // Error reporting itself must not let an allocation failure cross the
+        // public C boundary. The structured status remains authoritative.
+        ctx->public_last_error.clear();
+    }
+}
+
+voxtral_status voxtral_context_public_last_status_internal(
+    const voxtral_context * ctx)
+{
+    return ctx ? ctx->public_last_status : VOXTRAL_STATUS_INVALID_ARGUMENT;
+}
+
+int32_t voxtral_context_public_backend_code_internal(
+    const voxtral_context * ctx)
+{
+    return ctx ? ctx->public_backend_code : 0;
+}
+
+const std::string & voxtral_context_public_last_error_internal(
+    const voxtral_context * ctx)
+{
+    static const std::string empty;
+    return ctx ? ctx->public_last_error : empty;
 }
 
 bool voxtral_enc_kv_mask_allows(int64_t kv_abs, int64_t q_abs, int32_t window) {

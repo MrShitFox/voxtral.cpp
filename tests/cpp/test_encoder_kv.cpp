@@ -27,7 +27,7 @@
 // Assert-based; no external framework. Exits non-zero on any failure.
 // ============================================================================
 
-#include "voxtral.h"
+#include "voxtral-cpp.h"
 #include "voxtral-internal.h"
 
 #include <algorithm>

@@ -32,14 +32,14 @@ static int g_failures = 0;
 
 namespace {
 
-voxtral_stream_params default_params() {
-    voxtral_stream_params p;   // 16 kHz mono by default
+voxtral_stream_params_internal default_params() {
+    voxtral_stream_params_internal p;   // 16 kHz mono by default
     return p;
 }
 
 // Create a lifecycle-only stream (no model -> no owned context). This is the
 // mode the model-free tests use for everything that does not need inference.
-voxtral_stream * make_stream(const voxtral_stream_params & p = default_params()) {
+voxtral_stream * make_stream(const voxtral_stream_params_internal & p = default_params()) {
     return voxtral_stream_create_internal(nullptr, voxtral_context_params{}, p);
 }
 
@@ -47,9 +47,9 @@ voxtral_stream * make_stream(const voxtral_stream_params & p = default_params())
 void test_create_destroy() {
     voxtral_stream * s = make_stream();
     CHECK(s != nullptr);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::created);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created);
     CHECK(voxtral_stream_samples_received(s) == 0);
-    CHECK(voxtral_stream_last_status(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_last_status(s) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_pending_events(s) == 0);
     // A model-less stream owns no context.
     CHECK(!voxtral_stream_owns_context(s));
@@ -61,28 +61,28 @@ void test_create_destroy() {
 
 // --- 2 & 3. invalid sample rate / channels ---------------------------------
 void test_invalid_format() {
-    voxtral_stream_params bad_rate = default_params();
+    voxtral_stream_params_internal bad_rate = default_params();
     bad_rate.sample_rate = 44100;
-    CHECK(voxtral_stream_params_check(bad_rate) == voxtral_status::unsupported_audio_format);
+    CHECK(voxtral_stream_params_check(bad_rate) == voxtral_status_internal::unsupported_audio_format);
     CHECK(make_stream(bad_rate) == nullptr);
 
-    voxtral_stream_params bad_ch = default_params();
+    voxtral_stream_params_internal bad_ch = default_params();
     bad_ch.channels = 2;
-    CHECK(voxtral_stream_params_check(bad_ch) == voxtral_status::unsupported_audio_format);
+    CHECK(voxtral_stream_params_check(bad_ch) == voxtral_status_internal::unsupported_audio_format);
     CHECK(make_stream(bad_ch) == nullptr);
 
-    CHECK(voxtral_stream_params_check(default_params()) == voxtral_status::ok);
+    CHECK(voxtral_stream_params_check(default_params()) == voxtral_status_internal::ok);
 }
 
 // --- 4. zero-length feed ---------------------------------------------------
 void test_zero_length_feed() {
     voxtral_stream * s = make_stream();
     // nullptr with zero count is valid.
-    CHECK(voxtral_stream_feed_pcm16_internal(s, nullptr, 0) == voxtral_status::ok);
-    CHECK(voxtral_stream_feed_f32_internal(s, nullptr, 0) == voxtral_status::ok);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, nullptr, 0) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_feed_f32_internal(s, nullptr, 0) == voxtral_status_internal::ok);
     // No audio position change, and no implicit transition out of created.
     CHECK(voxtral_stream_samples_received(s) == 0);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::created);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created);
     CHECK(voxtral_stream_feed_calls(s) == 2);
     voxtral_stream_destroy_internal(s);
 }
@@ -90,8 +90,8 @@ void test_zero_length_feed() {
 // --- 5. null pointer with non-zero count -----------------------------------
 void test_null_with_count() {
     voxtral_stream * s = make_stream();
-    CHECK(voxtral_stream_feed_pcm16_internal(s, nullptr, 4) == voxtral_status::invalid_argument);
-    CHECK(voxtral_stream_feed_f32_internal(s, nullptr, 4) == voxtral_status::invalid_argument);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, nullptr, 4) == voxtral_status_internal::invalid_argument);
+    CHECK(voxtral_stream_feed_f32_internal(s, nullptr, 4) == voxtral_status_internal::invalid_argument);
     CHECK(voxtral_stream_samples_received(s) == 0);
     voxtral_stream_destroy_internal(s);
 }
@@ -100,9 +100,9 @@ void test_null_with_count() {
 void test_single_sample() {
     voxtral_stream * s = make_stream();
     const int16_t one = 16384;
-    CHECK(voxtral_stream_feed_pcm16_internal(s, &one, 1) == voxtral_status::ok);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, &one, 1) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_samples_received(s) == 1);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::running);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::running);
     CHECK(voxtral_stream_pcm_size(s) == 1);
     voxtral_stream_destroy_internal(s);
 }
@@ -111,9 +111,9 @@ void test_single_sample() {
 void test_multiple_chunks_accounting() {
     voxtral_stream * s = make_stream();
     std::vector<int16_t> a(100, 1), b(1, 2), c(2560, 3);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status::ok);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, b.data(), b.size()) == voxtral_status::ok);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, c.data(), c.size()) == voxtral_status::ok);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, b.data(), b.size()) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, c.data(), c.size()) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_samples_received(s) == 100 + 1 + 2560);
     CHECK(voxtral_stream_pcm_size(s) == 100 + 1 + 2560);
     // audio_ms derived from the 64-bit count, not accumulated.
@@ -126,7 +126,7 @@ void test_multiple_chunks_accounting() {
 void test_pcm16_conversion() {
     voxtral_stream * s = make_stream();
     const int16_t in[] = {0, 32767, -32768, 16384, -16384};
-    CHECK(voxtral_stream_feed_pcm16_internal(s, in, 5) == voxtral_status::ok);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, in, 5) == voxtral_status_internal::ok);
     const float * pcm = voxtral_stream_pcm_data(s);
     CHECK(pcm != nullptr);
     CHECK(pcm[0] == 0.0f);
@@ -141,19 +141,19 @@ void test_pcm16_conversion() {
 void test_f32_feed() {
     voxtral_stream * s = make_stream();
     const float ok_vals[] = {-1.0f, 0.0f, 0.25f, 1.5f};   // 1.5 passes through (no clamp)
-    CHECK(voxtral_stream_feed_f32_internal(s, ok_vals, 4) == voxtral_status::ok);
+    CHECK(voxtral_stream_feed_f32_internal(s, ok_vals, 4) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_pcm_size(s) == 4);
     CHECK(voxtral_stream_pcm_data(s)[3] == 1.5f);
 
     const float nan_vals[] = {0.0f, std::nanf("")};
-    CHECK(voxtral_stream_feed_f32_internal(s, nan_vals, 2) == voxtral_status::invalid_argument);
+    CHECK(voxtral_stream_feed_f32_internal(s, nan_vals, 2) == voxtral_status_internal::invalid_argument);
     // Rejected payload must not mutate the buffer.
     CHECK(voxtral_stream_pcm_size(s) == 4);
     CHECK(voxtral_stream_samples_received(s) == 4);
 
     // ±Inf is rejected the same way.
     const float inf_vals[] = {INFINITY};
-    CHECK(voxtral_stream_feed_f32_internal(s, inf_vals, 1) == voxtral_status::invalid_argument);
+    CHECK(voxtral_stream_feed_f32_internal(s, inf_vals, 1) == voxtral_status_internal::invalid_argument);
     CHECK(voxtral_stream_pcm_size(s) == 4);
     voxtral_stream_destroy_internal(s);
 }
@@ -161,17 +161,17 @@ void test_f32_feed() {
 // --- empty finish + 10/11: invalid state after finish, repeated finish -----
 void test_empty_finish_and_repeat() {
     voxtral_stream * s = make_stream();
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::completed);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::completed);
     CHECK(voxtral_stream_inference_runs(s) == 0);        // empty path never runs inference
     CHECK(voxtral_stream_transcript(s).empty());
 
     // feed after finish -> invalid_state, no crash.
     const int16_t x = 1;
-    CHECK(voxtral_stream_feed_pcm16_internal(s, &x, 1) == voxtral_status::invalid_state);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, &x, 1) == voxtral_status_internal::invalid_state);
 
     // repeated finish is idempotent and does not run inference.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_inference_runs(s) == 0);
     voxtral_stream_destroy_internal(s);
 }
@@ -180,14 +180,14 @@ void test_empty_finish_and_repeat() {
 void test_finish_without_context() {
     voxtral_stream * s = make_stream();
     const int16_t buf[4] = {1, 2, 3, 4};
-    CHECK(voxtral_stream_feed_pcm16_internal(s, buf, 4) == voxtral_status::ok);
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::backend_error);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::failed);
-    CHECK(voxtral_stream_last_status(s) == voxtral_status::backend_error);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, buf, 4) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::backend_error);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::failed);
+    CHECK(voxtral_stream_last_status(s) == voxtral_status_internal::backend_error);
     CHECK(!voxtral_stream_last_error(s).empty());
     // finish after failure is rejected; feed after failure is rejected.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::invalid_state);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, buf, 4) == voxtral_status::invalid_state);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::invalid_state);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, buf, 4) == voxtral_status_internal::invalid_state);
     voxtral_stream_destroy_internal(s);
 }
 
@@ -195,36 +195,36 @@ void test_finish_without_context() {
 void test_cancel() {
     voxtral_stream * s = make_stream();
     std::vector<int16_t> a(1280, 5);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status::ok);
-    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::cancelled);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::cancelled);
 
     // finish after cancel must not run inference.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_inference_runs(s) == 0);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::cancelled);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::cancelled);
 
     // repeated cancel is idempotent.
-    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status_internal::ok);
 
     // exactly one CANCELLED event was emitted.
     int cancelled_events = 0;
-    voxtral_stream_event ev;
-    while (voxtral_stream_poll_event(s, ev)) {
-        if (ev.type == voxtral_stream_event_type::cancelled) ++cancelled_events;
+    voxtral_stream_event_internal ev;
+    while (voxtral_stream_poll_event_internal(s, ev)) {
+        if (ev.type == voxtral_stream_event_type_internal::cancelled) ++cancelled_events;
     }
     CHECK(cancelled_events == 1);
 
     // feed after cancel is rejected.
-    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status::invalid_state);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status_internal::invalid_state);
     voxtral_stream_destroy_internal(s);
 }
 
 // --- cancel after completion is rejected -----------------------------------
 void test_cancel_after_completed() {
     voxtral_stream * s = make_stream();
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status::invalid_state);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status_internal::invalid_state);
     voxtral_stream_destroy_internal(s);
 }
 
@@ -232,16 +232,16 @@ void test_cancel_after_completed() {
 void test_reset_after_feed() {
     voxtral_stream * s = make_stream();
     std::vector<int16_t> a(500, 7);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status::ok);
-    CHECK(voxtral_stream_reset_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::created);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_reset_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created);
     CHECK(voxtral_stream_samples_received(s) == 0);
     CHECK(voxtral_stream_pcm_size(s) == 0);
     CHECK(voxtral_stream_feed_calls(s) == 0);
     // Reusable: a fresh feed works and can finish (empty second run here).
     const int16_t x = 1;
-    CHECK(voxtral_stream_feed_pcm16_internal(s, &x, 1) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::running);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, &x, 1) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::running);
     voxtral_stream_destroy_internal(s);
 }
 
@@ -250,12 +250,12 @@ void test_reset_reuse_cycles() {
     voxtral_stream * s = make_stream();
     std::vector<int16_t> big(20000, 3);
     for (int cycle = 0; cycle < 4; ++cycle) {
-        CHECK(voxtral_stream_feed_pcm16_internal(s, big.data(), big.size()) == voxtral_status::ok);
+        CHECK(voxtral_stream_feed_pcm16_internal(s, big.data(), big.size()) == voxtral_status_internal::ok);
         CHECK(voxtral_stream_pcm_size(s) == big.size());
-        CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::running);
-        CHECK(voxtral_stream_reset_internal(s) == voxtral_status::ok);
+        CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::running);
+        CHECK(voxtral_stream_reset_internal(s) == voxtral_status_internal::ok);
         CHECK(voxtral_stream_pcm_size(s) == 0);
-        CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::created);
+        CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created);
     }
     voxtral_stream_destroy_internal(s);
 }
@@ -264,43 +264,43 @@ void test_reset_reuse_cycles() {
 void test_reset_after_cancel() {
     voxtral_stream * s = make_stream();
     std::vector<int16_t> a(500, 7);
-    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status::ok);
-    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_reset_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::created);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, a.data(), a.size()) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_cancel_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_reset_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created);
     CHECK(voxtral_stream_pending_events(s) == 0);
     // A fresh empty finish works after reset.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::completed);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::completed);
     voxtral_stream_destroy_internal(s);
 }
 
 // --- 16. event ordering ----------------------------------------------------
 void test_event_ordering() {
     voxtral_stream * s = make_stream();
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_pending_events(s) == 2);
 
-    voxtral_stream_event ev;
-    CHECK(voxtral_stream_poll_event(s, ev));
-    CHECK(ev.type == voxtral_stream_event_type::final_text);
+    voxtral_stream_event_internal ev;
+    CHECK(voxtral_stream_poll_event_internal(s, ev));
+    CHECK(ev.type == voxtral_stream_event_type_internal::final_text);
     CHECK(ev.text.empty());
-    CHECK(voxtral_stream_poll_event(s, ev));
-    CHECK(ev.type == voxtral_stream_event_type::completed);
+    CHECK(voxtral_stream_poll_event_internal(s, ev));
+    CHECK(ev.type == voxtral_stream_event_type_internal::completed);
     // Draining is safe and repeatable.
-    CHECK(!voxtral_stream_poll_event(s, ev));
-    CHECK(!voxtral_stream_poll_event(s, ev));
+    CHECK(!voxtral_stream_poll_event_internal(s, ev));
+    CHECK(!voxtral_stream_poll_event_internal(s, ev));
     voxtral_stream_destroy_internal(s);
 }
 
 // --- 17. error clearing after reset ----------------------------------------
 void test_error_cleared_by_reset() {
     voxtral_stream * s = make_stream();
-    CHECK(voxtral_stream_feed_pcm16_internal(s, nullptr, 4) == voxtral_status::invalid_argument);
-    CHECK(voxtral_stream_last_status(s) == voxtral_status::invalid_argument);
+    CHECK(voxtral_stream_feed_pcm16_internal(s, nullptr, 4) == voxtral_status_internal::invalid_argument);
+    CHECK(voxtral_stream_last_status(s) == voxtral_status_internal::invalid_argument);
     CHECK(!voxtral_stream_last_error(s).empty());
-    CHECK(voxtral_stream_reset_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_last_status(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_reset_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_last_status(s) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_last_error(s).empty());
     voxtral_stream_destroy_internal(s);
 }
@@ -312,24 +312,24 @@ void test_overflow_guards() {
     voxtral_stream * s = make_stream();
     int16_t tiny = 0;
     CHECK(voxtral_stream_feed_pcm16_internal(s, &tiny, (size_t)64 * 1024 * 1024 + 1)
-          == voxtral_status::invalid_argument);
+          == voxtral_status_internal::invalid_argument);
     CHECK(voxtral_stream_samples_received(s) == 0);
     voxtral_stream_destroy_internal(s);
 
     // Cumulative compatibility bound: max_total_samples enforced across feeds,
     // overflow-safe. This is the documented full-buffer limit -> limit_exceeded
     // (NOT out_of_memory: it is not an allocation failure).
-    voxtral_stream_params bounded = default_params();
+    voxtral_stream_params_internal bounded = default_params();
     bounded.max_total_samples = 10;
     voxtral_stream * b = make_stream(bounded);
     std::vector<int16_t> eight(8, 1), five(5, 1), eleven(11, 1);
     CHECK(voxtral_stream_feed_pcm16_internal(b, eleven.data(), eleven.size())
-          == voxtral_status::limit_exceeded);             // single feed exceeds bound
-    CHECK(voxtral_stream_feed_pcm16_internal(b, eight.data(), eight.size()) == voxtral_status::ok);
+          == voxtral_status_internal::limit_exceeded);             // single feed exceeds bound
+    CHECK(voxtral_stream_feed_pcm16_internal(b, eight.data(), eight.size()) == voxtral_status_internal::ok);
     CHECK(voxtral_stream_feed_pcm16_internal(b, five.data(), five.size())
-          == voxtral_status::limit_exceeded);             // cumulative 8+5 > 10
+          == voxtral_status_internal::limit_exceeded);             // cumulative 8+5 > 10
     CHECK(voxtral_stream_samples_received(b) == 8);        // unchanged by the rejected feed
-    CHECK(voxtral_stream_last_status(b) == voxtral_status::limit_exceeded);
+    CHECK(voxtral_stream_last_status(b) == voxtral_status_internal::limit_exceeded);
     voxtral_stream_destroy_internal(b);
 }
 
@@ -340,8 +340,8 @@ void test_lifecycle_only_ownership() {
     CHECK(!voxtral_stream_owns_context(s));
     CHECK(voxtral_stream_context_ptr(s) == nullptr);
     // A lifecycle-only stream still supports the full non-inference lifecycle.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);   // empty -> completed
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::completed);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);   // empty -> completed
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::completed);
     voxtral_stream_destroy_internal(s);
 }
 
@@ -373,7 +373,7 @@ void test_owned_context_freed_on_destroy() {
     voxtral_model * fake_model = reinterpret_cast<voxtral_model *>(0x1);
     voxtral_stream * s = voxtral_stream_create_internal(fake_model, voxtral_context_params{}, default_params());
     CHECK(s != nullptr);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::created);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created);
     CHECK(voxtral_stream_owns_context(s));
     CHECK(voxtral_stream_context_ptr(s) == static_cast<const void *>(g_fake_ctx));
 
@@ -394,8 +394,8 @@ void test_context_creation_failure() {
     voxtral_stream * s = voxtral_stream_create_internal(fake_model, voxtral_context_params{}, default_params());
     // Failure is surfaced as a queryable status/error, not a bare nullptr.
     CHECK(s != nullptr);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::failed);
-    CHECK(voxtral_stream_last_status(s) == voxtral_status::backend_error);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::failed);
+    CHECK(voxtral_stream_last_status(s) == voxtral_status_internal::backend_error);
     CHECK(!voxtral_stream_last_error(s).empty());
     CHECK(!voxtral_stream_owns_context(s));
     CHECK(voxtral_stream_context_ptr(s) == nullptr);
@@ -436,14 +436,14 @@ void test_sequential_streams_distinct_contexts() {
 // reentrant stream call must return `busy` and none may convert the in-flight
 // finish into `cancelled`.
 // ---------------------------------------------------------------------------
-voxtral_stream_state g_hook_state    = voxtral_stream_state::created;
-voxtral_status       g_hook_feed     = voxtral_status::ok;
-voxtral_status       g_hook_cancel   = voxtral_status::ok;
-voxtral_status       g_hook_reset    = voxtral_status::ok;
-voxtral_status       g_hook_finish   = voxtral_status::ok;
+voxtral_stream_state_internal g_hook_state    = voxtral_stream_state_internal::created;
+voxtral_status_internal       g_hook_feed     = voxtral_status_internal::ok;
+voxtral_status_internal       g_hook_cancel   = voxtral_status_internal::ok;
+voxtral_status_internal       g_hook_reset    = voxtral_status_internal::ok;
+voxtral_status_internal       g_hook_finish   = voxtral_status_internal::ok;
 
 void reentry_hook(voxtral_stream * s, void *) {
-    g_hook_state = voxtral_stream_get_state(s);   // expected: finishing
+    g_hook_state = voxtral_stream_get_state_internal(s);   // expected: finishing
     const int16_t x = 1;
     g_hook_feed   = voxtral_stream_feed_pcm16_internal(s, &x, 1);
     g_hook_cancel = voxtral_stream_cancel_internal(s);
@@ -456,21 +456,21 @@ void test_finishing_reentrancy_guard() {
     voxtral_stream_test_set_finishing_hook(s, reentry_hook, nullptr);
 
     // Empty finish: enters `finishing`, runs the hook, then completes.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
 
     // The hook observed the transient state and got `busy` for every reentrant call.
-    CHECK(g_hook_state  == voxtral_stream_state::finishing);
-    CHECK(g_hook_feed   == voxtral_status::busy);
-    CHECK(g_hook_cancel == voxtral_status::busy);
-    CHECK(g_hook_reset  == voxtral_status::busy);
-    CHECK(g_hook_finish == voxtral_status::busy);
+    CHECK(g_hook_state  == voxtral_stream_state_internal::finishing);
+    CHECK(g_hook_feed   == voxtral_status_internal::busy);
+    CHECK(g_hook_cancel == voxtral_status_internal::busy);
+    CHECK(g_hook_reset  == voxtral_status_internal::busy);
+    CHECK(g_hook_finish == voxtral_status_internal::busy);
 
     // finishing -> completed (never cancelled), no CANCELLED event emitted.
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::completed);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::completed);
     int cancelled_events = 0;
-    voxtral_stream_event ev;
-    while (voxtral_stream_poll_event(s, ev)) {
-        if (ev.type == voxtral_stream_event_type::cancelled) ++cancelled_events;
+    voxtral_stream_event_internal ev;
+    while (voxtral_stream_poll_event_internal(s, ev)) {
+        if (ev.type == voxtral_stream_event_type_internal::cancelled) ++cancelled_events;
     }
     CHECK(cancelled_events == 0);
     voxtral_stream_destroy_internal(s);
@@ -487,21 +487,21 @@ void test_event_queue_hard_bound() {
     // finish with a bound of 1 still delivers BOTH events, records NO overflow, and
     // drops nothing (events_dropped is a hard gate == 0). This supersedes the old
     // behaviour where COMPLETED could be dropped when the queue was full.
-    CHECK(voxtral_stream_finish_internal(s) == voxtral_status::ok);
-    CHECK(voxtral_stream_get_state(s) == voxtral_stream_state::completed);
+    CHECK(voxtral_stream_finish_internal(s) == voxtral_status_internal::ok);
+    CHECK(voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::completed);
     CHECK(voxtral_stream_pending_events(s) == 2);          // final_text + completed
     CHECK(!voxtral_stream_test_events_overflowed(s));      // no mandatory drop
     CHECK(voxtral_stream_events_dropped(s) == 0);          // hard gate
 
-    voxtral_stream_event ev;
-    CHECK(voxtral_stream_poll_event(s, ev));
-    CHECK(ev.type == voxtral_stream_event_type::final_text);
-    CHECK(voxtral_stream_poll_event(s, ev));
-    CHECK(ev.type == voxtral_stream_event_type::completed);
-    CHECK(!voxtral_stream_poll_event(s, ev));
+    voxtral_stream_event_internal ev;
+    CHECK(voxtral_stream_poll_event_internal(s, ev));
+    CHECK(ev.type == voxtral_stream_event_type_internal::final_text);
+    CHECK(voxtral_stream_poll_event_internal(s, ev));
+    CHECK(ev.type == voxtral_stream_event_type_internal::completed);
+    CHECK(!voxtral_stream_poll_event_internal(s, ev));
 
     // reset() clears the overflow flag for reuse.
-    CHECK(voxtral_stream_reset_internal(s) == voxtral_status::ok);
+    CHECK(voxtral_stream_reset_internal(s) == voxtral_status_internal::ok);
     CHECK(!voxtral_stream_test_events_overflowed(s));
     voxtral_stream_destroy_internal(s);
 }

@@ -1,4 +1,4 @@
-#include "voxtral.h"
+#include "voxtral-cpp.h"
 
 #include <algorithm>
 #include <array>

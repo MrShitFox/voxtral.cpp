@@ -176,6 +176,28 @@ static voxtral_backlog_metrics backlog_metrics_from(
     }
     return out;
 }
+
+static double backlog_slope_from(const stage_backlog_series & series) {
+    if (series.stored <= 1) return 0.0;
+    double sx = 0.0;
+    double sy = 0.0;
+    double sxx = 0.0;
+    double sxy = 0.0;
+    for (size_t i = 0; i < series.stored; ++i) {
+        const double x = series.audio_seconds[i];
+        const double y = series.values[i];
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    const double n = static_cast<double>(series.stored);
+    const double denominator = n * sxx - sx * sx;
+    return denominator > 0.0
+        ? (n * sxy - sx * sy) / denominator
+        : 0.0;
+}
+
 voxtral_backlog_metrics voxtral_stream_encoder_backlog(const voxtral_stream * s) {
     return s ? backlog_metrics_from(s->telemetry.encoder_backlog) : voxtral_backlog_metrics{};
 }
@@ -184,4 +206,19 @@ voxtral_backlog_metrics voxtral_stream_adapter_backlog(const voxtral_stream * s)
 }
 voxtral_backlog_metrics voxtral_stream_decoder_backlog(const voxtral_stream * s) {
     return s ? backlog_metrics_from(s->telemetry.decoder_backlog) : voxtral_backlog_metrics{};
+}
+
+voxtral_public_backlog_metrics_internal
+voxtral_stream_public_backlog_internal(const voxtral_stream * s) {
+    voxtral_public_backlog_metrics_internal out;
+    if (!s) return out;
+    out.final_ms = std::max({
+        s->telemetry.encoder_backlog.final_ms,
+        s->telemetry.adapter_backlog.final_ms,
+        s->telemetry.decoder_backlog.final_ms});
+    out.slope_ms_per_s = std::max({
+        backlog_slope_from(s->telemetry.encoder_backlog),
+        backlog_slope_from(s->telemetry.adapter_backlog),
+        backlog_slope_from(s->telemetry.decoder_backlog)});
+    return out;
 }

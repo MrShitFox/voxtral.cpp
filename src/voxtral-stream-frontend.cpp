@@ -17,17 +17,18 @@
 // feed. Deferred (not done in create) so the model-free ownership tests, which
 // substitute an opaque sentinel context and never feed, never dereference it.
 // Returns false only on a genuine allocation failure. A lifecycle-only stream
-// (no owned context) or a context without frontend tables leaves mel_fe null and
-// keeps the full-PCM path.
+// (no context) or a context without frontend tables leaves mel_fe null and keeps
+// the full-PCM path. A valid context may be owned internally or borrowed by the
+// stable public C adapter.
 bool ensure_frontend(voxtral_stream * s) {
     if (s->frontend.mel_fe) return true;
-    if (!s->owns_context || !s->ctx) return true;
+    if (!s->ctx) return true;
     const float * hann    = voxtral_ctx_hann_window(s->ctx);
     const float * filters = voxtral_ctx_mel_filters(s->ctx);
     if (!hann || !filters) return true;
     s->frontend.mel_fe = voxtral_mel_frontend_create(hann, filters);
     if (!s->frontend.mel_fe) {
-        set_error(s, voxtral_status::out_of_memory, "failed to create incremental Mel frontend");
+        set_error(s, voxtral_status_internal::out_of_memory, "failed to create incremental Mel frontend");
         return false;
     }
     voxtral_mel_frontend_set_retain_history(s->frontend.mel_fe, s->params.retain_mel_history);
@@ -56,10 +57,10 @@ voxtral_encoder_metrics stream_encoder_metrics(const voxtral_stream * s) {
 // encoder is created. Returns false only on a genuine allocation failure.
 bool ensure_encoder(voxtral_stream * s) {
     if (s->frontend.enc) return true;
-    if (!s->frontend.mel_fe || !s->owns_context || !s->ctx) return true;
+    if (!s->frontend.mel_fe || !s->ctx) return true;
     s->frontend.enc = voxtral_encoder_stream_create(s->ctx);
     if (!s->frontend.enc) {
-        set_error(s, voxtral_status::out_of_memory, "failed to create incremental encoder");
+        set_error(s, voxtral_status_internal::out_of_memory, "failed to create incremental encoder");
         return false;
     }
     // Incremental path: mirror encoder output into the device ring from the first
@@ -87,7 +88,7 @@ bool drain_mel_to_encoder(voxtral_stream * s, bool final) {
     if (total <= s->frontend.enc_pushed_frames) return true;
     int64_t base = s->frontend.enc_pushed_frames;
     if (base < voxtral_mel_frontend_frames_base(s->frontend.mel_fe) || total < base) {
-        set_error(s, voxtral_status::backend_error, "incremental Mel history base advanced past encoder cursor");
+        set_error(s, voxtral_status_internal::backend_error, "incremental Mel history base advanced past encoder cursor");
         return false;
     }
     // The terminal frontend flush is already a bounded suffix. Preserve it as
@@ -99,7 +100,7 @@ bool drain_mel_to_encoder(voxtral_stream * s, bool final) {
         if (!frames || remaining > INT32_MAX ||
             !voxtral_encoder_stream_push_mel_final(
                 s->frontend.enc, frames, base, (int32_t) remaining)) {
-            set_error(s, voxtral_status::backend_error,
+            set_error(s, voxtral_status_internal::backend_error,
                       "incremental encoder rejected terminal Mel frames");
             return false;
         }
@@ -118,11 +119,11 @@ bool drain_mel_to_encoder(voxtral_stream * s, bool final) {
         const int32_t n = (int32_t) std::min<int64_t>(kMelDrainSlice, total - base);
         const float * frames = voxtral_mel_frontend_frame_data(s->frontend.mel_fe, base);
         if (!frames) {
-            set_error(s, voxtral_status::backend_error, "incremental Mel frame is outside retained window");
+            set_error(s, voxtral_status_internal::backend_error, "incremental Mel frame is outside retained window");
             return false;
         }
         if (!voxtral_encoder_stream_push_mel(s->frontend.enc, frames, base, n)) {
-            set_error(s, voxtral_status::backend_error, "incremental encoder rejected Mel frames");
+            set_error(s, voxtral_status_internal::backend_error, "incremental encoder rejected Mel frames");
             return false;
         }
         if (!capture_new_encoder_output_sha(s)) return false;

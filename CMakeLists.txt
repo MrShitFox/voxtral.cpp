@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VOXTRAL_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(VOXTRAL_NATIVE_OPT "Enable native CPU tuning flags" ON)
+option(VOXTRAL_BUILD_EXAMPLES "Build public API examples" ON)
 # Homebrew uses the system ggml formula; everywhere else ggml is built from source
 # via FetchContent (no vendored submodule). Backends are discovered at runtime via
 # the ggml registry, so no backend flags are needed here.
@@ -21,7 +22,7 @@ endif()
 # Standard testing switch. include(CTest) defines the cache option BUILD_TESTING
 # (default ON) and calls enable_testing(). The internal C++ tests and the
 # streaming-skeleton harness below are gated on it, so a production build with
-# -DBUILD_TESTING=OFF builds only the installed CLI tools. The existing
+# -DBUILD_TESTING=OFF skips every test-only executable. The existing
 # local/remote build+ctest workflow keeps working with no extra flags.
 include(CTest)
 
@@ -56,7 +57,7 @@ else()
     set(VOXTRAL_GGML_INCLUDES "")
 endif()
 
-add_library(voxtral_lib
+set(VOXTRAL_CORE_SOURCES
     src/voxtral.cpp
     src/voxtral-mel.cpp
     src/voxtral-stream.cpp
@@ -66,34 +67,91 @@ add_library(voxtral_lib
     src/voxtral-stream-frontend.cpp
     src/voxtral-stream-decoder.cpp)
 
-# On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
-# import library (voxtral_lib.lib) is generated for dependents like `voxtral`.
-if(WIN32 AND BUILD_SHARED_LIBS)
-    set_target_properties(voxtral_lib PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
-endif()
+# Compile the inference runtime once with hidden visibility. The CLI and
+# internal acceptance tests consume a private static archive, while the public
+# library combines the same PIC objects with the explicitly exported C adapter.
+# This keeps every C++/test helper out of the shared-library ABI.
+add_library(voxtral_core OBJECT ${VOXTRAL_CORE_SOURCES})
+set_target_properties(voxtral_core PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+target_include_directories(voxtral_core
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${VOXTRAL_GGML_INCLUDES})
+target_link_libraries(voxtral_core
+    PRIVATE
+        ${VOXTRAL_GGML_TARGETS}
+        Threads::Threads)
 
-target_include_directories(voxtral_lib
+add_library(voxtral_internal STATIC $<TARGET_OBJECTS:voxtral_core>)
+set_target_properties(voxtral_internal PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+target_include_directories(voxtral_internal
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${VOXTRAL_GGML_INCLUDES})
 
-target_link_libraries(voxtral_lib
+add_library(voxtral_lib
+    src/voxtral-c-api.cpp
+    $<TARGET_OBJECTS:voxtral_core>)
+set_target_properties(voxtral_lib PROPERTIES
+    OUTPUT_NAME voxtral
+    VERSION 1.0.0
+    SOVERSION 1
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+if(UNIX)
+    if(APPLE)
+        set_property(TARGET voxtral_lib PROPERTY
+            INSTALL_RPATH "@loader_path;@loader_path/../lib64")
+    else()
+        set_property(TARGET voxtral_lib PROPERTY
+            INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib64")
+    endif()
+endif()
+target_compile_definitions(voxtral_lib PRIVATE
+    $<$<BOOL:${BUILD_SHARED_LIBS}>:VOXTRAL_BUILD_SHARED>)
+target_include_directories(voxtral_lib
     PUBLIC
-        ${VOXTRAL_GGML_TARGETS}
-        Threads::Threads)
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${VOXTRAL_GGML_INCLUDES})
+if(BUILD_SHARED_LIBS AND UNIX)
+    if(APPLE)
+        target_link_options(voxtral_lib PRIVATE
+            "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/cmake/voxtral.exports")
+    else()
+        target_link_options(voxtral_lib PRIVATE
+            "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/voxtral.map")
+    endif()
+endif()
+
+foreach(voxtral_target IN ITEMS voxtral_internal voxtral_lib)
+    target_link_libraries(${voxtral_target}
+        PUBLIC
+            ${VOXTRAL_GGML_TARGETS}
+            Threads::Threads)
+endforeach()
 
 if(NOT WIN32)
+    target_link_libraries(voxtral_internal PUBLIC m)
     target_link_libraries(voxtral_lib PUBLIC m)
 endif()
 
 if(CMAKE_DL_LIBS)
+    target_link_libraries(voxtral_internal PUBLIC ${CMAKE_DL_LIBS})
     target_link_libraries(voxtral_lib PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 if(VOXTRAL_WARNINGS_AS_ERRORS)
     if (MSVC)
+        target_compile_options(voxtral_core PRIVATE /W4 /WX)
         target_compile_options(voxtral_lib PRIVATE /W4 /WX)
     else()
+        target_compile_options(voxtral_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
         target_compile_options(voxtral_lib PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
 endif()
@@ -102,12 +160,23 @@ if(VOXTRAL_NATIVE_OPT AND NOT MSVC)
     if(APPLE)
         message(STATUS "VOXTRAL_NATIVE_OPT: skipping -march/-mtune=native on Apple toolchains")
     else()
+        target_compile_options(voxtral_core PRIVATE -march=native -mtune=native)
         target_compile_options(voxtral_lib PRIVATE -march=native -mtune=native)
     endif()
 endif()
 
 add_executable(voxtral src/main.cpp)
-target_link_libraries(voxtral PRIVATE voxtral_lib)
+target_link_libraries(voxtral PRIVATE voxtral_internal)
+
+if(VOXTRAL_BUILD_EXAMPLES)
+    add_executable(voxtral-streaming-c examples/c/streaming.c)
+    set_target_properties(voxtral-streaming-c PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+        LINKER_LANGUAGE CXX)
+    target_link_libraries(voxtral-streaming-c PRIVATE voxtral_lib)
+endif()
 
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
 target_link_libraries(voxtral-quantize PRIVATE ${VOXTRAL_GGML_TARGETS} Threads::Threads)
@@ -135,8 +204,17 @@ if(VOXTRAL_NATIVE_OPT AND NOT MSVC)
     endif()
 endif()
 
-# Install the CLI tools (used by `cmake --install` and the Homebrew formula).
-install(TARGETS voxtral voxtral-quantize RUNTIME DESTINATION bin)
+# Install the CLI tools, stable library and C headers.
+install(TARGETS voxtral voxtral-quantize
+    RUNTIME DESTINATION bin)
+install(TARGETS voxtral_lib
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib)
+install(FILES
+    include/voxtral.h
+    include/voxtral-stream.h
+    DESTINATION include)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
@@ -159,6 +237,75 @@ endif()
 # header lives in src/.
 # ----------------------------------------------------------------------------
 if(BUILD_TESTING)
+    # Public headers are compiled as standalone translation units without any
+    # private include directory or GGML header dependency.
+    add_executable(public_header_c11 tests/headers/public_header_smoke.c)
+    set_target_properties(public_header_c11 PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF)
+    target_include_directories(public_header_c11 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME public_header_c11 COMMAND public_header_c11)
+
+    add_executable(public_header_c17 tests/headers/public_header_smoke.c)
+    set_target_properties(public_header_c17 PROPERTIES
+        C_STANDARD 17
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF)
+    target_include_directories(public_header_c17 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME public_header_c17 COMMAND public_header_c17)
+
+    add_executable(public_header_cpp17 tests/headers/public_header_smoke.cpp)
+    set_target_properties(public_header_cpp17 PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF)
+    target_include_directories(public_header_cpp17 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME public_header_cpp17 COMMAND public_header_cpp17)
+
+    add_executable(public_header_cpp20 tests/headers/public_header_smoke.cpp)
+    set_target_properties(public_header_cpp20 PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF)
+    target_include_directories(public_header_cpp20 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME public_header_cpp20 COMMAND public_header_cpp20)
+
+    # Model-free C ABI contract tests. The source is compiled as C and links
+    # only to the documented public library.
+    add_executable(voxtral_public_api_unit tests/c/test_public_api.c)
+    set_target_properties(voxtral_public_api_unit PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+        LINKER_LANGUAGE CXX)
+    target_link_libraries(voxtral_public_api_unit PRIVATE voxtral_lib)
+    add_test(NAME voxtral_public_api_unit COMMAND voxtral_public_api_unit)
+
+    # Model-driven public API harness. It is a C translation unit and links only
+    # against the installed/public library target; no src/ include directory or
+    # private helper symbol is available.
+    add_executable(voxtral_public_stream_api_test
+        tests/c/public_stream_api_test.c)
+    set_target_properties(voxtral_public_stream_api_test PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS ON
+        LINKER_LANGUAGE CXX)
+    target_link_libraries(voxtral_public_stream_api_test PRIVATE voxtral_lib)
+
+    # CPU-only microbenchmark of the ABI validation wrapper itself. Comparing
+    # two zero-length calls on one stream excludes GPU work and pacing sleeps.
+    add_executable(voxtral_public_api_call_benchmark
+        tests/cpp/benchmark_public_api_call.cpp
+        src/voxtral-c-api.cpp)
+    target_link_libraries(voxtral_public_api_call_benchmark
+        PRIVATE voxtral_internal)
+
     if(Python3_Interpreter_FOUND)
         add_test(
             NAME voxtral_python_reference
@@ -167,14 +314,14 @@ if(BUILD_TESTING)
 
     # Model-free unit tests for the stream lifecycle / state machine / PCM path.
     add_executable(voxtral_stream_unit tests/cpp/test_stream_state.cpp)
-    target_link_libraries(voxtral_stream_unit PRIVATE voxtral_lib)
+    target_link_libraries(voxtral_stream_unit PRIVATE voxtral_internal)
     target_include_directories(voxtral_stream_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_stream_unit COMMAND voxtral_stream_unit)
 
     # Model-free numerical parity + memory-bound tests for the incremental Mel
     # frontend (batch vs incremental, one-shot frames, bounded PCM retention).
     add_executable(voxtral_mel_unit tests/cpp/test_mel_incremental.cpp)
-    target_link_libraries(voxtral_mel_unit PRIVATE voxtral_lib)
+    target_link_libraries(voxtral_mel_unit PRIVATE voxtral_internal)
     target_include_directories(voxtral_mel_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_mel_unit COMMAND voxtral_mel_unit)
 
@@ -182,7 +329,7 @@ if(BUILD_TESTING)
     # (batch-vs-incremental chunk schedule equivalence, conv frame math, bounded
     # work). End-to-end tensor parity is proven by the Node.js GPU acceptance suite.
     add_executable(voxtral_encoder_unit tests/cpp/test_encoder_incremental.cpp)
-    target_link_libraries(voxtral_encoder_unit PRIVATE voxtral_lib)
+    target_link_libraries(voxtral_encoder_unit PRIVATE voxtral_internal)
     target_include_directories(voxtral_encoder_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_encoder_unit COMMAND voxtral_encoder_unit)
 
@@ -190,14 +337,14 @@ if(BUILD_TESTING)
     # wrap, eviction, causal-window mask, absolute positions across rollover, conv
     # window alignment). End-to-end tensor parity is proven by the GPU suite.
     add_executable(voxtral_encoder_kv_unit tests/cpp/test_encoder_kv.cpp)
-    target_link_libraries(voxtral_encoder_kv_unit PRIVATE voxtral_lib)
+    target_link_libraries(voxtral_encoder_kv_unit PRIVATE voxtral_internal)
     target_include_directories(voxtral_encoder_kv_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_encoder_kv_unit COMMAND voxtral_encoder_kv_unit)
 
     # Model-free decoder KV ring arithmetic: absolute positions, modulo writes,
     # logical read ordering, wrap and fully-sliding eviction without movement.
     add_executable(voxtral_decoder_kv_unit tests/cpp/test_decoder_kv.cpp)
-    target_link_libraries(voxtral_decoder_kv_unit PRIVATE voxtral_lib)
+    target_link_libraries(voxtral_decoder_kv_unit PRIVATE voxtral_internal)
     target_include_directories(voxtral_decoder_kv_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME voxtral_decoder_kv_unit COMMAND voxtral_decoder_kv_unit)
 
@@ -209,7 +356,7 @@ if(BUILD_TESTING)
 
     # Model-driven harness used by the Node.js acceptance suite. Not a CLI/server.
     add_executable(voxtral-stream-test tests/cpp/voxtral_stream_test.cpp)
-    target_link_libraries(voxtral-stream-test PRIVATE voxtral_lib)
+    target_link_libraries(voxtral-stream-test PRIVATE voxtral_internal)
     target_include_directories(voxtral-stream-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 

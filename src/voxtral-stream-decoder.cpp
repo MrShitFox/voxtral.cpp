@@ -57,8 +57,8 @@ static bool token_piece_has_lexical_content(const voxtral_stream * s, int32_t to
 // One scheduler pass: commit every ready adapter group, then run every ready
 // decoder step, emitting TOKEN + PARTIAL_TEXT. Called after each feed slice and at
 // finish. All three stages stay bounded because they are drained here every slice.
-voxtral_status pump_incremental(voxtral_stream * s) {
-    if (!s->decoder.incremental || !s->frontend.enc || !s->ctx) return voxtral_status::ok;
+voxtral_status_internal pump_incremental(voxtral_stream * s) {
+    if (!s->decoder.incremental || !s->frontend.enc || !s->ctx) return voxtral_status_internal::ok;
     build_prompt_ids(s);
 
     const int32_t aemb_cap    = voxtral_ctx_aemb_ring_frames(s->ctx);
@@ -72,12 +72,12 @@ voxtral_status pump_incremental(voxtral_stream * s) {
     if (committable > s->decoder.adapter_groups_committed) {
         const int32_t n = (int32_t) (committable - s->decoder.adapter_groups_committed);
         if (voxtral_ctx_adapter_commit(s->ctx, s->decoder.adapter_groups_committed, n) < 0) {
-            set_error(s, voxtral_status::backend_error, "incremental adapter commit failed");
-            return voxtral_status::backend_error;
+            set_error(s, voxtral_status_internal::backend_error, "incremental adapter commit failed");
+            return voxtral_status_internal::backend_error;
         }
         if (!capture_new_adapter_output_sha(
                 s, s->decoder.adapter_groups_committed, n)) {
-            return voxtral_status::backend_error;
+            return voxtral_status_internal::backend_error;
         }
         note_group_eligibility(s, s->decoder.adapter_groups_committed, n, aemb_cap);
         if (s->telemetry.first_adapter_commit_ms == 0.0) s->telemetry.first_adapter_commit_ms = stream_elapsed_ms(s);
@@ -91,8 +91,8 @@ voxtral_status pump_incremental(voxtral_stream * s) {
     if (!s->decoder.decoder_prefill_done && s->decoder.adapter_groups_committed >= (L - 1)) {
         voxtral_ctx_decoder_begin_incremental(s->ctx);
         if (!voxtral_ctx_decoder_prefill_incremental(s->ctx, s->decoder.prompt_ids.data(), L - 1)) {
-            set_error(s, voxtral_status::backend_error, "incremental decoder prefill failed");
-            return voxtral_status::backend_error;
+            set_error(s, voxtral_status_internal::backend_error, "incremental decoder prefill failed");
+            return voxtral_status_internal::backend_error;
         }
         s->decoder.decoder_prefill_done = true;
         s->decoder.decoder_position     = L - 1;                // first step is at position L-1
@@ -150,7 +150,7 @@ voxtral_status pump_incremental(voxtral_stream * s) {
     // Resume: flush a token stashed by a previous backpressured pass before doing
     // any new work. Still full → remain backpressured (caller drains and retries).
     if (s->decoder.decoder_prefill_done) {
-        if (!commit_pending()) return voxtral_status::limit_exceeded;
+        if (!commit_pending()) return voxtral_status_internal::limit_exceeded;
         s->events.decoder_backpressured = false;
     }
 
@@ -162,8 +162,8 @@ voxtral_status pump_incremental(voxtral_stream * s) {
             int32_t tok = 0;
             if (!voxtral_ctx_decoder_step_incremental(
                     s->ctx, s->decoder.decoder_prev_token, (int32_t) s->decoder.decoder_position, &tok)) {
-                set_error(s, voxtral_status::backend_error, "incremental decoder step failed");
-                return voxtral_status::backend_error;
+                set_error(s, voxtral_status_internal::backend_error, "incremental decoder step failed");
+                return voxtral_status_internal::backend_error;
             }
             s->decoder.decoder_steps++;
             s->telemetry.token_id_d2h_bytes += (int64_t) sizeof(int32_t);   // 4-byte argmax readback
@@ -183,10 +183,10 @@ voxtral_status pump_incremental(voxtral_stream * s) {
             s->decoder.pending.position = s->decoder.decoder_position;
             s->decoder.pending.special  = (tok == VOXTRAL_TOKEN_EOS || tok == VOXTRAL_TOKEN_BOS ||
                                    tok == VOXTRAL_TOKEN_STREAMING_PAD);
-            if (!commit_pending()) return voxtral_status::limit_exceeded;
+            if (!commit_pending()) return voxtral_status_internal::limit_exceeded;
         }
     }
-    return voxtral_status::ok;
+    return voxtral_status_internal::ok;
 }
 
 // ---- introspection accessors ----

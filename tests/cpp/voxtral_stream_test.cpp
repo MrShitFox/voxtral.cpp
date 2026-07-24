@@ -34,7 +34,7 @@
 // ============================================================================
 
 #include "voxtral-stream.h"
-#include "voxtral.h"
+#include "voxtral-cpp.h"
 #include "voxtral-mel.h"
 #include "voxtral-internal.h"
 
@@ -347,7 +347,7 @@ struct StreamRun {
     std::string          pcmSha;
     std::vector<int32_t> tokens;
     std::string          text;
-    std::vector<voxtral_stream_event> events;
+    std::vector<voxtral_stream_event_internal> events;
     bool                 contextOwned = false;
     bool                 ok           = false;
     bool                 warmupApplied = false;
@@ -858,8 +858,8 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.parityChecked = options.check_parity;
     r.eventHistoryRetained = options.retain_event_history;
     auto drain_events = [&]() {
-        voxtral_stream_event event;
-        while (voxtral_stream_poll_event(stream, event)) {
+        voxtral_stream_event_internal event;
+        while (voxtral_stream_poll_event_internal(stream, event)) {
             if (options.retain_event_history) {
                 r.events.push_back(std::move(event));
             }
@@ -902,7 +902,7 @@ StreamRun drive_stream(voxtral_stream * stream,
         previous_profile =
             voxtral_context_runtime_profile_internal(run_context);
     }
-    voxtral_status fst = voxtral_status::ok;
+    voxtral_status_internal fst = voxtral_status_internal::ok;
     for (size_t c : counts) {
         // A captured chunk becomes callable only when its final sample has
         // arrived. Anchor every deadline to the common monotonic start so
@@ -1013,7 +1013,7 @@ StreamRun drive_stream(voxtral_stream * stream,
                     (double) (audio_cursor + c) / VOXTRAL_SAMPLE_RATE);
             }
         }
-        if (fst == voxtral_status::limit_exceeded) {
+        if (fst == voxtral_status_internal::limit_exceeded) {
             // Explicit backpressure (queue_full), NOT a failure: the audio was
             // accepted; the decoder has output pending because the event queue is
             // full. Record it, drain, and continue — the next feed / finish resumes
@@ -1023,10 +1023,10 @@ StreamRun drive_stream(voxtral_stream * stream,
             drain_events();
             off += c;
             audio_cursor += c;
-            fst = voxtral_status::ok;   // resumed for the next iteration / finish
+            fst = voxtral_status_internal::ok;   // resumed for the next iteration / finish
             continue;
         }
-        if (fst != voxtral_status::ok) {
+        if (fst != voxtral_status_internal::ok) {
             std::cerr << "feed failed: " << voxtral_stream_status_name(fst)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
             break;
@@ -1047,13 +1047,13 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.steadyRuntimeProfile = voxtral_context_runtime_profile_internal(
         static_cast<const voxtral_context *>(voxtral_stream_context_ptr(stream)));
 
-    voxtral_status finst = voxtral_status::internal_error;
-    if (fst == voxtral_status::ok) {
+    voxtral_status_internal finst = voxtral_status_internal::internal_error;
+    if (fst == voxtral_status_internal::ok) {
         const auto tfin0 = std::chrono::steady_clock::now();
         finst = voxtral_stream_finish_internal(stream);
         const auto tfin1 = std::chrono::steady_clock::now();
         r.finishLatencyMs = std::chrono::duration<double, std::milli>(tfin1 - tfin0).count();
-        if (finst != voxtral_status::ok) {
+        if (finst != voxtral_status_internal::ok) {
             std::cerr << "finish failed: " << voxtral_stream_status_name(finst)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
         }
@@ -1291,7 +1291,7 @@ StreamRun drive_stream(voxtral_stream * stream,
     // Drain events (order preserved when history capture is enabled).
     drain_events();
 
-    r.state           = voxtral_stream_state_name(voxtral_stream_get_state(stream));
+    r.state           = voxtral_stream_state_name(voxtral_stream_get_state_internal(stream));
     r.finishStatus    = voxtral_stream_status_name(finst);
     r.samplesReceived = voxtral_stream_samples_received(stream);
     r.samplesConsumed = voxtral_stream_samples_consumed(stream);
@@ -1304,7 +1304,7 @@ StreamRun drive_stream(voxtral_stream * stream,
     r.tokenOutputBytes = r.tokens.size() * sizeof(int32_t);
     r.transcriptOutputBytes = r.text.size();
     r.contextOwned    = voxtral_stream_owns_context(stream);
-    r.ok              = (finst == voxtral_status::ok);
+    r.ok              = (finst == voxtral_status_internal::ok);
 
     // Session 7 incremental adapter/decoder telemetry.
     r.usesIncrementalDecode   = voxtral_stream_uses_incremental_decode(stream);
@@ -1758,18 +1758,18 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
     js << "\"events\":[";
     for (size_t i = 0; i < r.events.size(); ++i) {
         if (i) js << ",";
-        const voxtral_stream_event & e = r.events[i];
+        const voxtral_stream_event_internal & e = r.events[i];
         js << "{\"type\":\"" << voxtral_stream_event_name(e.type) << "\"";
-        if (e.type == voxtral_stream_event_type::error) {
+        if (e.type == voxtral_stream_event_type_internal::error) {
             js << ",\"code\":" << e.error_code;
-        } else if (e.type == voxtral_stream_event_type::token) {
+        } else if (e.type == voxtral_stream_event_type_internal::token) {
             js << ",\"sequence\":" << e.sequence
                << ",\"token\":" << e.token
                << ",\"piece\":\"" << json_escape(e.text) << "\""
                << ",\"decoderPosition\":" << e.decoder_position
                << ",\"audioEndSample\":" << e.audio_end_sample
                << ",\"special\":" << (e.special ? "true" : "false");
-        } else if (e.type == voxtral_stream_event_type::partial_text) {
+        } else if (e.type == voxtral_stream_event_type_internal::partial_text) {
             js << ",\"revision\":" << e.revision
                << ",\"stablePrefixBytes\":" << e.stable_prefix_bytes
                << ",\"audioEndSample\":" << e.audio_end_sample
@@ -1793,7 +1793,7 @@ void write_run_fields(std::ostringstream & js, const StreamRun & r) {
 // ============================================================================
 int run_sequential_streams(voxtral_model * model,
                            const voxtral_context_params & cp,
-                           voxtral_stream_params sp,
+                           voxtral_stream_params_internal sp,
                            const std::vector<int16_t> & full_pcm,
                            int32_t iterations,
                            int32_t short_samples) {
@@ -1830,23 +1830,23 @@ int run_sequential_streams(voxtral_model * model,
         it.vram = read_vram_used_bytes();
         it.rss = read_process_rss_kib();
         it.events = voxtral_stream_events_emitted(stream);
-        it.stateAfterFinish = voxtral_stream_state_name(voxtral_stream_get_state(stream));
+        it.stateAfterFinish = voxtral_stream_state_name(voxtral_stream_get_state_internal(stream));
         if (i == 0) first_tokens = run.tokens;
         it.tokensMatchFirst = (run.tokens == first_tokens);
         if (!it.tokensMatchFirst) all_tokens_consistent = false;
 
-        const voxtral_status rs = voxtral_stream_reset_internal(stream);
+        const voxtral_status_internal rs = voxtral_stream_reset_internal(stream);
         it.resetStatus = voxtral_stream_status_name(rs);
-        if (rs != voxtral_status::ok) all_reset_ok = false;
-        voxtral_stream_event ev;
-        it.resetPristine = rs == voxtral_status::ok &&
-            voxtral_stream_get_state(stream) == voxtral_stream_state::created &&
+        if (rs != voxtral_status_internal::ok) all_reset_ok = false;
+        voxtral_stream_event_internal ev;
+        it.resetPristine = rs == voxtral_status_internal::ok &&
+            voxtral_stream_get_state_internal(stream) == voxtral_stream_state_internal::created &&
             voxtral_stream_samples_received(stream) == 0 &&
             voxtral_stream_samples_consumed(stream) == 0 &&
             voxtral_stream_tokens(stream).empty() &&
             voxtral_stream_transcript(stream).empty() &&
             voxtral_stream_events_emitted(stream) == 0 &&
-            !voxtral_stream_poll_event(stream, ev);
+            !voxtral_stream_poll_event_internal(stream, ev);
         if (!it.resetPristine) all_reset_pristine = false;
         iters.push_back(it);
     }
@@ -1875,13 +1875,13 @@ int run_sequential_streams(voxtral_model * model,
             const size_t c = std::min<size_t>(chunk, pcm.size() - o);
             voxtral_stream_feed_pcm16_internal(s, pcm.data() + o, c);
         }
-        const voxtral_status f1 = voxtral_stream_finish_internal(s);
-        const voxtral_status f2 = voxtral_stream_finish_internal(s);   // idempotent -> ok
+        const voxtral_status_internal f1 = voxtral_stream_finish_internal(s);
+        const voxtral_status_internal f2 = voxtral_stream_finish_internal(s);   // idempotent -> ok
         const int16_t one = 0;
-        const voxtral_status fa = voxtral_stream_feed_pcm16_internal(s, &one, 1);  // -> err
-        add_edge("finish_twice_idempotent", f1 == voxtral_status::ok && f2 == voxtral_status::ok,
+        const voxtral_status_internal fa = voxtral_stream_feed_pcm16_internal(s, &one, 1);  // -> err
+        add_edge("finish_twice_idempotent", f1 == voxtral_status_internal::ok && f2 == voxtral_status_internal::ok,
                  std::string(voxtral_stream_status_name(f1)) + "/" + voxtral_stream_status_name(f2));
-        add_edge("feed_after_finish_rejected", fa != voxtral_status::ok,
+        add_edge("feed_after_finish_rejected", fa != voxtral_status_internal::ok,
                  voxtral_stream_status_name(fa));
         voxtral_stream_destroy_internal(s);
     }
@@ -1889,15 +1889,15 @@ int run_sequential_streams(voxtral_model * model,
     {
         voxtral_stream * s = voxtral_stream_create_internal(model, cp, sp);
         if (!pcm.empty()) voxtral_stream_feed_pcm16_internal(s, pcm.data(), std::min<size_t>(chunk, pcm.size()));
-        const voxtral_status cx = voxtral_stream_cancel_internal(s);
-        const bool cancelled = voxtral_stream_get_state(s) == voxtral_stream_state::cancelled;
-        const voxtral_status fin = voxtral_stream_finish_internal(s);   // ok, no inference
-        const voxtral_status rs = voxtral_stream_reset_internal(s);
-        add_edge("cancel_sets_cancelled", cx == voxtral_status::ok && cancelled,
+        const voxtral_status_internal cx = voxtral_stream_cancel_internal(s);
+        const bool cancelled = voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::cancelled;
+        const voxtral_status_internal fin = voxtral_stream_finish_internal(s);   // ok, no inference
+        const voxtral_status_internal rs = voxtral_stream_reset_internal(s);
+        add_edge("cancel_sets_cancelled", cx == voxtral_status_internal::ok && cancelled,
                  voxtral_stream_status_name(cx));
-        add_edge("finish_after_cancel_ok", fin == voxtral_status::ok, voxtral_stream_status_name(fin));
+        add_edge("finish_after_cancel_ok", fin == voxtral_status_internal::ok, voxtral_stream_status_name(fin));
         add_edge("reset_after_cancel_created",
-                 rs == voxtral_status::ok && voxtral_stream_get_state(s) == voxtral_stream_state::created,
+                 rs == voxtral_status_internal::ok && voxtral_stream_get_state_internal(s) == voxtral_stream_state_internal::created,
                  voxtral_stream_status_name(rs));
         voxtral_stream_destroy_internal(s);
     }
@@ -1917,10 +1917,10 @@ int run_sequential_streams(voxtral_model * model,
     // (d) reset from created / double reset is a safe no-op.
     {
         voxtral_stream * s = voxtral_stream_create_internal(model, cp, sp);
-        const voxtral_status r1 = voxtral_stream_reset_internal(s);
-        const voxtral_status r2 = voxtral_stream_reset_internal(s);
+        const voxtral_status_internal r1 = voxtral_stream_reset_internal(s);
+        const voxtral_status_internal r2 = voxtral_stream_reset_internal(s);
         add_edge("reset_from_created_idempotent",
-                 r1 == voxtral_status::ok && r2 == voxtral_status::ok,
+                 r1 == voxtral_status_internal::ok && r2 == voxtral_status_internal::ok,
                  std::string(voxtral_stream_status_name(r1)) + "/" + voxtral_stream_status_name(r2));
         voxtral_stream_destroy_internal(s);
     }
@@ -2114,7 +2114,7 @@ int main(int argc, char ** argv) {
     cp.logger    = logger;
     cp.gpu       = gpu;
 
-    voxtral_stream_params sp;
+    voxtral_stream_params_internal sp;
     sp.max_tokens = max_tokens;
     sp.retain_mel_history = !skip_parity || manual_oracle;
     if (max_total_samples > 0) sp.max_total_samples = max_total_samples;
@@ -2130,11 +2130,11 @@ int main(int argc, char ** argv) {
     auto apply_warmup = [&](voxtral_stream * stream, StreamRun & run) -> bool {
         if (!warmup) return true;
         const auto start = std::chrono::steady_clock::now();
-        const voxtral_status status = voxtral_stream_warmup_internal(stream);
+        const voxtral_status_internal status = voxtral_stream_warmup_internal(stream);
         run.warmupMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
-        run.warmupApplied = status == voxtral_status::ok;
-        if (status != voxtral_status::ok) {
+        run.warmupApplied = status == voxtral_status_internal::ok;
+        if (status != voxtral_status_internal::ok) {
             std::cerr << "warmup failed: " << voxtral_stream_status_name(status)
                       << " (" << voxtral_stream_last_error(stream) << ")\n";
             return false;
@@ -2142,20 +2142,20 @@ int main(int argc, char ** argv) {
         // Warmup is a preparation operation, not a synthetic utterance. Lock
         // down that contract here so shader/graph preparation can never become
         // an invisible source of token, transcript, event or audio state.
-        voxtral_stream_event warmup_event;
+        voxtral_stream_event_internal warmup_event;
         const bool pristine =
-            voxtral_stream_get_state(stream) == voxtral_stream_state::created &&
+            voxtral_stream_get_state_internal(stream) == voxtral_stream_state_internal::created &&
             voxtral_stream_samples_received(stream) == 0 &&
             voxtral_stream_samples_consumed(stream) == 0 &&
             voxtral_stream_tokens(stream).empty() &&
             voxtral_stream_transcript(stream).empty() &&
             voxtral_stream_events_emitted(stream) == 0 &&
-            !voxtral_stream_poll_event(stream, warmup_event);
+            !voxtral_stream_poll_event_internal(stream, warmup_event);
         if (!pristine) {
             std::cerr << "warmup polluted fresh stream state\n";
             return false;
         }
-        if (voxtral_stream_warmup_internal(stream) != voxtral_status::ok) {
+        if (voxtral_stream_warmup_internal(stream) != voxtral_status_internal::ok) {
             std::cerr << "warmup is not idempotent\n";
             return false;
         }

@@ -19,7 +19,7 @@ bool capture_new_encoder_output_sha(voxtral_stream * s) {
     if (count64 <= 0) return true;
     const int32_t capacity = voxtral_ctx_enc_out_ring_frames(s->ctx);
     if (count64 > capacity || count64 > INT32_MAX) {
-        set_error(s, voxtral_status::backend_error,
+        set_error(s, voxtral_status_internal::backend_error,
                   "encoder SHA capture fell behind bounded output ring");
         return false;
     }
@@ -28,7 +28,7 @@ bool capture_new_encoder_output_sha(voxtral_stream * s) {
     if (!voxtral_ctx_read_enc_out_ring_internal(
             s->ctx, s->diagnostics.encoder_sha_rows, count,
             s->diagnostics.output_sha_scratch.data())) {
-        set_error(s, voxtral_status::backend_error,
+        set_error(s, voxtral_status_internal::backend_error,
                   "encoder SHA diagnostic readback failed");
         return false;
     }
@@ -45,14 +45,14 @@ bool capture_new_adapter_output_sha(voxtral_stream * s,
         count <= 0) return true;
     const int32_t capacity = voxtral_ctx_aemb_ring_frames(s->ctx);
     if (count > capacity || start != s->diagnostics.adapter_sha_rows) {
-        set_error(s, voxtral_status::backend_error,
+        set_error(s, voxtral_status_internal::backend_error,
                   "adapter SHA capture lost monotonic ring position");
         return false;
     }
     s->diagnostics.output_sha_scratch.resize((size_t) count * VOXTRAL_DEC_DIM);
     if (!voxtral_ctx_read_aemb_ring_internal(
             s->ctx, start, count, s->diagnostics.output_sha_scratch.data())) {
-        set_error(s, voxtral_status::backend_error,
+        set_error(s, voxtral_status_internal::backend_error,
                   "adapter SHA diagnostic readback failed");
         return false;
     }

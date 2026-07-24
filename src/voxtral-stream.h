@@ -5,15 +5,15 @@
 // Internal streaming session runtime (v2)
 // ----------------------------------------------------------------------------
 // This header is INTERNAL and UNSTABLE. It is intentionally not part of the
-// public C++ surface in include/voxtral.h. The public streaming C ABI and the
-// WebSocket server remain out of scope for this session (see
-// docs/architecture/streaming-runtime.md, "Implementation status").
+// public surface in include/voxtral.h / include/voxtral-stream.h. The stable C
+// ABI is a validation/ownership adapter over this runtime; a WebSocket server
+// remains out of scope (see docs/architecture/streaming-runtime.md).
 //
 // What this layer provides today:
 //   * an opaque-ish `voxtral_stream` object with a strict lifecycle;
-//   * a shared, immutable `voxtral_model` and a per-stream, mutable
-//     `voxtral_context` OWNED by the stream (created via the existing
-//     model/context factory, freed on destroy);
+//   * a shared, immutable `voxtral_model` and a per-inference mutable
+//     `voxtral_context`, either owned by an internal stream factory or borrowed
+//     from the stable public C context factory;
 //   * incremental PCM16 / float32 feeding with 64-bit sample accounting;
 //   * a strictly bounded internal event queue (lifecycle + error events);
 //   * finish/reset/cancel/destroy;
@@ -26,7 +26,7 @@
 // PCM, encoder output, or an utterance-sized event history.
 //
 // ----------------------------------------------------------------------------
-// Ownership model (v1)
+// Internal ownership modes
 // ----------------------------------------------------------------------------
 //     voxtral_model        immutable weights + tokenizer + device selection.
 //                          SHARED. Outlives every stream created from it. Never
@@ -34,18 +34,20 @@
 //     voxtral_context      the mutable per-inference execution engine: decoder
 //                          KV-cache, kv_used, decoder/encoder memory, schedulers,
 //                          scratch buffers and the current transcription sizes.
-//                          This is genuinely mutable per-inference state, so it
-//                          is OWNED exclusively by exactly one stream and freed
-//                          when that stream is destroyed.
-//     voxtral_stream       owns its context plus its own PCM / counters /
-//                          transcript / event queue / lifecycle state.
+//                          This is genuinely mutable per-inference state and is
+//                          leased exclusively to one stream at a time.
+//     voxtral_stream       always owns PCM / counters / transcript / events.
+//                          The legacy internal factory also owns its context;
+//                          the public-C adapter factory borrows a caller-owned
+//                          context and never frees it.
 //
-//     model  outlives  stream  ⊃  its own context
+//     owned mode:     model outlives stream, stream owns context
+//     borrowed mode:  model outlives context outlives stream
 //
-// One `voxtral_context` is NEVER shared by two streams: each stream creates its
-// own via voxtral_init_from_model(). Several streams may be created from the
-// same model, sequentially; concurrent execution of streams is NOT supported in
-// this session (a separate concurrency session owns that).
+// One `voxtral_context` is never used by two streams concurrently. The public
+// adapter enforces one live stream lease per context. Several contexts may be
+// created from the same immutable model; concurrent execution is supported only
+// across independently owned contexts and remains caller-serialized per stream.
 //
 // ----------------------------------------------------------------------------
 // Threading contract (v1): EXTERNALLY SERIALIZED
@@ -54,7 +56,7 @@
 // Concurrent or reentrant calls on the same stream are NOT supported. As a cheap
 // diagnostic (not a real synchronization primitive), every mutating entry point
 // (feed/finish/reset/cancel) takes a non-blocking guard and returns
-// `voxtral_status::busy` if it detects another operation already in progress on
+// `voxtral_status_internal::busy` if it detects another operation already in progress on
 // the same stream. In particular:
 //   * finish() is SYNCHRONOUS;
 //   * cancel() does NOT interrupt an in-flight finish() — it returns `busy`.
@@ -67,8 +69,7 @@
 // data race across threads.
 // ============================================================================
 
-#include "voxtral.h"   // public API: voxtral_model, voxtral_context, voxtral_context_params,
-                        // voxtral_init_from_model, voxtral_free, voxtral_transcribe_audio, constants
+#include "voxtral-cpp.h"   // private C++ model/context compatibility surface
 #include "voxtral-mel.h"  // incremental Mel frontend + voxtral_mel_metrics
 #include "voxtral-internal.h"  // voxtral_encoder_metrics (full encoder KV / reference metrics)
 
@@ -82,7 +83,7 @@
 // entry point returns one of these and records a human-readable last error on
 // the stream (owned by the stream, see voxtral_stream_last_error).
 // ----------------------------------------------------------------------------
-enum class voxtral_status {
+enum class voxtral_status_internal {
     ok,
     invalid_argument,
     invalid_state,
@@ -125,7 +126,7 @@ enum class voxtral_status {
 // (***) destroy() during an in-flight operation is caller error (see the
 //       threading contract above); it is not made safe here.
 // ----------------------------------------------------------------------------
-enum class voxtral_stream_state {
+enum class voxtral_stream_state_internal {
     created,
     running,
     finishing,
@@ -140,7 +141,7 @@ enum class voxtral_stream_state {
 // cancelled are the terminal lifecycle events. Every event owns its text (no
 // dangling const char *).
 // ----------------------------------------------------------------------------
-enum class voxtral_stream_event_type {
+enum class voxtral_stream_event_type_internal {
     token,
     partial_text,
     final_text,
@@ -149,12 +150,12 @@ enum class voxtral_stream_event_type {
     cancelled,
 };
 
-struct voxtral_stream_event {
-    voxtral_stream_event_type type   = voxtral_stream_event_type::final_text;
+struct voxtral_stream_event_internal {
+    voxtral_stream_event_type_internal type   = voxtral_stream_event_type_internal::final_text;
     int32_t                   token  = 0;      // token id (token events)
     std::string               text;            // owned copy (partial/final text)
     double                    t_audio_ms = 0.0;// audio position, derived from 64-bit count
-    int32_t                   error_code = 0;  // voxtral_status value for error events
+    int32_t                   error_code = 0;  // voxtral_status_internal value for error events
 
     // Incremental streaming payload (token / partial_text events).
     uint64_t sequence               = 0;   // token events: strictly monotonic id
@@ -171,7 +172,7 @@ struct voxtral_stream_event {
 // currently supported format is mono 16 kHz. Extra fields are reserved so the
 // incremental frontend session can extend this without breaking callers.
 // ----------------------------------------------------------------------------
-struct voxtral_stream_params {
+struct voxtral_stream_params_internal {
     int32_t  sample_rate = VOXTRAL_SAMPLE_RATE;   // must equal 16000
     int32_t  channels    = 1;                      // must equal 1
     int32_t  max_tokens  = 0;                       // 0 = decode whole buffer
@@ -193,7 +194,7 @@ struct voxtral_stream;  // defined in voxtral-stream.cpp
 // Params validation (exposed so tests can assert the specific rejection code).
 // Returns ok, unsupported_audio_format or invalid_argument.
 // ----------------------------------------------------------------------------
-voxtral_status voxtral_stream_params_check(const voxtral_stream_params & params);
+voxtral_status_internal voxtral_stream_params_check(const voxtral_stream_params_internal & params);
 
 // ----------------------------------------------------------------------------
 // Lifecycle.
@@ -220,24 +221,31 @@ voxtral_status voxtral_stream_params_check(const voxtral_stream_params & params)
 voxtral_stream * voxtral_stream_create_internal(
     voxtral_model                * model,
     const voxtral_context_params & ctx_params,
-    const voxtral_stream_params  & params);
+    const voxtral_stream_params_internal  & params);
+
+// Public-C-adapter path: borrow an already-created context instead of creating
+// a second execution engine. The caller owns ctx and guarantees it outlives the
+// returned stream. The stream still owns all frontend/encoder/event host state.
+voxtral_stream * voxtral_stream_create_from_context_internal(
+    voxtral_context * ctx,
+    const voxtral_stream_params_internal & params);
 
 // Explicit production-graph warmup. Valid only before the first feed (and
 // idempotent). Compiles shaders and retains reusable buffers without changing
 // audio/token/transcript/event state.
-voxtral_status voxtral_stream_warmup_internal(voxtral_stream * stream);
+voxtral_status_internal voxtral_stream_warmup_internal(voxtral_stream * stream);
 
 // Incremental feeds. The input buffer is copied into the stream; the caller may
 // free or reuse it immediately after return. `samples == nullptr` is only valid
 // when `sample_count == 0`.
-voxtral_status voxtral_stream_feed_pcm16_internal(
+voxtral_status_internal voxtral_stream_feed_pcm16_internal(
     voxtral_stream * stream, const int16_t * samples, size_t sample_count);
 
 // Canonical float32 samples. Any FINITE value is accepted and stored unchanged:
 // the nominal range is [-1, 1] but values outside it are NOT rejected and are
 // NEVER silently clamped (this preserves parity with the batch audio path).
 // NaN and ±Inf are rejected with invalid_argument and never mutate the buffer.
-voxtral_status voxtral_stream_feed_f32_internal(
+voxtral_status_internal voxtral_stream_feed_f32_internal(
     voxtral_stream * stream, const float * samples, size_t sample_count);
 
 // Flush the remaining Mel/encoder frames and process the bounded decoder tail
@@ -245,20 +253,20 @@ voxtral_status voxtral_stream_feed_f32_internal(
 // FINAL_TEXT + COMPLETED. Idempotent after completion (never re-runs the encoder
 // prefix).
 // Synchronous; see the threading contract.
-voxtral_status voxtral_stream_finish_internal(voxtral_stream * stream);
+voxtral_status_internal voxtral_stream_finish_internal(voxtral_stream * stream);
 
 // Return the stream to a state equivalent to a freshly created stream with the
 // same params and (owned) context: clears PCM, counters, transcript, tokens,
 // events, error and cancellation, and RETAINS the PCM buffer's capacity for
 // cheap reuse (no shrink_to_fit). Never touches model weights, tokenizer, device
 // or the owned context. Intended for cheap stream reuse.
-voxtral_status voxtral_stream_reset_internal(voxtral_stream * stream);
+voxtral_status_internal voxtral_stream_reset_internal(voxtral_stream * stream);
 
 // Pre-execution cancellation. A later finish() will not run inference. v1 only
 // supports cancelling before finish() runs; a cancel() attempted while finish()
 // is in flight returns `busy` and does not change state (in-flight GGML graph
 // cancellation is not implemented).
-voxtral_status voxtral_stream_cancel_internal(voxtral_stream * stream);
+voxtral_status_internal voxtral_stream_cancel_internal(voxtral_stream * stream);
 
 // Frees the stream and its owned context (if any). Never frees the model. The
 // caller must ensure no other method is running on this stream (see the
@@ -268,8 +276,8 @@ void voxtral_stream_destroy_internal(voxtral_stream * stream);
 // ----------------------------------------------------------------------------
 // Introspection (read-only; for tests and the internal realtime harness).
 // ----------------------------------------------------------------------------
-voxtral_stream_state voxtral_stream_get_state       (const voxtral_stream * stream);
-voxtral_status       voxtral_stream_last_status      (const voxtral_stream * stream);
+voxtral_stream_state_internal voxtral_stream_get_state_internal       (const voxtral_stream * stream);
+voxtral_status_internal       voxtral_stream_last_status      (const voxtral_stream * stream);
 const std::string &  voxtral_stream_last_error       (const voxtral_stream * stream);
 uint64_t             voxtral_stream_samples_received (const voxtral_stream * stream);
 uint64_t             voxtral_stream_samples_consumed (const voxtral_stream * stream);
@@ -437,12 +445,21 @@ struct voxtral_backlog_metrics {
     double deadlineMissRate = 0.0;
 };
 
+// Allocation-free subset used by the stable public metrics adapter. Unlike the
+// diagnostic backlog query, this does not sort samples to compute percentiles.
+struct voxtral_public_backlog_metrics_internal {
+    double final_ms = 0.0;
+    double slope_ms_per_s = 0.0;
+};
+
 voxtral_backlog_metrics voxtral_stream_encoder_backlog(const voxtral_stream * stream);
 voxtral_backlog_metrics voxtral_stream_adapter_backlog(const voxtral_stream * stream);
 voxtral_backlog_metrics voxtral_stream_decoder_backlog(const voxtral_stream * stream);
+voxtral_public_backlog_metrics_internal
+voxtral_stream_public_backlog_internal(const voxtral_stream * stream);
 
 // ----------------------------------------------------------------------------
-// Explicit backpressure state. feed()/finish() still return voxtral_status; this
+// Explicit backpressure state. feed()/finish() still return voxtral_status_internal; this
 // projects the most recent operation's status onto the documented feed contract:
 //   ok          -> proceed
 //   queue_full  -> event queue full; drain events (poll) and feed again (a
@@ -464,12 +481,17 @@ voxtral_stream_feed_status voxtral_stream_last_feed_status(const voxtral_stream 
 // poll_event is part of the externally-serialized contract: do not call it
 // concurrently with (or reentrantly from) another stream method.
 // ----------------------------------------------------------------------------
-bool   voxtral_stream_poll_event   (voxtral_stream * stream, voxtral_stream_event & out);
+bool   voxtral_stream_poll_event_internal   (voxtral_stream * stream, voxtral_stream_event_internal & out);
 size_t voxtral_stream_pending_events(const voxtral_stream * stream);
 
-const char * voxtral_stream_state_name (voxtral_stream_state state);
-const char * voxtral_stream_status_name(voxtral_status status);
-const char * voxtral_stream_event_name (voxtral_stream_event_type type);
+// Production adapter control for the fixed event bound. Returns false rather
+// than silently clamping an invalid capacity.
+bool voxtral_stream_set_event_capacity_internal(
+    voxtral_stream * stream, size_t max_events);
+
+const char * voxtral_stream_state_name (voxtral_stream_state_internal state);
+const char * voxtral_stream_status_name(voxtral_status_internal status);
+const char * voxtral_stream_event_name (voxtral_stream_event_type_internal type);
 
 // ============================================================================
 // Test seam (INTERNAL, test-only). None of the following is part of any
