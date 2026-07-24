@@ -48,6 +48,7 @@
     "benchmark:public-c-api-overhead": "node scripts/benchmark-public-c-api-overhead.js",
     "benchmark:encoder-scheduler": "node scripts/benchmark-encoder-scheduler.js",
     "test:encoder-kv-manual": "node scripts/test-encoder-kv-manual.js",
+    "smoke:server": "node scripts/smoke-voxtral-server.js",
     "build:local": "node scripts/build-local.js",
     "sync:gpu": "node scripts/sync-gpu.js",
     "build:gpu": "node scripts/build-gpu.js"

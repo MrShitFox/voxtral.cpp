@@ -99,6 +99,45 @@ See [Public streaming C API](docs/public-streaming-api.md) for lifecycle,
 ownership, backpressure, ABI/versioning, P/Invoke notes, and the buildable
 [C example](examples/c/streaming.c).
 
+## Standalone server
+
+`voxtral-server` loads one realtime model and Vulkan context, then exposes an
+unauthenticated health check, synchronous PCM WAV/raw batch transcription, and
+binary-PCM realtime WebSocket transcription. It uses a single non-waiting GPU
+lease: concurrent transcription requests receive `503 server_busy`.
+
+Build it with Boost.Asio/Beast/JSON available:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=ON -DGGML_VULKAN=ON -DVOXTRAL_BUILD_SERVER=ON
+cmake --build build-release -j --target voxtral-server
+```
+
+Start with a Bearer key file, then check health or submit a WAV:
+
+```bash
+./build-release/voxtral-server --model /path/to/model.gguf \
+  --listen 127.0.0.1 --port 8080 --api-key-file /path/to/api-key
+
+curl -sS http://127.0.0.1:8080/health
+
+curl -sS -H "Authorization: Bearer $VOXTRAL_API_KEY" \
+  -H "Content-Type: audio/wav" --data-binary @speech.wav \
+  http://127.0.0.1:8080/v1/audio/transcriptions
+
+dotnet run --project examples/csharp/VoxtralServerExample.csproj -- \
+  realtime ws://127.0.0.1:8080/v1/realtime/transcription \
+  "$VOXTRAL_API_KEY" speech.pcm
+```
+
+See [Standalone server API](docs/server-api.md) for configuration, auth,
+limits, batch formats, the realtime event protocol, backpressure, errors, and
+C# usage.
+
+`voxtral-server` itself serves HTTP and WebSocket without TLS. For public
+Internet deployment place it behind Caddy, nginx, or HAProxy.
+
 ---
 
 ## Advanced Usage
